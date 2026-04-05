@@ -888,6 +888,12 @@ impl Eval {
             ("eof-object?", 101),
             ("write-char", 102),
             ("error", 103),
+            // Case-insensitive char comparisons
+            ("char-ci=?", 104), ("char-ci<?", 105), ("char-ci>?", 106),
+            ("char-ci<=?", 107), ("char-ci>=?", 108),
+            // Case-insensitive string comparisons
+            ("string-ci=?", 109), ("string-ci<?", 110), ("string-ci>?", 111),
+            ("string-ci<=?", 112), ("string-ci>=?", 113),
             // ── Algebra extension (wispy algebra) ────────────
             ("dot", 200),       // (dot a b) → CAYLEY[a][b]
             ("tau", 201),       // (tau x) → type tag of x
@@ -1415,6 +1421,60 @@ impl Eval {
 
             // eof-object?
             101 => self.scheme_bool(self.heap.tag(a1) == table::EOF),
+
+            // Case-insensitive char comparisons
+            104 => { // char-ci=?
+                let ca = (self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+                let cb = (self.heap.rib_car(a2).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+                self.scheme_bool(ca == cb)
+            }
+            105 => { // char-ci<?
+                let ca = (self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+                let cb = (self.heap.rib_car(a2).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+                self.scheme_bool(ca < cb)
+            }
+            106 => { // char-ci>?
+                let ca = (self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+                let cb = (self.heap.rib_car(a2).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+                self.scheme_bool(ca > cb)
+            }
+            107 => { // char-ci<=?
+                let ca = (self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+                let cb = (self.heap.rib_car(a2).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+                self.scheme_bool(ca <= cb)
+            }
+            108 => { // char-ci>=?
+                let ca = (self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+                let cb = (self.heap.rib_car(a2).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+                self.scheme_bool(ca >= cb)
+            }
+
+            // Case-insensitive string comparisons
+            109 => { // string-ci=?
+                let sa = self.extract_string(a1).unwrap_or_default().to_ascii_lowercase();
+                let sb = self.extract_string(a2).unwrap_or_default().to_ascii_lowercase();
+                self.scheme_bool(sa == sb)
+            }
+            110 => { // string-ci<?
+                let sa = self.extract_string(a1).unwrap_or_default().to_ascii_lowercase();
+                let sb = self.extract_string(a2).unwrap_or_default().to_ascii_lowercase();
+                self.scheme_bool(sa < sb)
+            }
+            111 => { // string-ci>?
+                let sa = self.extract_string(a1).unwrap_or_default().to_ascii_lowercase();
+                let sb = self.extract_string(a2).unwrap_or_default().to_ascii_lowercase();
+                self.scheme_bool(sa > sb)
+            }
+            112 => { // string-ci<=?
+                let sa = self.extract_string(a1).unwrap_or_default().to_ascii_lowercase();
+                let sb = self.extract_string(a2).unwrap_or_default().to_ascii_lowercase();
+                self.scheme_bool(sa <= sb)
+            }
+            113 => { // string-ci>=?
+                let sa = self.extract_string(a1).unwrap_or_default().to_ascii_lowercase();
+                let sb = self.extract_string(a2).unwrap_or_default().to_ascii_lowercase();
+                self.scheme_bool(sa >= sb)
+            }
 
             // write-char
             102 => {
@@ -2134,5 +2194,51 @@ mod tests {
         assert_eq!(ev.eval_str("(my-if #t 1)"), Val::fixnum(1));
         assert_eq!(ev.eval_str("(my-if #f 1)"), Val::fixnum(0));
         assert_eq!(ev.eval_str("(my-if #f 1 2)"), Val::fixnum(2));
+    }
+
+    // ── char-ci / string-ci tests ────────────────────
+
+    #[test]
+    fn char_ci_equal() {
+        let mut ev = Eval::new();
+        let r1 = ev.eval_str("(char-ci=? #\\a #\\A)");
+        assert!(ev.is_true(r1));
+        let r2 = ev.eval_str("(char-ci=? #\\a #\\b)");
+        assert!(!ev.is_true(r2));
+    }
+
+    #[test]
+    fn char_ci_ordering() {
+        let mut ev = Eval::new();
+        let r1 = ev.eval_str("(char-ci<? #\\A #\\b)");
+        assert!(ev.is_true(r1));
+        let r2 = ev.eval_str("(char-ci>? #\\B #\\a)");
+        assert!(ev.is_true(r2));
+        let r3 = ev.eval_str("(char-ci<=? #\\a #\\A)");
+        assert!(ev.is_true(r3));
+        let r4 = ev.eval_str("(char-ci>=? #\\a #\\A)");
+        assert!(ev.is_true(r4));
+    }
+
+    #[test]
+    fn string_ci_equal() {
+        let mut ev = Eval::new();
+        let r1 = ev.eval_str(r#"(string-ci=? "Hello" "hello")"#);
+        assert!(ev.is_true(r1));
+        let r2 = ev.eval_str(r#"(string-ci=? "ABC" "abd")"#);
+        assert!(!ev.is_true(r2));
+    }
+
+    #[test]
+    fn string_ci_ordering() {
+        let mut ev = Eval::new();
+        let r1 = ev.eval_str(r#"(string-ci<? "abc" "ABD")"#);
+        assert!(ev.is_true(r1));
+        let r2 = ev.eval_str(r#"(string-ci>? "XYZ" "abc")"#);
+        assert!(ev.is_true(r2));
+        let r3 = ev.eval_str(r#"(string-ci<=? "abc" "ABC")"#);
+        assert!(ev.is_true(r3));
+        let r4 = ev.eval_str(r#"(string-ci>=? "ABC" "abc")"#);
+        assert!(ev.is_true(r4));
     }
 }

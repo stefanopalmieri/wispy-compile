@@ -909,6 +909,24 @@ impl CpsEval {
             ("integer?", 91), ("exact?", 92),
             ("eof-object?", 101),
             ("error", 103),
+            // Char comparisons (case-sensitive)
+            ("char=?", 81), ("char<?", 82), ("char>?", 98),
+            ("char<=?", 99), ("char>=?", 100),
+            ("char-alphabetic?", 83), ("char-numeric?", 84),
+            ("char-whitespace?", 85), ("char-upper-case?", 86),
+            ("char-lower-case?", 87), ("char-upcase", 88), ("char-downcase", 89),
+            // String comparisons (case-sensitive)
+            ("string=?", 74), ("string<?", 75),
+            ("string>?", 95), ("string<=?", 96), ("string>=?", 97),
+            ("string-length", 51), ("string-ref", 52),
+            ("string-append", 53), ("make-string", 58),
+            ("substring", 76), ("string-set!", 90),
+            // Case-insensitive char comparisons
+            ("char-ci=?", 104), ("char-ci<?", 105), ("char-ci>?", 106),
+            ("char-ci<=?", 107), ("char-ci>=?", 108),
+            // Case-insensitive string comparisons
+            ("string-ci=?", 109), ("string-ci<?", 110), ("string-ci>?", 111),
+            ("string-ci<=?", 112), ("string-ci>=?", 113),
             // ── Algebra extension (wispy algebra) ────────────
             ("dot", 200),       // (dot a b) → CAYLEY[a][b]
             ("tau", 201),       // (tau x) → type tag of x
@@ -1016,6 +1034,87 @@ impl CpsEval {
                     let mut r = 1i64; for _ in 0..exp { r *= base; } Val::fixnum(r) }
             101 => self.scheme_bool(self.heap.tag(a1) == table::EOF),
             103 => { eprintln!("Error"); Val::NIL }
+
+            // Char comparisons (case-sensitive)
+            81 => { let ca = self.heap.rib_car(a1).as_fixnum(); let cb = self.heap.rib_car(a2).as_fixnum(); self.scheme_bool(ca == cb) }
+            82 => { let ca = self.heap.rib_car(a1).as_fixnum().unwrap_or(0); let cb = self.heap.rib_car(a2).as_fixnum().unwrap_or(0); self.scheme_bool(ca < cb) }
+            83 => { let cp = self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8; self.scheme_bool(cp.is_ascii_alphabetic()) }
+            84 => { let cp = self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8; self.scheme_bool(cp.is_ascii_digit()) }
+            85 => { let cp = self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8; self.scheme_bool(cp.is_ascii_whitespace()) }
+            86 => { let cp = self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8; self.scheme_bool(cp.is_ascii_uppercase()) }
+            87 => { let cp = self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8; self.scheme_bool(cp.is_ascii_lowercase()) }
+            88 => { let cp = self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8; self.heap.character(cp.to_ascii_uppercase() as i64) }
+            89 => { let cp = self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8; self.heap.character(cp.to_ascii_lowercase() as i64) }
+            90 => { // string-set!
+                let idx = a2.as_fixnum().unwrap_or(0);
+                let a3 = self.heap.car(self.heap.cdr(self.heap.cdr(args)));
+                let cp = self.heap.rib_car(a3).as_fixnum().unwrap_or(0);
+                let mut chars = self.heap.rib_car(a1);
+                for _ in 0..idx { chars = self.heap.cdr(chars); }
+                self.heap.set_car(chars, Val::fixnum(cp));
+                self.void_val
+            }
+            95 => { let sa = self.extract_string(a1).unwrap_or_default(); let sb = self.extract_string(a2).unwrap_or_default(); self.scheme_bool(sa > sb) }
+            96 => { let sa = self.extract_string(a1).unwrap_or_default(); let sb = self.extract_string(a2).unwrap_or_default(); self.scheme_bool(sa <= sb) }
+            97 => { let sa = self.extract_string(a1).unwrap_or_default(); let sb = self.extract_string(a2).unwrap_or_default(); self.scheme_bool(sa >= sb) }
+            98 => { let ca = self.heap.rib_car(a1).as_fixnum().unwrap_or(0); let cb = self.heap.rib_car(a2).as_fixnum().unwrap_or(0); self.scheme_bool(ca > cb) }
+            99 => { let ca = self.heap.rib_car(a1).as_fixnum().unwrap_or(0); let cb = self.heap.rib_car(a2).as_fixnum().unwrap_or(0); self.scheme_bool(ca <= cb) }
+            100 => { let ca = self.heap.rib_car(a1).as_fixnum().unwrap_or(0); let cb = self.heap.rib_car(a2).as_fixnum().unwrap_or(0); self.scheme_bool(ca >= cb) }
+
+            // String operations
+            52 => { // string-ref
+                let idx = a2.as_fixnum().unwrap_or(0);
+                let mut chars = self.heap.rib_car(a1);
+                for _ in 0..idx { chars = self.heap.cdr(chars); }
+                self.heap.character(self.heap.car(chars).as_fixnum().unwrap_or(0))
+            }
+            53 => { // string-append
+                let s1 = self.extract_string(a1).unwrap_or_default();
+                let s2 = self.extract_string(a2).unwrap_or_default();
+                self.make_string(&format!("{s1}{s2}"))
+            }
+            58 => { // make-string
+                let len = a1.as_fixnum().unwrap_or(0);
+                let fill = if a2.is_fixnum() { a2.as_fixnum().unwrap_or(b' ' as i64) }
+                           else { self.heap.rib_car(a2).as_fixnum().unwrap_or(b' ' as i64) };
+                let mut chars = Val::NIL;
+                for _ in 0..len { chars = self.heap.cons(Val::fixnum(fill), chars); }
+                self.heap.string(chars, Val::fixnum(len))
+            }
+            74 => { let sa = self.extract_string(a1).unwrap_or_default(); let sb = self.extract_string(a2).unwrap_or_default(); self.scheme_bool(sa == sb) }
+            75 => { let sa = self.extract_string(a1).unwrap_or_default(); let sb = self.extract_string(a2).unwrap_or_default(); self.scheme_bool(sa < sb) }
+            76 => { // substring
+                let s = self.extract_string(a1).unwrap_or_default();
+                let start = a2.as_fixnum().unwrap_or(0) as usize;
+                let a3 = self.heap.car(self.heap.cdr(self.heap.cdr(args)));
+                let end = a3.as_fixnum().unwrap_or(s.len() as i64) as usize;
+                self.make_string(&s[start..end])
+            }
+
+            // Case-insensitive char comparisons
+            104 => { let ca = (self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+                     let cb = (self.heap.rib_car(a2).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase(); self.scheme_bool(ca == cb) }
+            105 => { let ca = (self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+                     let cb = (self.heap.rib_car(a2).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase(); self.scheme_bool(ca < cb) }
+            106 => { let ca = (self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+                     let cb = (self.heap.rib_car(a2).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase(); self.scheme_bool(ca > cb) }
+            107 => { let ca = (self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+                     let cb = (self.heap.rib_car(a2).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase(); self.scheme_bool(ca <= cb) }
+            108 => { let ca = (self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+                     let cb = (self.heap.rib_car(a2).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase(); self.scheme_bool(ca >= cb) }
+
+            // Case-insensitive string comparisons
+            109 => { let sa = self.extract_string(a1).unwrap_or_default().to_ascii_lowercase();
+                     let sb = self.extract_string(a2).unwrap_or_default().to_ascii_lowercase(); self.scheme_bool(sa == sb) }
+            110 => { let sa = self.extract_string(a1).unwrap_or_default().to_ascii_lowercase();
+                     let sb = self.extract_string(a2).unwrap_or_default().to_ascii_lowercase(); self.scheme_bool(sa < sb) }
+            111 => { let sa = self.extract_string(a1).unwrap_or_default().to_ascii_lowercase();
+                     let sb = self.extract_string(a2).unwrap_or_default().to_ascii_lowercase(); self.scheme_bool(sa > sb) }
+            112 => { let sa = self.extract_string(a1).unwrap_or_default().to_ascii_lowercase();
+                     let sb = self.extract_string(a2).unwrap_or_default().to_ascii_lowercase(); self.scheme_bool(sa <= sb) }
+            113 => { let sa = self.extract_string(a1).unwrap_or_default().to_ascii_lowercase();
+                     let sb = self.extract_string(a2).unwrap_or_default().to_ascii_lowercase(); self.scheme_bool(sa >= sb) }
+
             // ── Algebra extension ────────────
             200 => { // dot: (dot a b) → CAYLEY[a][b]
                 let a = a1.as_fixnum().unwrap_or(0) as u8;
@@ -1359,5 +1458,34 @@ mod tests {
             (define (nqueens n) (nqueens-count n 0 (list)))
         ");
         assert_eq!(ev.eval_str("(nqueens 6)"), Val::fixnum(4));
+    }
+
+    // ── char-ci / string-ci tests ────────────────────
+
+    #[test]
+    fn cps_char_ci_equal() {
+        let mut ev = CpsEval::new();
+        let r1 = ev.eval_str("(char-ci=? #\\a #\\A)");
+        assert!(ev.is_true(r1));
+        let r2 = ev.eval_str("(char-ci=? #\\a #\\b)");
+        assert!(!ev.is_true(r2));
+    }
+
+    #[test]
+    fn cps_string_ci_equal() {
+        let mut ev = CpsEval::new();
+        let r1 = ev.eval_str(r#"(string-ci=? "Hello" "hello")"#);
+        assert!(ev.is_true(r1));
+        let r2 = ev.eval_str(r#"(string-ci=? "ABC" "abd")"#);
+        assert!(!ev.is_true(r2));
+    }
+
+    #[test]
+    fn cps_string_ci_ordering() {
+        let mut ev = CpsEval::new();
+        let r1 = ev.eval_str(r#"(string-ci<? "abc" "ABD")"#);
+        assert!(ev.is_true(r1));
+        let r2 = ev.eval_str(r#"(string-ci>=? "ABC" "abc")"#);
+        assert!(ev.is_true(r2));
     }
 }

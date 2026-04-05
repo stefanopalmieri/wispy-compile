@@ -261,6 +261,13 @@ impl Compiler {
             "string-length" | "string-ref" | "string-append" |
             "make-vector" | "make-string" | "vector-length" | "vector-ref" | "vector-set!" |
             "symbol->string" | "string->symbol" | "eof-object?" |
+            "char=?" | "char<?" | "char>?" | "char<=?" | "char>=?" |
+            "char-ci=?" | "char-ci<?" | "char-ci>?" | "char-ci<=?" | "char-ci>=?" |
+            "char-alphabetic?" | "char-numeric?" | "char-whitespace?" |
+            "char-upper-case?" | "char-lower-case?" | "char-upcase" | "char-downcase" |
+            "string-ci=?" | "string-ci<?" | "string-ci>?" | "string-ci<=?" | "string-ci>=?" |
+            "string=?" | "string<?" | "string>?" | "string<=?" | "string>=?" |
+            "string-set!" | "substring" |
             "call-with-current-continuation" | "force" | "lcm" |
             // Algebra constants (global Val consts in generated code)
             "TOP" | "BOT" | "Q" | "E" | "CAR" | "CDR" | "CONS" | "RHO" |
@@ -1159,6 +1166,119 @@ impl Compiler {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
                     return format!("string_to_number({a})");
                 }
+                "string-set!" => {
+                    let s = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let idx = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    let ch = self.emit_expr_inline(heap.car(heap.cdr(heap.cdr(rest))), heap, syms);
+                    return format!("string_set({s}, {idx}, {ch})");
+                }
+                // Case-sensitive char comparisons
+                "char=?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(char_codepoint({a}) == char_codepoint({b}))");
+                }
+                "char<?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(char_codepoint({a}) < char_codepoint({b}))");
+                }
+                "char>?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(char_codepoint({a}) > char_codepoint({b}))");
+                }
+                "char<=?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(char_codepoint({a}) <= char_codepoint({b}))");
+                }
+                "char>=?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(char_codepoint({a}) >= char_codepoint({b}))");
+                }
+                // Case-insensitive char comparisons
+                "char-ci=?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(char_ci_cmp({a}, {b}) == 0)");
+                }
+                "char-ci<?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(char_ci_cmp({a}, {b}) < 0)");
+                }
+                "char-ci>?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(char_ci_cmp({a}, {b}) > 0)");
+                }
+                "char-ci<=?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(char_ci_cmp({a}, {b}) <= 0)");
+                }
+                "char-ci>=?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(char_ci_cmp({a}, {b}) >= 0)");
+                }
+                // Case-insensitive string comparisons
+                "string-ci=?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(string_ci_eq({a}, {b}))");
+                }
+                "string-ci<?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(string_ci_cmp({a}, {b}) < 0)");
+                }
+                "string-ci>?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(string_ci_cmp({a}, {b}) > 0)");
+                }
+                "string-ci<=?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(string_ci_cmp({a}, {b}) <= 0)");
+                }
+                "string-ci>=?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(string_ci_cmp({a}, {b}) >= 0)");
+                }
+                // Char predicates and case conversion
+                "char-alphabetic?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val((char_codepoint({a}) as u8).is_ascii_alphabetic())");
+                }
+                "char-numeric?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val((char_codepoint({a}) as u8).is_ascii_digit())");
+                }
+                "char-whitespace?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val((char_codepoint({a}) as u8).is_ascii_whitespace())");
+                }
+                "char-upper-case?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val((char_codepoint({a}) as u8).is_ascii_uppercase())");
+                }
+                "char-lower-case?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val((char_codepoint({a}) as u8).is_ascii_lowercase())");
+                }
+                "char-upcase" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("make_char((char_codepoint({a}) as u8).to_ascii_uppercase() as i64)");
+                }
+                "char-downcase" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("make_char((char_codepoint({a}) as u8).to_ascii_lowercase() as i64)");
+                }
 
                 // ── Algebra extension ────────────
                 "dot" => {
@@ -1686,6 +1806,55 @@ fn make_string_fill(n: Val, fill: Val) -> Val {
 
 fn char_to_integer(c: Val) -> Val {
     if is_char(c) { car(c) } else { Val::fixnum(0) }
+}
+
+fn char_codepoint(c: Val) -> i64 {
+    if is_char(c) { car(c).as_fixnum().unwrap_or(0) } else { 0 }
+}
+
+fn char_ci_cmp(a: Val, b: Val) -> i64 {
+    let ca = (char_codepoint(a) as u8).to_ascii_lowercase() as i64;
+    let cb = (char_codepoint(b) as u8).to_ascii_lowercase() as i64;
+    ca - cb
+}
+
+fn string_ci_eq(a: Val, b: Val) -> bool {
+    let mut ca = car(a);
+    let mut cb = car(b);
+    loop {
+        if ca == Val::NIL && cb == Val::NIL { return true; }
+        if ca == Val::NIL || cb == Val::NIL { return false; }
+        if ca.is_fixnum() || cb.is_fixnum() { return false; }
+        let va = (car(ca).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+        let vb = (car(cb).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+        if va != vb { return false; }
+        ca = cdr(ca);
+        cb = cdr(cb);
+    }
+}
+
+fn string_ci_cmp(a: Val, b: Val) -> i64 {
+    let mut ca = car(a);
+    let mut cb = car(b);
+    loop {
+        if ca == Val::NIL && cb == Val::NIL { return 0; }
+        if ca == Val::NIL { return -1; }
+        if cb == Val::NIL { return 1; }
+        let va = (car(ca).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+        let vb = (car(cb).as_fixnum().unwrap_or(0) as u8).to_ascii_lowercase();
+        if va != vb { return (va as i64) - (vb as i64); }
+        ca = cdr(ca);
+        cb = cdr(cb);
+    }
+}
+
+fn string_set(s: Val, idx: Val, ch: Val) -> Val {
+    let n = idx.as_fixnum().unwrap_or(0);
+    let cp = if is_char(ch) { car(ch).as_fixnum().unwrap_or(0) } else { ch.as_fixnum().unwrap_or(0) };
+    let mut chars = car(s);
+    for _ in 0..n { chars = cdr(chars); }
+    set_car(chars, Val::fixnum(cp));
+    Val::NIL
 }
 
 fn number_to_string(n: Val) -> Val {
@@ -2369,5 +2538,54 @@ mod tests {
             (newline)
         ");
         assert_eq!(out.trim(), "30");
+    }
+
+    // ── char-ci / string-ci compiled tests ────────────
+
+    #[test]
+    fn compiled_char_ci() {
+        let out = compile_and_run(r#"
+            (define (f)
+              (if (char-ci=? #\a #\A) 1 0))
+            (display (f))
+            (newline)
+        "#);
+        assert_eq!(out.trim(), "1");
+    }
+
+    #[test]
+    fn compiled_string_ci() {
+        let out = compile_and_run(r#"
+            (define (f)
+              (if (string-ci=? "Hello" "hello") 1 0))
+            (display (f))
+            (newline)
+        "#);
+        assert_eq!(out.trim(), "1");
+    }
+
+    #[test]
+    fn compiled_char_predicates_full() {
+        let out = compile_and_run(r#"
+            (define (show x) (display (if x 1 0)))
+            (show (char-alphabetic? #\a))
+            (show (char-numeric? #\5))
+            (show (char-whitespace? #\space))
+            (show (char-upper-case? #\A))
+            (show (char-lower-case? #\z))
+            (newline)
+        "#);
+        assert_eq!(out.trim(), "11111");
+    }
+
+    #[test]
+    fn compiled_char_case_conversion() {
+        let out = compile_and_run(r#"
+            (display (char->integer (char-upcase #\a)))
+            (display (char->integer (char-downcase #\A)))
+            (newline)
+        "#);
+        // 'A' = 65, 'a' = 97
+        assert_eq!(out.trim(), "6597");
     }
 }
