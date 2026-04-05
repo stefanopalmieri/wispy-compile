@@ -1,116 +1,108 @@
-# Kamea Scheme
+# WispyScheme
 
-An R4RS Scheme implementation grounded in a 64×64 Cayley table (4KB).
+An R4RS Scheme grounded in a 1KB Cayley table. Compiles to native Rust. Targets `no_std` embedded.
 
-Type dispatch, small-value arithmetic, and type predicates are algebraic
-operations — single table lookups with no branching. The table is the
-runtime. Everything else is scaffolding.
+Named after Wispy the guinea pig.
+
+## What it is
+
+A Scheme implementation where type dispatch is algebraic. Applying `car` to a pair, a string, or a number doesn't branch on a tag bit — it indexes into a 32×32 lookup table. The table encodes which operations are valid on which types. The table is `const`, lives in flash on embedded targets, and is transparent to the optimizer.
+
+The table's 12-element algebraic core was found by Z3 and satisfies the same axioms as the [Kamea](https://github.com/stefanopalmieri/Kamea) project's Ψ₁₆ algebra: absorbers, extensionality, Q/E retraction, classifier dichotomy, branch, composition, and the Y fixed point.
+
+Values are ribs (3-field structs: car, cdr, tag), following the [Ribbit](https://github.com/udem-dlteam/ribbit) model. Pairs, symbols, closures, strings, vectors, characters, continuations, and ports are all the same struct with a different tag byte.
+
+## Performance
+
+| Implementation | N-Queens(8) | Counter arithmetic |
+|---|---|---|
+| **C** (gcc -O2, bump alloc) | 96 µs | 0.017 µs |
+| **WispyScheme → Rust** (rustc -O) | **136 µs** | **0.105 µs** |
+| **LuaJIT** | 212 µs | 0.170 µs |
+| **SBCL** (native Common Lisp) | 440 µs | 0.187 µs |
+
+WispyScheme compiled to Rust is 1.5x faster than LuaJIT and 3.2x faster than SBCL on N-Queens(8).
+
+## Quick Start
+
+```rust
+use wispy_scheme::eval::Eval;
+
+let mut ev = Eval::new();
+ev.eval_str("(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))");
+let result = ev.eval_str("(fib 10)"); // 55
+```
 
 ## Architecture
 
 ```
-64 elements = 6 bits per element, stored as bytes (2 spare bits for GC)
-64×64 table = 4,096 entries × 1 byte = 4 KB
-
-Element layout (tentative):
-  0x00-0x06  algebraic core (⊤ ⊥ Q E car cdr cons branch classify ...)
-  0x07-0x09  control (apply, call/cc, tail)
-  0x0A-0x0F  type tags (pair, symbol, char, vector, string, closure)
-  0x10-0x2F  immediate fixnums 0-31
-  0x30-0x37  built-in symbols (lambda, if, define, quote, set!, begin, cond, let)
-  0x38-0x3B  immediate chars or ports
-  0x3C-0x3D  special (#t, #f, eof, void)
-  0x3E-0x3F  reserved
+wispy-scheme/src/
+├── table.rs      32×32 Cayley table (1KB const array), algebraic axiom tests
+├── val.rs        Val = tagged pointer (fixnum | rib index)
+├── heap.rs       Rib heap: uniform (car, cdr, tag) for all types
+├── symbol.rs     Symbol interning (shared reader/evaluator)
+├── reader.rs     S-expression parser
+├── eval.rs       Tree-walking evaluator, 104 builtins, tail call trampoline
+├── cps.rs        CPS evaluator with first-class continuations (call/cc)
+└── compile.rs    Scheme → Rust compiler (standalone binaries)
 ```
 
-## Design Principles
-
-1. **R4RS compliance.** The target is the essential procedures of R4RS,
-   with optional features (complex numbers, rationals, transcendentals)
-   omitted per the spec's allowance.
-
-2. **Table-driven type dispatch.** Applying `car` to a pair is a table
-   lookup. Applying `car` to a fixnum is also a table lookup — the table
-   row returns the error value. No tag-bit branching in the hot path.
-
-3. **Immediate small values.** Fixnums 0-31, common symbols, and
-   characters are algebraic elements. Arithmetic on small fixnums is
-   a single table lookup.
-
-4. **Bump allocator + optional GC.** The default allocator is a bump
-   pointer (pointer increment, no free). MMTk Immix is available for
-   workloads that need collection.
-
-5. **`no_std` core.** The table and evaluator compile with zero
-   dependencies on bare-metal Rust targets.
-
-6. **Lean-verified sub-algebra.** The 7 computational core elements
-   embed as a sub-algebra with the same independence properties as Ψ₁₆.
+Three execution paths:
+- `eval.rs` — interpreter with tail call optimization (fast, no call/cc)
+- `cps.rs` — CPS state machine with first-class continuations (R4RS compliant)
+- `compile.rs` — generates standalone Rust programs (native speed)
 
 ## R4RS Coverage
 
-### Special Forms (primitive)
-- [x] quote, lambda, if, set!, define (design only)
+### Implemented
 
-### Special Forms (derived — implemented as macros)
-- [ ] cond, case, and, or, let, let*, letrec, begin, do, named let,
-      delay, quasiquote
+**Special forms:** `quote`, `if`, `define`, `lambda` (multi-body), `set!`, `begin`, `cond`, `case`, `and`, `or`, `let`, `let*`, `letrec`, named `let`, `do`, `delay`, `quasiquote`/`unquote`/`unquote-splicing`
 
-### Essential Procedures
-- [ ] Booleans: not, boolean?
-- [ ] Equivalence: eqv?, eq?, equal?
-- [ ] Pairs/lists: pair?, cons, car, cdr, set-car!, set-cdr!, null?,
-      list?, list, length, append, reverse, list-ref, memq, memv,
-      member, assq, assv, assoc, caar..cddddr
-- [ ] Symbols: symbol?, symbol->string, string->symbol
-- [ ] Numbers: number?, integer?, exact?, inexact?, =, <, >, <=, >=,
-      zero?, positive?, negative?, odd?, even?, max, min, +, *, -, /,
-      abs, quotient, remainder, modulo, gcd, lcm, floor, ceiling,
-      truncate, round, number->string, string->number
-- [ ] Characters: char?, char=?, char<?, ..., char-alphabetic?,
-      char-numeric?, char-whitespace?, char-upper-case?, char-lower-case?,
-      char->integer, integer->char, char-upcase, char-downcase
-- [ ] Strings: string?, make-string, string, string-length, string-ref,
-      string-set!, string=?, string<?, ..., substring, string-append,
-      string->list, list->string
-- [ ] Vectors: vector?, make-vector, vector, vector-length, vector-ref,
-      vector-set!, vector->list, list->vector
-- [ ] Control: procedure?, apply, map, for-each, call/cc
-- [ ] I/O: read, write, display, newline, read-char, write-char,
-      peek-char, eof-object?, open-input-file, open-output-file,
-      close-input-port, close-output-port, current-input-port,
-      current-output-port, call-with-input-file, call-with-output-file,
-      input-port?, output-port?, load
+**Control:** `call-with-current-continuation` (CPS evaluator), tail call optimization, rest parameters
 
-## Project Structure
+**104 builtin procedures** covering arithmetic, comparison, pairs/lists, type predicates, booleans, equivalence, strings, vectors, characters, symbols, higher-order functions, and I/O.
 
-```
-src/
-  table.py          — 64×64 Cayley table design + generator
-  eval.py           — R4RS evaluator (table-driven)
-  compile.py        — Scheme → C transpiler
-  runtime.h         — C runtime (4KB table + allocator)
-lean/
-  KameaScheme.lean  — Algebraic properties of the 64-element table
-examples/
-  fib.scm           — (define (fib n) ...)
-  nqueens.scm       — N-Queens for benchmark comparison
-  r4rs-tests.scm    — R4RS compliance test suite
-benchmarks/
-  bench.c           — C baseline benchmarks
-reference/
-  psi_runtime.h     — Ψ₁₆ᶠ runtime (pattern reference)
-  psi_lisp.py       — Ψ-Lisp interpreter (pattern reference)
-  ...
-docs/
-  table_design.md   — Element allocation rationale
-  r4rs_coverage.md  — Spec compliance tracking
-```
+### Not yet implemented
+
+- `syntax-rules` (hygienic macros)
+- `read` (S-expression input from ports)
+- Port I/O (`open-input-file`, `open-output-file`, `close-input-port`, `close-output-port`, `current-input-port`, `current-output-port`, `call-with-input-file`, `call-with-output-file`, `input-port?`, `output-port?`, `peek-char`, `char-ready?`)
+- `load`
+- Case-insensitive character and string comparisons (`char-ci=?`, `string-ci=?`, etc.)
+- `dynamic-wind`
+- `call/cc` in the compiler (only the CPS evaluator supports `call/cc`)
+
+## The Cayley Table
+
+The 32×32 table (1KB) is a finite algebra with a Z3-verified core:
+
+- **Absorbers:** ⊤ (nil) and ⊥ (#f) are left absorbers
+- **Retraction pair:** Q and E are mutual inverses on the core (quote/eval)
+- **Classifier:** τ partitions the core into two boolean classes
+- **Branch:** ρ dispatches on the classifier (conditional evaluation)
+- **Composition:** cdr = ρ ∘ cons (second projection factors through branch)
+- **Y fixed point:** Y(ρ) = ρ(Y(ρ)), non-absorber (unbounded recursion)
+- **Extensionality:** all 32 rows are distinct
+- **Type dispatch:** CAR × T_PAIR → valid, CAR × T_STR → error, etc.
+
+The core sub-algebra embeds the same independence structure as [Kamea's Ψ₁₆](https://github.com/stefanopalmieri/Kamea): self-representation (Q/E), self-description (τ), and self-execution (branch + composition) are three independent capabilities.
+
+## Future Work
+
+- **MMTk Immix GC** as an optional feature (`features = ["gc"]`). The bump allocator is the default for `no_std` embedded targets. Long-running applications can opt into garbage collection via [MMTk](https://www.mmtk.io/). The Kamea project already has a working MMTk Immix binding that achieves 184 µs on N-Queens(8).
+
+- **`no_std` heap variant.** Replace `Vec<Rib>` with a fixed-size `&mut [Rib]` buffer for bare-metal targets. The table and evaluator are already `no_std` compatible; the heap is the only blocker.
+
+- **Lean verification.** Prove the 32×32 table's algebraic properties in Lean 4 via `native_decide` (1024 entries, well within capacity).
+
+- **Compiler improvements.** Closure conversion, tail call optimization via loop, `call/cc` support in compiled output.
+
+- **Embedded demo.** Run WispyScheme on an RP2040 or ESP32-C3: read sensor values, apply user-defined Scheme rules, actuate outputs. Upload new `.scm` files over serial without reflashing.
 
 ## Lineage
 
-Descended from the [Kamea](https://github.com/stefanopalmieri/Kamea)
-project. The algebraic core (retraction pair, classifier dichotomy,
-internal composition) embeds as a sub-algebra of the 64-element table.
-Independence proofs:
-[finite-magma-independence](https://github.com/stefanopalmieri/finite-magma-independence).
+WispyScheme descends from the [Kamea](https://github.com/stefanopalmieri/Kamea) project's algebraic framework. The independence theorems (93 Lean theorems, zero `sorry`) are in [finite-magma-independence](https://github.com/stefanopalmieri/finite-magma-independence). The rib-based value model is inspired by [Ribbit](https://github.com/udem-dlteam/ribbit).
+
+## License
+
+MIT

@@ -1,9 +1,10 @@
 [package]
-name = "kamea-scheme"
-version = "0.2.0"
+name = "wispy-scheme"
+version = "0.1.0"
 edition = "2021"
 description = "R4RS Scheme in 1KB. Rib-based, table-driven, no_std."
 license = "MIT"
+repository = "https://github.com/stefanopalmieri/WispyScheme"
 
 [features]
 default = ["std"]
