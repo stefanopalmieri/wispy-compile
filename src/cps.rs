@@ -40,6 +40,9 @@ pub struct CpsEval {
     pub void_val: Val,
     pub strict: bool,
     pub macros: Vec<(Val, crate::macros::Macro)>,
+    pub ports: Vec<crate::eval::Port>,
+    pub stdin_port: Val,
+    pub stdout_port: Val,
 }
 
 enum State {
@@ -58,11 +61,22 @@ impl CpsEval {
         let false_val = heap.alloc_special(table::BOT);
         let void_val = heap.alloc_special(table::VOID);
 
+        let ports = vec![
+            crate::eval::Port { buffer: Vec::new(), pos: 0, writer: None, closed: false, direction: 0 },
+            crate::eval::Port { buffer: Vec::new(), pos: 0, writer: Some(Box::new(std::io::stdout())), closed: false, direction: 1 },
+            crate::eval::Port { buffer: Vec::new(), pos: 0, writer: Some(Box::new(std::io::stderr())), closed: false, direction: 1 },
+        ];
+        let stdin_port = heap.alloc_rib(Val::fixnum(0), Val::fixnum(0), table::T_PORT);
+        let stdout_port = heap.alloc_rib(Val::fixnum(1), Val::fixnum(1), table::T_PORT);
+
         let mut ev = CpsEval {
             heap, syms, globals: Val::NIL,
             true_val, false_val, void_val,
             strict: false,
             macros: Vec::new(),
+            ports,
+            stdin_port,
+            stdout_port,
         };
         ev.register_builtins();
         ev
@@ -927,6 +941,13 @@ impl CpsEval {
             // Case-insensitive string comparisons
             ("string-ci=?", 109), ("string-ci<?", 110), ("string-ci>?", 111),
             ("string-ci<=?", 112), ("string-ci>=?", 113),
+            // Port / I/O
+            ("open-input-file", 120), ("open-output-file", 121),
+            ("close-input-port", 122), ("close-output-port", 123),
+            ("current-input-port", 124), ("current-output-port", 125),
+            ("input-port?", 126), ("output-port?", 127),
+            ("read", 130), ("load", 131),
+            ("read-char", 132), ("peek-char", 133), ("port?", 134),
             // ── Algebra extension (wispy algebra) ────────────
             ("dot", 200),       // (dot a b) → CAYLEY[a][b]
             ("tau", 201),       // (tau x) → type tag of x
@@ -1114,6 +1135,102 @@ impl CpsEval {
                      let sb = self.extract_string(a2).unwrap_or_default().to_ascii_lowercase(); self.scheme_bool(sa <= sb) }
             113 => { let sa = self.extract_string(a1).unwrap_or_default().to_ascii_lowercase();
                      let sb = self.extract_string(a2).unwrap_or_default().to_ascii_lowercase(); self.scheme_bool(sa >= sb) }
+
+            // ── Port / I/O builtins ───────────────────────────
+            120 => { // open-input-file
+                let filename = self.extract_string(a1).unwrap_or_default();
+                let content = std::fs::read(&filename).unwrap_or_default();
+                let id = self.ports.len();
+                self.ports.push(crate::eval::Port {
+                    buffer: content, pos: 0, writer: None, closed: false, direction: 0,
+                });
+                self.heap.alloc_rib(Val::fixnum(id as i64), Val::fixnum(0), table::T_PORT)
+            }
+            121 => { // open-output-file
+                let filename = self.extract_string(a1).unwrap_or_default();
+                let file = std::fs::File::create(&filename).unwrap();
+                let id = self.ports.len();
+                self.ports.push(crate::eval::Port {
+                    buffer: Vec::new(), pos: 0,
+                    writer: Some(Box::new(std::io::BufWriter::new(file))),
+                    closed: false, direction: 1,
+                });
+                self.heap.alloc_rib(Val::fixnum(id as i64), Val::fixnum(1), table::T_PORT)
+            }
+            122 | 123 => { // close-input-port / close-output-port
+                if let Some(id) = self.heap.rib_car(a1).as_fixnum().map(|n| n as usize) {
+                    if id < self.ports.len() {
+                        if let Some(w) = &mut self.ports[id].writer {
+                            use std::io::Write;
+                            let _ = w.flush();
+                        }
+                        self.ports[id].closed = true;
+                    }
+                }
+                self.void_val
+            }
+            124 => self.stdin_port,
+            125 => self.stdout_port,
+            126 => { // input-port?
+                self.scheme_bool(self.heap.tag(a1) == table::T_PORT
+                    && self.heap.rib_cdr(a1).as_fixnum() == Some(0))
+            }
+            127 => { // output-port?
+                self.scheme_bool(self.heap.tag(a1) == table::T_PORT
+                    && self.heap.rib_cdr(a1).as_fixnum() == Some(1))
+            }
+            130 => { // read
+                let pid = if a1 != Val::NIL && self.heap.tag(a1) == table::T_PORT {
+                    self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as usize
+                } else { 0 };
+                if pid == 0 {
+                    // stdin: read a line
+                    let mut line = String::new();
+                    match std::io::stdin().read_line(&mut line) {
+                        Ok(0) | Err(_) => self.heap.alloc_special(table::EOF),
+                        _ => match crate::reader::read(&line, &mut self.heap, &mut self.syms) {
+                            Ok(val) => val,
+                            _ => self.heap.alloc_special(table::EOF),
+                        }
+                    }
+                } else {
+                    let port = &self.ports[pid];
+                    if port.closed || port.pos >= port.buffer.len() {
+                        self.heap.alloc_special(table::EOF)
+                    } else {
+                        let remaining = std::str::from_utf8(&port.buffer[port.pos..]).unwrap_or("");
+                        let mut reader = crate::reader::Reader::new(remaining);
+                        match reader.read(&mut self.heap, &mut self.syms) {
+                            Ok(val) => { self.ports[pid].pos += reader.position(); val }
+                            _ => self.heap.alloc_special(table::EOF),
+                        }
+                    }
+                }
+            }
+            131 => { // load
+                let filename = self.extract_string(a1).unwrap_or_default();
+                if let Ok(src) = std::fs::read_to_string(&filename) { self.eval_str(&src); }
+                self.void_val
+            }
+            132 => { // read-char
+                let pid = if a1 != Val::NIL && self.heap.tag(a1) == table::T_PORT {
+                    self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as usize
+                } else { 0 };
+                if pid < self.ports.len() && !self.ports[pid].closed && self.ports[pid].pos < self.ports[pid].buffer.len() {
+                    let b = self.ports[pid].buffer[self.ports[pid].pos];
+                    self.ports[pid].pos += 1;
+                    self.heap.character(b as i64)
+                } else { self.heap.alloc_special(table::EOF) }
+            }
+            133 => { // peek-char
+                let pid = if a1 != Val::NIL && self.heap.tag(a1) == table::T_PORT {
+                    self.heap.rib_car(a1).as_fixnum().unwrap_or(0) as usize
+                } else { 0 };
+                if pid < self.ports.len() && !self.ports[pid].closed && self.ports[pid].pos < self.ports[pid].buffer.len() {
+                    self.heap.character(self.ports[pid].buffer[self.ports[pid].pos] as i64)
+                } else { self.heap.alloc_special(table::EOF) }
+            }
+            134 => self.scheme_bool(self.heap.tag(a1) == table::T_PORT), // port?
 
             // ── Algebra extension ────────────
             200 => { // dot: (dot a b) → CAYLEY[a][b]

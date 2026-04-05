@@ -176,6 +176,11 @@ impl<'a> Reader<'a> {
         Reader { src: src.as_bytes(), pos: 0 }
     }
 
+    /// Current position in the source (bytes consumed so far).
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
     fn peek(&self) -> Option<u8> {
         self.src.get(self.pos).copied()
     }
