@@ -333,7 +333,7 @@ impl CpsEval {
                     // (call/cc proc) — eval the single arg, then capture
                     let proc_expr = self.heap.car(arg_exprs);
                     // Build a continuation that will call_cc
-                    let k_cc = self.k_evfn(Val::NIL, env, k);
+                    let _k_cc = self.k_evfn(Val::NIL, env, k);
                     // We mark this as a call/cc by storing the actual cont
                     // in a special way — the arg to call/cc is a proc
                     // that receives the continuation as argument
@@ -598,7 +598,7 @@ impl CpsEval {
         let closure = self.heap.closure(param_list, body_env_rib);
 
         // Evaluate init expressions
-        let args_list = self.heap.list(&init_exprs);
+        let _args_list = self.heap.list(&init_exprs);
         if init_exprs.is_empty() {
             State::ApplyProc { proc: closure, args: Val::NIL, cont }
         } else {

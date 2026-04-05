@@ -40,7 +40,7 @@ pub const VOID: u8 = 22;   // void (unspecified)
 
 // ── The table ────────────────────────────────────────────────────
 
-include!("../../src/cayley_32.rs");
+include!("../tools/cayley_32.rs");
 
 /// Apply element `a` to element `b` via the Cayley table.
 #[inline(always)]

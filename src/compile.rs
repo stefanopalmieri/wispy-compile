@@ -25,8 +25,6 @@ pub struct Compiler {
     main_exprs: Vec<Val>,
     /// Global variable definitions: (name, init_expr)
     globals: Vec<(String, Val)>,
-    /// Functions that use the heap (cons, list, etc.)
-    heap_users: Vec<String>,
 }
 
 impl Compiler {
@@ -35,7 +33,6 @@ impl Compiler {
             functions: Vec::new(),
             main_exprs: Vec::new(),
             globals: Vec::new(),
-            heap_users: Vec::new(),
         }
     }
 
@@ -258,7 +255,7 @@ impl Compiler {
                         parts.push(self.emit_expr_inline(heap.car(r), heap, syms));
                         r = heap.cdr(r);
                     }
-                    let chain = parts.join(" && is_true(") + ")".repeat(parts.len() - 1).as_str();
+                    let _chain = parts.join(" && is_true(") + ")".repeat(parts.len() - 1).as_str();
                     // Simplified: just check truthiness
                     return format!("{pad}{{ let _and = {}; _and }}\n",
                         self.emit_and_chain(&parts));
@@ -354,11 +351,6 @@ impl Compiler {
                 "not" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
                     return format!("{pad}bool_to_val(!is_true({a}))\n");
-                }
-
-                "pair?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}bool_to_val({a} != Val::NIL && !{a}.is_fixnum())\n");
                 }
 
                 _ => {

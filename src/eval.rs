@@ -642,7 +642,6 @@ impl Eval {
             }
 
             // Update bindings
-            let mut e = new_env;
             for (i, (_, step_expr)) in specs.iter().enumerate().rev() {
                 // Find the binding for this var (it's at the head of new_env
                 // since we pushed them in order)
@@ -655,7 +654,6 @@ impl Eval {
                     self.heap.set_cdr(self.heap.car(walk), new_vals[i]);
                 }
             }
-            let _ = e;
         }
     }
 
@@ -720,7 +718,7 @@ impl Eval {
 
     // ── call/cc ──────────────────────────────────────────────────
 
-    fn call_cc(&mut self, proc: Val, env: Val) -> Val {
+    fn call_cc(&mut self, proc: Val, _env: Val) -> Val {
         // We implement call/cc using Rust's panic/catch mechanism
         // as a simple escape continuation.
         //
@@ -1706,7 +1704,7 @@ mod tests {
         let mut ev = Eval::new();
         ev.eval_str("(define (double x) (* x 2))");
         let result = ev.eval_str("(map double (list 1 2 3))");
-        let mut ev2 = ev;
+        let ev2 = ev;
         assert_eq!(ev2.heap.car(result), Val::fixnum(2));
         assert_eq!(ev2.heap.car(ev2.heap.cdr(result)), Val::fixnum(4));
         assert_eq!(ev2.heap.car(ev2.heap.cdr(ev2.heap.cdr(result))), Val::fixnum(6));
