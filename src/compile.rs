@@ -17,6 +17,18 @@ use crate::symbol::SymbolTable;
 use crate::val::Val;
 use crate::table;
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
+
+/// A lambda that has been lifted to a top-level function.
+#[derive(Clone)]
+struct LiftedLambda {
+    id: usize,
+    params: Vec<String>,
+    free_vars: Vec<String>,
+    body_list: Val, // list of body expressions (use emit_begin)
+}
+
 /// Compiler state.
 pub struct Compiler {
     /// Collected top-level function definitions: (name, params, body)
@@ -25,6 +37,10 @@ pub struct Compiler {
     main_exprs: Vec<Val>,
     /// Global variable definitions: (name, init_expr)
     globals: Vec<(String, Val)>,
+    /// Lifted lambda functions (populated during code generation)
+    lifted: RefCell<Vec<LiftedLambda>>,
+    /// Next lambda ID to assign (starts at functions.len())
+    next_lambda_id: Cell<usize>,
 }
 
 impl Compiler {
@@ -33,6 +49,8 @@ impl Compiler {
             functions: Vec::new(),
             main_exprs: Vec::new(),
             globals: Vec::new(),
+            lifted: RefCell::new(Vec::new()),
+            next_lambda_id: Cell::new(0),
         }
     }
 
@@ -88,13 +106,332 @@ impl Compiler {
         }
     }
 
+    // ── Closure support helpers ────────────────────────────────────
+
+    /// Check if a name is a known top-level function.
+    fn is_known_function(&self, name: &str) -> bool {
+        self.functions.iter().any(|(n, _, _)| n == name)
+    }
+
+    /// Get the closure ID for a known top-level function, if any.
+    fn function_closure_id(&self, name: &str) -> Option<usize> {
+        self.functions.iter().position(|(n, _, _)| n == name)
+    }
+
+    /// Check if a name is a compiler builtin or special form (not a user variable).
+    fn is_builtin_or_special(name: &str) -> bool {
+        matches!(name,
+            "+" | "-" | "*" | "/" | "=" | "<" | ">" | "<=" | ">=" |
+            "cons" | "car" | "cdr" | "null?" | "pair?" | "number?" | "integer?" |
+            "zero?" | "positive?" | "negative?" | "even?" | "odd?" | "not" |
+            "eq?" | "eqv?" | "equal?" | "boolean?" | "procedure?" |
+            "abs" | "max" | "min" | "expt" | "gcd" | "quotient" | "remainder" | "modulo" |
+            "set-car!" | "set-cdr!" | "length" | "append" | "reverse" |
+            "list-ref" | "list-tail" | "list" | "map" | "for-each" |
+            "display" | "newline" | "write" | "write-char" | "apply" | "error" |
+            "if" | "let" | "let*" | "letrec" | "begin" | "cond" | "case" |
+            "and" | "or" | "do" | "define" | "set!" | "lambda" | "quote" |
+            "quasiquote" | "unquote" | "unquote-splicing" | "else" |
+            "dot" | "tau" | "type-valid?" | "strict-mode" | "permissive-mode" |
+            "exact?" | "inexact?" | "char?" | "string?" | "vector?" | "symbol?" |
+            "char->integer" | "integer->char" | "number->string" | "string->number" |
+            "string-length" | "string-ref" | "string-append" |
+            "make-vector" | "make-string" | "vector-length" | "vector-ref" | "vector-set!" |
+            "symbol->string" | "string->symbol" | "eof-object?" |
+            "call-with-current-continuation" | "force" | "lcm" |
+            // Algebra constants (global Val consts in generated code)
+            "TOP" | "BOT" | "Q" | "E" | "CAR" | "CDR" | "CONS" | "RHO" |
+            "APPLY" | "CC" | "TAU" | "Y" |
+            "T_PAIR" | "T_SYM" | "T_CLS" | "T_STR" | "T_VEC" | "T_CHAR" |
+            "T_CONT" | "T_PORT" | "TRUE" | "EOF" | "VOID"
+        )
+    }
+
+    fn walk_free_vars(&self, expr: Val, heap: &Heap, syms: &SymbolTable,
+                      bound: &HashSet<String>,
+                      fv: &mut Vec<String>, seen: &mut HashSet<String>) {
+        if expr.is_fixnum() || expr == Val::NIL { return; }
+        let tag = heap.tag(expr);
+        if tag == table::T_SYM {
+            let name = syms.symbol_name(expr).unwrap_or("").to_string();
+            if !name.is_empty() && !bound.contains(&name)
+                && !Self::is_builtin_or_special(&name)
+                && !self.is_known_function(&name)
+                && !seen.contains(&name)
+            {
+                seen.insert(name.clone());
+                fv.push(name);
+            }
+            return;
+        }
+        if tag != table::T_PAIR { return; }
+
+        let head = heap.car(expr);
+        let rest = heap.cdr(expr);
+
+        if heap.is_symbol(head) {
+            let name = syms.symbol_name(head).unwrap_or("");
+            match name {
+                "quote" => { /* don't descend */ }
+                "lambda" => {
+                    let params_list = heap.car(rest);
+                    let body_exprs = heap.cdr(rest);
+                    let mut new_bound = bound.clone();
+                    let mut p = params_list;
+                    while heap.is_pair(p) {
+                        if let Some(pname) = syms.symbol_name(heap.car(p)) {
+                            new_bound.insert(pname.to_string());
+                        }
+                        p = heap.cdr(p);
+                    }
+                    self.walk_free_vars_list(body_exprs, heap, syms, &new_bound, fv, seen);
+                }
+                "let" => {
+                    let first = heap.car(rest);
+                    if heap.is_symbol(first) {
+                        // Named let: (let name ((var init) ...) body...)
+                        let loop_name = syms.symbol_name(first).unwrap_or("_").to_string();
+                        let bindings = heap.car(heap.cdr(rest));
+                        let body_exprs = heap.cdr(heap.cdr(rest));
+                        let mut new_bound = bound.clone();
+                        new_bound.insert(loop_name);
+                        let mut b = bindings;
+                        while heap.is_pair(b) {
+                            let binding = heap.car(b);
+                            let init = heap.car(heap.cdr(binding));
+                            self.walk_free_vars(init, heap, syms, bound, fv, seen);
+                            if let Some(vname) = syms.symbol_name(heap.car(binding)) {
+                                new_bound.insert(vname.to_string());
+                            }
+                            b = heap.cdr(b);
+                        }
+                        self.walk_free_vars_list(body_exprs, heap, syms, &new_bound, fv, seen);
+                    } else {
+                        // Regular let
+                        let bindings = first;
+                        let body_exprs = heap.cdr(rest);
+                        let mut new_bound = bound.clone();
+                        let mut b = bindings;
+                        while heap.is_pair(b) {
+                            let binding = heap.car(b);
+                            let init = heap.car(heap.cdr(binding));
+                            self.walk_free_vars(init, heap, syms, bound, fv, seen);
+                            if let Some(vname) = syms.symbol_name(heap.car(binding)) {
+                                new_bound.insert(vname.to_string());
+                            }
+                            b = heap.cdr(b);
+                        }
+                        self.walk_free_vars_list(body_exprs, heap, syms, &new_bound, fv, seen);
+                    }
+                }
+                "let*" => {
+                    let bindings = heap.car(rest);
+                    let body_exprs = heap.cdr(rest);
+                    let mut new_bound = bound.clone();
+                    let mut b = bindings;
+                    while heap.is_pair(b) {
+                        let binding = heap.car(b);
+                        let init = heap.car(heap.cdr(binding));
+                        self.walk_free_vars(init, heap, syms, &new_bound, fv, seen);
+                        if let Some(vname) = syms.symbol_name(heap.car(binding)) {
+                            new_bound.insert(vname.to_string());
+                        }
+                        b = heap.cdr(b);
+                    }
+                    self.walk_free_vars_list(body_exprs, heap, syms, &new_bound, fv, seen);
+                }
+                "letrec" => {
+                    let bindings = heap.car(rest);
+                    let body_exprs = heap.cdr(rest);
+                    let mut new_bound = bound.clone();
+                    let mut b = bindings;
+                    while heap.is_pair(b) {
+                        if let Some(vname) = syms.symbol_name(heap.car(heap.car(b))) {
+                            new_bound.insert(vname.to_string());
+                        }
+                        b = heap.cdr(b);
+                    }
+                    b = bindings;
+                    while heap.is_pair(b) {
+                        let init = heap.car(heap.cdr(heap.car(b)));
+                        self.walk_free_vars(init, heap, syms, &new_bound, fv, seen);
+                        b = heap.cdr(b);
+                    }
+                    self.walk_free_vars_list(body_exprs, heap, syms, &new_bound, fv, seen);
+                }
+                "set!" => {
+                    // (set! var expr) — var reference + walk expr
+                    let var = heap.car(rest);
+                    if heap.is_symbol(var) {
+                        self.walk_free_vars(var, heap, syms, bound, fv, seen);
+                    }
+                    self.walk_free_vars(heap.car(heap.cdr(rest)), heap, syms, bound, fv, seen);
+                }
+                "define" => {
+                    // skip defines inside lambda bodies
+                    self.walk_free_vars_list(heap.cdr(rest), heap, syms, bound, fv, seen);
+                }
+                "if" | "begin" | "and" | "or" | "cond" | "case" | "do" => {
+                    self.walk_free_vars_list(rest, heap, syms, bound, fv, seen);
+                }
+                _ => {
+                    // Function call: head (if not builtin/known) + all args
+                    if !Self::is_builtin_or_special(name) && !self.is_known_function(name)
+                        && !bound.contains(name) && !seen.contains(name) {
+                        seen.insert(name.to_string());
+                        fv.push(name.to_string());
+                    }
+                    self.walk_free_vars_list(rest, heap, syms, bound, fv, seen);
+                }
+            }
+        } else {
+            // Non-symbol head
+            self.walk_free_vars(head, heap, syms, bound, fv, seen);
+            self.walk_free_vars_list(rest, heap, syms, bound, fv, seen);
+        }
+    }
+
+    fn walk_free_vars_list(&self, mut list: Val, heap: &Heap, syms: &SymbolTable,
+                           bound: &HashSet<String>,
+                           fv: &mut Vec<String>, seen: &mut HashSet<String>) {
+        while heap.is_pair(list) {
+            self.walk_free_vars(heap.car(list), heap, syms, bound, fv, seen);
+            list = heap.cdr(list);
+        }
+    }
+
+    /// Handle a lambda expression — lift it and return make_closure code.
+    fn compile_lambda(&self, rest: Val, heap: &Heap, syms: &SymbolTable) -> String {
+        let params_list = heap.car(rest);
+        let body_list = heap.cdr(rest);
+
+        // Collect params
+        let mut params = Vec::new();
+        let mut p = params_list;
+        while heap.is_pair(p) {
+            if let Some(pname) = syms.symbol_name(heap.car(p)) {
+                params.push(pname.to_string());
+            }
+            p = heap.cdr(p);
+        }
+
+        // Analyze free variables
+        let bound: HashSet<String> = params.iter().cloned().collect();
+        // Also add global names to bound so they aren't captured
+        // (globals are available to top-level functions but NOT to lifted lambdas,
+        //  so we actually DO want to capture them)
+        let fvs = self.collect_free_vars_list(body_list, heap, syms, &bound);
+
+        // Assign ID
+        let id = self.next_lambda_id.get();
+        self.next_lambda_id.set(id + 1);
+
+        // Store lifted lambda
+        self.lifted.borrow_mut().push(LiftedLambda {
+            id,
+            params,
+            free_vars: fvs.clone(),
+            body_list,
+        });
+
+        // Emit closure creation
+        if fvs.is_empty() {
+            format!("make_closure({id}, Val::NIL)")
+        } else {
+            let mut env = "Val::NIL".to_string();
+            for fv in fvs.iter().rev() {
+                let rv = rust_ident(fv);
+                env = format!("cons({rv}, {env})");
+            }
+            format!("make_closure({id}, {env})")
+        }
+    }
+
+    fn collect_free_vars_list(&self, list: Val, heap: &Heap, syms: &SymbolTable,
+                              bound: &HashSet<String>) -> Vec<String> {
+        let mut fv = Vec::new();
+        let mut seen = HashSet::new();
+        self.walk_free_vars_list(list, heap, syms, bound, &mut fv, &mut seen);
+        fv
+    }
+
+    /// Emit a lifted lambda function definition.
+    fn emit_lifted_lambda(&self, lambda: &LiftedLambda, heap: &Heap, syms: &SymbolTable) -> String {
+        let lname = format!("__lambda_{}", lambda.id);
+        let mut rparams = vec!["__env: Val".to_string()];
+        for p in &lambda.params {
+            rparams.push(format!("{}: Val", rust_ident(p)));
+        }
+        let params_str = rparams.join(", ");
+
+        let mut out = format!("fn {lname}({params_str}) -> Val {{\n");
+
+        // Extract free vars from env
+        for (i, fv) in lambda.free_vars.iter().enumerate() {
+            let rv = rust_ident(fv);
+            let access = if i == 0 {
+                "car(__env)".to_string()
+            } else {
+                let mut s = "__env".to_string();
+                for _ in 0..i {
+                    s = format!("cdr({s})");
+                }
+                format!("car({s})")
+            };
+            out.push_str(&format!("    let {rv} = {access};\n"));
+        }
+
+        // Emit body
+        out.push_str(&self.emit_begin(lambda.body_list, heap, syms, 1));
+        out.push_str("}\n\n");
+        out
+    }
+
+    /// Generate the dispatch_closure function.
+    fn emit_dispatch(&self, _heap: &Heap, _syms: &SymbolTable) -> String {
+        let mut out = String::new();
+        out.push_str("fn dispatch_closure(closure: Val, args: &[Val]) -> Val {\n");
+        out.push_str("    let code_id = car(closure).as_fixnum().unwrap();\n");
+        out.push_str("    let __env = cdr(closure);\n");
+        out.push_str("    match code_id {\n");
+
+        // Top-level functions (IDs 0..N-1)
+        for (i, (name, params, _)) in self.functions.iter().enumerate() {
+            let fname = rust_ident(name);
+            let args: Vec<String> = (0..params.len())
+                .map(|j| format!("args[{j}]"))
+                .collect();
+            let args_str = args.join(", ");
+            out.push_str(&format!("        {i} => {fname}({args_str}),\n"));
+        }
+
+        // Lifted lambdas (IDs N..)
+        for lambda in self.lifted.borrow().iter() {
+            let lname = format!("__lambda_{}", lambda.id);
+            let mut args = vec!["__env".to_string()];
+            for j in 0..lambda.params.len() {
+                args.push(format!("args[{j}]"));
+            }
+            let args_str = args.join(", ");
+            out.push_str(&format!("        {} => {lname}({args_str}),\n", lambda.id));
+        }
+
+        out.push_str("        _ => Val::NIL,\n");
+        out.push_str("    }\n");
+        out.push_str("}\n\n");
+        out
+    }
+
     /// Emit the compiled Rust program as a string.
     pub fn emit_rust(&self, heap: &Heap, syms: &SymbolTable) -> String {
+        // Lambda IDs: top-level functions get 0..N-1, lifted lambdas start at N
+        self.next_lambda_id.set(self.functions.len());
+
         let mut out = String::new();
 
         // Header
         out.push_str("// Generated by wispy-scheme compiler\n");
-        out.push_str("#![allow(non_snake_case, unused_variables, unused_mut, unused_parens)]\n\n");
+        out.push_str("#![allow(non_snake_case, unused_variables, unused_mut, unused_parens, dead_code)]\n\n");
 
         // Inline the Cayley table
         out.push_str("// 32×32 Cayley table (1KB)\n");
@@ -103,6 +440,7 @@ impl Compiler {
         out.push_str(&format!("const TAG_TOP: u8 = {};\n", table::TOP));
         out.push_str(&format!("const TAG_BOT: u8 = {};\n", table::BOT));
         out.push_str(&format!("const TAG_PAIR: u8 = {};\n", table::T_PAIR));
+        out.push_str(&format!("const TAG_CLS: u8 = {};\n", table::T_CLS));
         out.push_str("\n");
 
         // Inline the table data
@@ -120,7 +458,6 @@ impl Compiler {
             ("Q", table::Q), ("E", table::E),
             ("CAR", table::CAR), ("CDR", table::CDR), ("CONS", table::CONS),
             ("RHO", table::RHO), ("APPLY", table::APPLY), ("CC", table::CC),
-            // TAU clashes with the tau() function name — Rust is case-sensitive so it's fine
             ("TAU", table::TAU), ("Y", table::Y),
             ("T_PAIR", table::T_PAIR), ("T_SYM", table::T_SYM),
             ("T_CLS", table::T_CLS), ("T_STR", table::T_STR),
@@ -134,39 +471,68 @@ impl Compiler {
         }
         out.push_str("\n");
 
-        // Function definitions
+        // ── Code generation (may discover lambdas) ─────────────────
+
+        // Collect function bodies (this triggers lambda lifting)
+        let mut func_code = String::new();
         for (name, params, body) in &self.functions {
             let rname = rust_ident(name);
             let rparams: Vec<String> = params.iter()
                 .map(|p| format!("{}: Val", rust_ident(p)))
                 .collect();
             let params_str = rparams.join(", ");
-
-            out.push_str(&format!("fn {rname}({params_str}) -> Val {{\n"));
+            func_code.push_str(&format!("fn {rname}({params_str}) -> Val {{\n"));
             let body_code = self.emit_expr(*body, heap, syms, 1);
-            out.push_str(&body_code);
-            out.push_str("}\n\n");
+            func_code.push_str(&body_code);
+            func_code.push_str("}\n\n");
         }
+
+        // Collect global + main code (may also lift lambdas)
+        let mut globals_code = String::new();
+        for (name, init) in &self.globals {
+            let rname = rust_ident(name);
+            let init_code = self.emit_expr_inline(*init, heap, syms);
+            globals_code.push_str(&format!("    let mut {rname} = {init_code};\n"));
+        }
+        let mut main_code = String::new();
+        for &expr in &self.main_exprs {
+            let code = self.emit_expr_inline(expr, heap, syms);
+            main_code.push_str(&format!("    {{ let _ = {code}; }}\n"));
+        }
+
+        // Emit lifted lambdas (fixpoint: emitting bodies may discover more)
+        let mut lifted_code = String::new();
+        let mut emitted = 0;
+        loop {
+            let lambdas_to_emit: Vec<LiftedLambda>;
+            {
+                let all = self.lifted.borrow();
+                if emitted >= all.len() { break; }
+                lambdas_to_emit = all[emitted..].to_vec();
+                emitted = all.len();
+            }
+            for lambda in &lambdas_to_emit {
+                lifted_code.push_str(&self.emit_lifted_lambda(lambda, heap, syms));
+            }
+        }
+
+        // ── Assemble output ─────────────────────────────────────────
+
+        // Top-level Scheme functions
+        out.push_str(&func_code);
+
+        // Lifted lambda functions
+        out.push_str(&lifted_code);
+
+        // dispatch_closure (must come after all functions are defined)
+        out.push_str(&self.emit_dispatch(heap, syms));
 
         // Main
         out.push_str("fn main() {\n");
         out.push_str("    heap_init();\n");
-
-        // Global variables
-        for (name, init) in &self.globals {
-            let rname = rust_ident(name);
-            let init_code = self.emit_expr_inline(*init, heap, syms);
-            out.push_str(&format!("    let mut {rname} = {init_code};\n"));
-        }
+        out.push_str(&globals_code);
         out.push_str("\n");
-
-        // Main expressions
-        for &expr in &self.main_exprs {
-            // Need to use block expressions in main so they compile as statements
-            let code = self.emit_expr_inline(expr, heap, syms);
-            out.push_str(&format!("    {{ let _ = {code}; }}\n"));
-        }
-
+        out.push_str(&main_code);
         out.push_str("}\n");
         out
     }
@@ -205,6 +571,10 @@ impl Compiler {
 
         if tag == table::T_SYM {
             let name = syms.symbol_name(expr).unwrap_or("_");
+            // Known function in value position → wrap as closure
+            if let Some(id) = self.function_closure_id(name) {
+                return format!("{pad}make_closure({id}, Val::NIL)\n");
+            }
             return format!("{pad}{}\n", rust_ident(name));
         }
 
@@ -482,11 +852,8 @@ impl Compiler {
                 }
 
                 "lambda" => {
-                    // Lambda as value: emit a Rust closure
-                    // For now, only handles lambdas that are immediately called
-                    // or passed to known higher-order functions.
-                    // Full closure conversion is future work.
-                    return format!("{pad}Val::NIL // lambda-as-value not yet compiled\n");
+                    let code = self.compile_lambda(rest, heap, syms);
+                    return format!("{pad}{code}\n");
                 }
 
                 // Additional builtins
@@ -583,8 +950,8 @@ impl Compiler {
                 }
                 "apply" => {
                     let f = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let args = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}apply_fn({f}, {args})\n");
+                    let args_list = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}apply_val({f}, {args_list})\n");
                 }
 
                 // ── Algebra extension ────────────
@@ -619,13 +986,27 @@ impl Compiler {
                         a = heap.cdr(a);
                     }
                     let args_str = args.join(", ");
-                    return format!("{pad}{fname}({args_str})\n");
+                    if self.is_known_function(name) {
+                        return format!("{pad}{fname}({args_str})\n");
+                    } else {
+                        return format!("{pad}call_val({fname}, &[{args_str}])\n");
+                    }
                 }
             }
         }
 
-        // Generic function call (head is not a symbol)
-        format!("{pad}Val::NIL // unhandled\n")
+        // Generic function call (head is not a symbol) — e.g. ((lambda ...) args)
+        {
+            let head_code = self.emit_expr_inline(head, heap, syms);
+            let mut args = Vec::new();
+            let mut a = rest;
+            while heap.is_pair(a) {
+                args.push(self.emit_expr_inline(heap.car(a), heap, syms));
+                a = heap.cdr(a);
+            }
+            let args_str = args.join(", ");
+            format!("{pad}call_val({head_code}, &[{args_str}])\n")
+        }
     }
 
     /// Emit an expression as an inline Rust expression (no trailing newline).
@@ -641,7 +1022,12 @@ impl Compiler {
         }
         let tag = heap.tag(expr);
         if tag == table::T_SYM {
-            return rust_ident(syms.symbol_name(expr).unwrap_or("_"));
+            let name = syms.symbol_name(expr).unwrap_or("_");
+            // Known function in value position → wrap as closure
+            if let Some(id) = self.function_closure_id(name) {
+                return format!("make_closure({id}, Val::NIL)");
+            }
+            return rust_ident(name);
         }
         if tag != table::T_PAIR {
             return "Val::NIL".to_string();
@@ -852,6 +1238,9 @@ impl Compiler {
                 "permissive-mode" => {
                     return "Val::NIL".to_string();
                 }
+                "lambda" => {
+                    return self.compile_lambda(rest, heap, syms);
+                }
                 _ => {
                     let fname = rust_ident(name);
                     let mut args = Vec::new();
@@ -860,12 +1249,27 @@ impl Compiler {
                         args.push(self.emit_expr_inline(heap.car(a), heap, syms));
                         a = heap.cdr(a);
                     }
-                    return format!("{fname}({})", args.join(", "));
+                    if self.is_known_function(name) {
+                        return format!("{fname}({})", args.join(", "));
+                    } else {
+                        return format!("call_val({fname}, &[{}])", args.join(", "));
+                    }
                 }
             }
         }
 
-        "Val::NIL".to_string()
+        // Generic call (head is not a symbol) — e.g. ((lambda ...) args)
+        {
+            let head_code = self.emit_expr_inline(head, heap, syms);
+            let mut args = Vec::new();
+            let mut a = rest;
+            while heap.is_pair(a) {
+                args.push(self.emit_expr_inline(heap.car(a), heap, syms));
+                a = heap.cdr(a);
+            }
+            let args_str = args.join(", ");
+            format!("call_val({head_code}, &[{args_str}])")
+        }
     }
 
     fn emit_begin(&self, mut body: Val, heap: &Heap, syms: &SymbolTable, indent: usize) -> String {
@@ -1238,6 +1642,38 @@ fn display(v: Val) {
         }
     }
 }
+
+// ── Closure support ──────────────────────────────────────────────
+
+fn make_closure(code_id: i64, env: Val) -> Val {
+    unsafe {
+        let idx = HEAP.len();
+        HEAP.push(Rib { car: Val::fixnum(code_id), cdr: env, tag: TAG_CLS });
+        Val::rib(idx)
+    }
+}
+
+fn call_val(f: Val, args: &[Val]) -> Val {
+    if !f.is_fixnum() && f != Val::NIL {
+        unsafe {
+            if HEAP[f.as_rib()].tag == TAG_CLS {
+                return dispatch_closure(f, args);
+            }
+        }
+    }
+    Val::NIL
+}
+
+fn apply_val(f: Val, args_list: Val) -> Val {
+    // Unpack a Scheme list into a slice and call_val
+    let mut args = Vec::new();
+    let mut l = args_list;
+    while l != Val::NIL && !l.is_fixnum() {
+        args.push(car(l));
+        l = cdr(l);
+    }
+    call_val(f, &args)
+}
 "#;
 
 /// Compile a Scheme source string to a Rust program string.
@@ -1582,5 +2018,83 @@ mod tests {
             (newline)
         ");
         assert_eq!(out.trim(), "10");
+    }
+
+    // ── Closure tests ────────────────────────────────
+
+    #[test]
+    fn compiled_closure_basic() {
+        let out = compile_and_run("
+            (define (make-adder n) (lambda (x) (+ x n)))
+            (define add10 (make-adder 10))
+            (display (add10 32))
+            (newline)
+        ");
+        assert_eq!(out.trim(), "42");
+    }
+
+    #[test]
+    fn compiled_closure_as_arg() {
+        let out = compile_and_run("
+            (define (apply-twice f x) (f (f x)))
+            (define (add1 x) (+ x 1))
+            (display (apply-twice add1 5))
+            (newline)
+        ");
+        assert_eq!(out.trim(), "7");
+    }
+
+    #[test]
+    fn compiled_closure_lambda_arg() {
+        let out = compile_and_run("
+            (define (apply-twice f x) (f (f x)))
+            (display (apply-twice (lambda (x) (* x 2)) 3))
+            (newline)
+        ");
+        assert_eq!(out.trim(), "12");
+    }
+
+    #[test]
+    fn compiled_closure_nested() {
+        let out = compile_and_run("
+            (define (make-adder n) (lambda (x) (+ x n)))
+            (define (apply-it f x) (f x))
+            (display (apply-it (make-adder 100) 23))
+            (newline)
+        ");
+        assert_eq!(out.trim(), "123");
+    }
+
+    #[test]
+    fn compiled_closure_map() {
+        let out = compile_and_run("
+            (define (map f lst)
+              (if (null? lst) '()
+                  (cons (f (car lst)) (map f (cdr lst)))))
+            (display (map (lambda (x) (* x x)) (list 1 2 3 4)))
+            (newline)
+        ");
+        assert_eq!(out.trim(), "(1 4 9 16)");
+    }
+
+    #[test]
+    fn compiled_closure_let_lambda() {
+        let out = compile_and_run("
+            (define (go)
+              (let ((f (lambda (x) (* x 2))))
+                (display (f 21))))
+            (go)
+            (newline)
+        ");
+        assert_eq!(out.trim(), "42");
+    }
+
+    #[test]
+    fn compiled_closure_immediate_lambda() {
+        let out = compile_and_run("
+            (display ((lambda (x y) (+ x y)) 13 29))
+            (newline)
+        ");
+        assert_eq!(out.trim(), "42");
     }
 }

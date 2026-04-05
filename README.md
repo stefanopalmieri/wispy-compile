@@ -118,7 +118,7 @@ src/
 Three execution paths:
 - **Interpreter** (`eval.rs`): tail call optimization, 104 builtins, `(strict-mode)` / `(permissive-mode)` toggle
 - **CPS evaluator** (`cps.rs`): first-class continuations, `call/cc`, re-entrant
-- **Compiler** (`compile.rs`): Scheme → standalone Rust, 1.5x faster than LuaJIT on nqueens(8). Handles `if`, `cond`, `case`, `let`, `let*`, `letrec`, `begin`, `and`, `or`, `do`, `quote`, `set!`, `define`, `list`, variadic `+`/`*`, and 40+ inlined builtins.
+- **Compiler** (`compile.rs`): Scheme → standalone Rust, 1.5x faster than LuaJIT on nqueens(8). Closure conversion (lambda lifting + free variable analysis), `if`, `cond`, `case`, `let`, `let*`, `letrec`, `begin`, `and`, `or`, `do`, `quote`, `set!`, `define`, `lambda`, `list`, variadic `+`/`*`, 40+ inlined builtins, and the algebra extension.
 
 ## R4RS Coverage
 
@@ -178,7 +178,7 @@ cargo check --no-default-features --lib
 
 - **Lean verification.** Prove the 32×32 table's algebraic properties in Lean 4 via `native_decide` (1024 entries, well within capacity).
 
-- **Compiler improvements.** Closure conversion (lambda as value), tail call optimization via loop, `call/cc` support in compiled output, string literals in compiled code.
+- **Compiler improvements.** Tail call optimization via loop, `call/cc` support in compiled output, string literals in compiled code.
 
 - **Embedded demo.** Run WispyScheme on an RP2040 or ESP32-C3: read sensor values, apply user-defined Scheme rules, actuate outputs. Upload new `.scm` files over serial without reflashing.
 
