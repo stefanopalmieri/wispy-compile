@@ -132,17 +132,18 @@ Three execution paths:
 
 **Control:** `call-with-current-continuation` (CPS evaluator), tail call optimization, rest parameters
 
-**104 builtin procedures** covering arithmetic, comparison, pairs/lists, type predicates, booleans, equivalence, strings, vectors, characters, symbols, higher-order functions, and I/O.
+**114 builtin procedures** covering arithmetic, comparison, pairs/lists, type predicates, booleans, equivalence, strings (including case-insensitive), vectors, characters (including case-insensitive), symbols, higher-order functions, and I/O.
 
-### Not yet implemented
+### Not yet implemented (R4RS)
 
 - `read` (S-expression input from ports)
 - Port I/O (`open-input-file`, `open-output-file`, `close-input-port`, `close-output-port`, `current-input-port`, `current-output-port`, `call-with-input-file`, `call-with-output-file`, `input-port?`, `output-port?`, `peek-char`, `char-ready?`)
 - `load`
-- Case-insensitive character and string comparisons (`char-ci=?`, `string-ci=?`, etc.)
 - `dynamic-wind`
-- Full macro hygiene (current implementation is unhygienic — macro-introduced bindings can capture)
+- Full macro hygiene (current implementation is unhygienic)
 - `call/cc` in the compiler (only the CPS evaluator supports `call/cc`)
+
+See [`docs/r7rs-small-plan.md`](docs/r7rs-small-plan.md) for the path to R7RS-small compliance.
 
 ## The Cayley Table
 
