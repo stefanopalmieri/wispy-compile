@@ -4,14 +4,14 @@ WispyScheme currently targets R4RS. This document plans the path to R7RS-small c
 
 ## Current State
 
-**What we have (R4RS):**
-- 155 tests, 14 Lean theorems
+**What we have (R4RS, nearly complete):**
+- 174 tests, 14 Lean theorems
 - `syntax-rules` with ellipsis, literals, multiple clauses
 - `call/cc` (CPS evaluator)
 - TCO in compiler (self-tail-calls → loops)
 - Closures in compiler (lambda lifting + free variable analysis)
-- Strings, characters, vectors
-- 104 builtin procedures
+- Strings, characters, vectors, ports, `read`, `load`
+- 129 builtin procedures (including case-insensitive comparisons)
 - Algebra extension (dot, tau, type-valid?)
 - `no_std` bare-metal support
 - REPL + CLI + compiler
@@ -34,10 +34,10 @@ WispyScheme currently targets R4RS. This document plans the path to R7RS-small c
 
 Estimated effort: 1-2 sessions. No architectural changes.
 
-**1.1 `define-record-type` (SRFI-9 style)**
+**1.1 `define-record-type` (SRFI-9 style) + `match`**
 
-Implement as a macro expanding to constructor, predicate, and accessors.
-Uses a new rib tag (`T_RECORD = 23`, from our reserved slots).
+Implement `define-record-type` as a macro expanding to constructor, predicate,
+and accessors. Uses a new rib tag (`T_RECORD = 23`, from our reserved slots).
 
 ```scheme
 (define-record-type <point> (make-point x y) point?
@@ -51,6 +51,24 @@ Uses a new rib tag (`T_RECORD = 23`, from our reserved slots).
 ;; - point-y: cdr of the rib (for 2-field records)
 ;; - For >2 fields: nested cons cells
 ```
+
+Combine with a `match` form (inspired by Gerbil's pattern matching) that
+uses `tau` internally for type dispatch:
+
+```scheme
+(match value
+  ((? point? p) (+ (point-x p) (point-y p)))
+  ((? pair?)    (car value))
+  ((? number?)  (* value 2))
+  ([a b c]      (+ a b c))      ; list destructuring
+  (else         0))
+```
+
+The `match` desugars to `tau` + `cond`. The algebra does the dispatch.
+This makes the table visible to the programmer at the pattern-matching
+level, not just through the raw `dot`/`tau` API. This is WispyScheme's
+answer to Gerbil's interface devirtualization: type-based dispatch as
+a language feature backed by the algebraic table.
 
 **1.2 `case-lambda`**
 
@@ -90,13 +108,9 @@ Feature-based conditional compilation. We define WispyScheme's feature set:
 
 Features to advertise: `r7rs`, `wispy-scheme`, `no-std` (when applicable), `exact-closed`, `ieee-float` (if we add floats).
 
-**1.5 Expose `read` as a Scheme procedure**
+**1.5 Expose `read` as a Scheme procedure** ✅ DONE
 
-We already have a reader. Wrap it as a builtin that reads from the current input port (stdin initially).
-
-```scheme
-(read)  ; reads one S-expression from current-input-port
-```
+Implemented as builtin 130 with full port support.
 
 **1.6 `(scheme process-context)` basics**
 
@@ -118,8 +132,8 @@ We already have a reader. Wrap it as a builtin that reads from the current input
 - `string->vector`, `vector->string`
 - `string-for-each`, `vector-for-each`, `vector-map`
 - `make-list`, `list-copy`
-- `char-ci=?`, `char-ci<?`, etc. (case-insensitive)
-- `string-ci=?`, `string-ci<?`, etc.
+- ~~`char-ci=?`, `char-ci<?`, etc.~~ ✅ DONE
+- ~~`string-ci=?`, `string-ci<?`, etc.~~ ✅ DONE
 - `let-values`, `let*-values`
 
 ### Phase 2: Library System
@@ -144,6 +158,15 @@ Estimated effort: 2-3 sessions. This is the hardest piece.
 | Namespace isolation | Separate environments vs prefix mangling | Separate environments (cleaner) |
 | Compilation unit | Library = one compiled module | Yes, matches Rust's module model |
 | Built-in libraries | Hardcoded vs self-hosted | Hybrid: `(scheme base)` hardcoded, others in Scheme |
+| Instantiation | Single (Gerbil) vs multi (Racket) | **Single instantiation** (Gerbil model) |
+
+**Why single instantiation (from Gerbil):** Modules are evaluated once, at
+load time. Subsequent imports get the cached bindings. This enables aggressive
+ahead-of-time compilation because the compiler knows every module's state is
+fixed after loading. Multi-instantiation (Racket's model) requires runtime
+bookkeeping that conflicts with our `no_std` and native compilation goals.
+Single instantiation matches both Rust's module model and our compiler's
+architecture (Scheme → standalone Rust binary).
 
 **2.3 Implementation plan**
 
@@ -268,6 +291,41 @@ Estimated effort: 1 session. Needed for full `call/cc` correctness.
 
 Ensures `before` runs on entry and `after` runs on exit, even when continuations jump in and out. Implementation: maintain a wind stack in the evaluator; `call/cc` captures it; invoking a continuation replays the wind/unwind sequence.
 
+### Phase 7: Compiler Type Propagation
+
+Estimated effort: 2-3 sessions. Performance optimization, not compliance.
+
+Inspired by Gerbil's interface devirtualization: when the compiler can
+prove a value's type at compile time, eliminate the table lookup entirely.
+
+**The insight:** `(car (cons x y))` always operates on a pair. The compiler
+knows `cons` returns `T_PAIR`. So `TABLE[CAR][T_PAIR]` is a compile-time
+constant (`T_PAIR`, meaning "valid"). The runtime check is unnecessary.
+
+**Implementation:**
+
+1. **Type environment.** During compilation, track the known type of each
+   variable. `cons` always returns `T_PAIR`. `make-point` always returns
+   `T_RECORD`. Fixnum arithmetic always returns a fixnum.
+
+2. **Type propagation through control flow.** In `(if (pair? x) (car x) 0)`,
+   inside the consequent branch, `x` is known to be a pair. The `car` call
+   can skip the table lookup.
+
+3. **Constant folding through the table.** When both the operator and the
+   type tag are known, `dot(op, tag)` is a compile-time constant. This is
+   the algebraic version of Gerbil's devirtualization: the table lookup
+   becomes a constant.
+
+4. **match optimization.** When `match` is compiled, the `tau` call on
+   a known-type value can be eliminated. Each branch can assume the type
+   and skip redundant checks.
+
+This is WispyScheme's unique optimization story: the finite table means
+type dispatch is *always* constant-foldable when the type is known. No
+other Scheme can make this claim because no other Scheme has a finite,
+explicit operational semantics.
+
 ## Table Impact
 
 The 32×32 table has reserved slots 23-31 (9 elements). R7RS-small needs:
@@ -312,20 +370,28 @@ Phase 5 (depends on Phase 3 for interaction with exceptions)
 
 Phase 6 (depends on Phase 3 + Phase 5)
   └── dynamic-wind
+
+Phase 7 (independent, performance)
+  └── Compiler type propagation
+      ├── Type environment tracking
+      ├── Constant folding through the table
+      └── match optimization
 ```
 
 ## Effort Estimate
 
 | Phase | Effort | Tests added | Cumulative |
 |---|---|---|---|
-| Phase 1 | 1-2 sessions | ~20 | ~175 |
-| Phase 2 | 2-3 sessions | ~15 | ~190 |
-| Phase 3 | 1-2 sessions | ~10 | ~200 |
-| Phase 4 | 2-3 sessions | ~15 | ~215 |
-| Phase 5 | 1 session | ~5 | ~220 |
-| Phase 6 | 1 session | ~5 | ~225 |
+| Phase 1 | 1-2 sessions | ~20 | ~194 |
+| Phase 2 | 2-3 sessions | ~15 | ~209 |
+| Phase 3 | 1-2 sessions | ~10 | ~219 |
+| Phase 4 | 2-3 sessions | ~15 | ~234 |
+| Phase 5 | 1 session | ~5 | ~239 |
+| Phase 6 | 1 session | ~5 | ~244 |
+| Phase 7 | 2-3 sessions | ~10 | ~254 |
 
-Total: ~10-12 sessions from R4RS to R7RS-small.
+Total: ~12-15 sessions from current state to R7RS-small + optimized compiler.
+(Phase 7 is independent and can be done in parallel with Phases 3-6.)
 
 ## What We Can Skip (Per R7RS-small)
 
@@ -337,19 +403,21 @@ R7RS-small allows implementations to omit:
 
 Our integer-only numeric tower is valid. We document it as a feature: `(cond-expand (exact-closed ...) ...)`.
 
-## Comparison with Chibi
+## Comparison
 
-| Aspect | Chibi Scheme | WispyScheme target |
-|---|---|---|
-| Language | C (17%) + Scheme (73%) | Rust (100%) |
-| Size | ~50K lines | ~5K lines (current), ~10K estimated |
-| VM | Bytecode interpreter | Table-driven eval + native compiler |
-| GC | Mark-sweep | Bump allocator (+ optional MMTk Immix) |
-| Numeric tower | Full (rational, complex) | Integer-only |
-| Unicode | Full | ASCII (extensible) |
-| Library resolution | File-based (.sld) | File-based (.sld), same convention |
-| Embedding | C API | Rust crate (`no_std` compatible) |
-| Unique feature | Reference implementation status | Algebraic type dispatch (Cayley table) |
+| Aspect | Chibi Scheme | Gerbil Scheme | WispyScheme target |
+|---|---|---|---|
+| Language | C + Scheme | Scheme (on Gambit) | Rust (100%) |
+| Size | ~50K lines | ~100K+ lines | ~5K (current), ~10K est. |
+| VM | Bytecode interpreter | Gambit C backend | Table-driven eval + native compiler |
+| GC | Mark-sweep | Gambit GC | Bump allocator (+ optional MMTk) |
+| Module instantiation | Multi (R7RS) | Single (AOT-friendly) | **Single** (Gerbil model) |
+| Type dispatch | Tag bits + branch | Interfaces + devirtualization | **Cayley table lookup** |
+| Macro system | syntax-rules | syntax-case (full tower) | syntax-rules (unhygienic) |
+| Pattern matching | via library | Built-in match | **match via tau** (planned) |
+| Numeric tower | Full | Full | Integer-only |
+| Embedding | C API | Gambit C API | Rust crate (`no_std`) |
+| Unique feature | R7RS-small reference | Actor system, interfaces | Algebraic dispatch, Lean-proved |
 
 ## Success Criteria
 
