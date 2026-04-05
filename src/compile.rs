@@ -29,6 +29,13 @@ struct LiftedLambda {
     body_list: Val, // list of body expressions (use emit_begin)
 }
 
+/// TCO context for the function currently being compiled.
+#[derive(Clone)]
+struct TcoContext {
+    fn_name: String,
+    params: Vec<String>,
+}
+
 /// Compiler state.
 pub struct Compiler {
     /// Collected top-level function definitions: (name, params, body)
@@ -41,6 +48,8 @@ pub struct Compiler {
     lifted: RefCell<Vec<LiftedLambda>>,
     /// Next lambda ID to assign (starts at functions.len())
     next_lambda_id: Cell<usize>,
+    /// Current function's TCO context (set during function body emission)
+    tco: RefCell<Option<TcoContext>>,
 }
 
 impl Compiler {
@@ -51,6 +60,7 @@ impl Compiler {
             globals: Vec::new(),
             lifted: RefCell::new(Vec::new()),
             next_lambda_id: Cell::new(0),
+            tco: RefCell::new(None),
         }
     }
 
@@ -103,6 +113,68 @@ impl Compiler {
                 body_list
             };
             self.functions.push((name, params, body));
+        }
+    }
+
+    // ── TCO helpers ────────────────────────────────────────────────
+
+    /// Check if an expression contains a self-tail-call to `fn_name`.
+    /// Walks into tail positions only: if branches, begin last, let/let*/letrec body.
+    fn has_self_tail_call(&self, expr: Val, fn_name: &str,
+                          heap: &Heap, syms: &SymbolTable) -> bool {
+        if !heap.is_pair(expr) { return false; }
+        let head = heap.car(expr);
+        let rest = heap.cdr(expr);
+        if !heap.is_symbol(head) { return false; }
+        let name = syms.symbol_name(head).unwrap_or("");
+        match name {
+            "if" => {
+                let conseq = heap.car(heap.cdr(rest));
+                let alt = heap.car(heap.cdr(heap.cdr(rest)));
+                self.has_self_tail_call(conseq, fn_name, heap, syms)
+                    || self.has_self_tail_call(alt, fn_name, heap, syms)
+            }
+            "begin" => {
+                self.has_self_tail_call_in_begin(rest, fn_name, heap, syms)
+            }
+            "let" | "let*" | "letrec" => {
+                let body = heap.cdr(rest);
+                self.has_self_tail_call_in_begin(body, fn_name, heap, syms)
+            }
+            "cond" => {
+                let mut clauses = rest;
+                while heap.is_pair(clauses) {
+                    let clause = heap.car(clauses);
+                    let body = heap.cdr(clause);
+                    if self.has_self_tail_call_in_begin(body, fn_name, heap, syms) {
+                        return true;
+                    }
+                    clauses = heap.cdr(clauses);
+                }
+                false
+            }
+            _ => name == fn_name,
+        }
+    }
+
+    /// Check if the last expression in a begin-style list has a self-tail-call.
+    fn has_self_tail_call_in_begin(&self, mut list: Val, fn_name: &str,
+                                    heap: &Heap, syms: &SymbolTable) -> bool {
+        let mut last = Val::NIL;
+        while heap.is_pair(list) {
+            last = heap.car(list);
+            list = heap.cdr(list);
+        }
+        self.has_self_tail_call(last, fn_name, heap, syms)
+    }
+
+    /// When inside a TCO loop, wrap a value expression with `return`.
+    /// Otherwise, return as-is (implicit return from function).
+    fn tco_return(&self, pad: &str, expr_code: &str) -> String {
+        if self.tco.borrow().is_some() {
+            format!("{pad}return {expr_code}\n")
+        } else {
+            format!("{pad}{expr_code}\n")
         }
     }
 
@@ -479,14 +551,36 @@ impl Compiler {
         let mut func_code = String::new();
         for (name, params, body) in &self.functions {
             let rname = rust_ident(name);
-            let rparams: Vec<String> = params.iter()
-                .map(|p| format!("{}: Val", rust_ident(p)))
-                .collect();
-            let params_str = rparams.join(", ");
-            func_code.push_str(&format!("fn {rname}({params_str}) -> Val {{\n"));
-            let body_code = self.emit_expr(*body, heap, syms, 1);
-            func_code.push_str(&body_code);
-            func_code.push_str("}\n\n");
+            let needs_tco = self.has_self_tail_call(*body, name, heap, syms);
+
+            if needs_tco {
+                // Emit with mut params and loop wrapper
+                let rparams: Vec<String> = params.iter()
+                    .map(|p| format!("mut {}: Val", rust_ident(p)))
+                    .collect();
+                let params_str = rparams.join(", ");
+                func_code.push_str(&format!("fn {rname}({params_str}) -> Val {{\n"));
+                func_code.push_str("    loop {\n");
+                // Set TCO context
+                *self.tco.borrow_mut() = Some(TcoContext {
+                    fn_name: name.clone(),
+                    params: params.clone(),
+                });
+                let body_code = self.emit_expr(*body, heap, syms, 2);
+                func_code.push_str(&body_code);
+                *self.tco.borrow_mut() = None;
+                func_code.push_str("    }\n");
+                func_code.push_str("}\n\n");
+            } else {
+                let rparams: Vec<String> = params.iter()
+                    .map(|p| format!("{}: Val", rust_ident(p)))
+                    .collect();
+                let params_str = rparams.join(", ");
+                func_code.push_str(&format!("fn {rname}({params_str}) -> Val {{\n"));
+                let body_code = self.emit_expr(*body, heap, syms, 1);
+                func_code.push_str(&body_code);
+                func_code.push_str("}\n\n");
+            }
         }
 
         // Collect global + main code (may also lift lambdas)
@@ -553,44 +647,17 @@ impl Compiler {
         s
     }
 
-    /// Emit an expression as a Rust return statement.
+    /// Emit an expression in tail position (last expression in a block).
+    /// When inside a TCO loop, leaf values are wrapped with `return`,
+    /// and self-tail-calls are transformed to `continue`.
     fn emit_expr(&self, expr: Val, heap: &Heap, syms: &SymbolTable, indent: usize) -> String {
         let pad = "    ".repeat(indent);
 
-        if expr.is_fixnum() {
-            return format!("{pad}Val::fixnum({})\n", expr.as_fixnum().unwrap());
-        }
-
-        if expr == Val::NIL {
-            return format!("{pad}Val::NIL\n");
-        }
-
-        if !expr.is_rib() {
-            return format!("{pad}Val::NIL\n");
-        }
-
-        let tag = heap.tag(expr);
-
-        if tag == table::T_SYM {
-            let name = syms.symbol_name(expr).unwrap_or("_");
-            // Known function in value position → wrap as closure
-            if let Some(id) = self.function_closure_id(name) {
-                return format!("{pad}make_closure({id}, Val::NIL)\n");
-            }
-            return format!("{pad}{}\n", rust_ident(name));
-        }
-
-        if tag == table::T_STR {
-            return format!("{pad}{}\n", self.emit_string_rib(expr, heap));
-        }
-
-        if tag == table::T_CHAR {
-            let cp = heap.rib_car(expr).as_fixnum().unwrap_or(0);
-            return format!("{pad}make_char({cp})\n");
-        }
-
-        if tag != table::T_PAIR {
-            return format!("{pad}Val::NIL\n");
+        // Only control-flow forms need special handling in emit_expr.
+        // Everything else delegates to emit_expr_inline + tco_return.
+        if !heap.is_pair(expr) || heap.tag(expr) != table::T_PAIR {
+            let code = self.emit_expr_inline(expr, heap, syms);
+            return self.tco_return(&pad, &code);
         }
 
         let head = heap.car(expr);
@@ -600,12 +667,7 @@ impl Compiler {
             let name = syms.symbol_name(head).unwrap_or("");
 
             match name {
-                "quote" => {
-                    let datum = heap.car(rest);
-                    let d = self.emit_datum(datum, heap, syms);
-                    return format!("{pad}{d}\n");
-                }
-
+                // ── Control-flow forms that propagate tail position ──
                 "if" => {
                     let test = heap.car(rest);
                     let rest2 = heap.cdr(rest);
@@ -705,400 +767,50 @@ impl Compiler {
                     return self.emit_case(rest, heap, syms, indent);
                 }
 
-                "and" => {
-                    if rest == Val::NIL {
-                        return format!("{pad}Val::fixnum(1) // #t\n");
-                    }
-                    let mut parts = Vec::new();
-                    let mut r = rest;
-                    while heap.is_pair(r) {
-                        parts.push(self.emit_expr_inline(heap.car(r), heap, syms));
-                        r = heap.cdr(r);
-                    }
-                    return format!("{pad}{}\n", self.emit_and_chain(&parts));
-                }
-
-                "+" | "*" => {
-                    // Variadic: (+ a b c ...) → a + b + c + ...
-                    let mut args = Vec::new();
-                    let mut r = rest;
-                    while heap.is_pair(r) {
-                        args.push(self.emit_expr_inline(heap.car(r), heap, syms));
-                        r = heap.cdr(r);
-                    }
-                    if args.is_empty() {
-                        return format!("{pad}Val::fixnum({})\n", if name == "+" { "0" } else { "1" });
-                    }
-                    let op = if name == "+" { "+" } else { "*" };
-                    let chain = args.iter()
-                        .map(|a| format!("{a}.as_fixnum().unwrap()"))
-                        .collect::<Vec<_>>()
-                        .join(&format!(" {op} "));
-                    return format!("{pad}Val::fixnum({chain})\n");
-                }
-                "-" => {
-                    let mut args = Vec::new();
-                    let mut r = rest;
-                    while heap.is_pair(r) {
-                        args.push(self.emit_expr_inline(heap.car(r), heap, syms));
-                        r = heap.cdr(r);
-                    }
-                    if args.len() == 1 {
-                        return format!("{pad}Val::fixnum(-{}.as_fixnum().unwrap())\n", args[0]);
-                    }
-                    let first = format!("{}.as_fixnum().unwrap()", args[0]);
-                    let rest_chain = args[1..].iter()
-                        .map(|a| format!("{a}.as_fixnum().unwrap()"))
-                        .collect::<Vec<_>>()
-                        .join(" - ");
-                    return format!("{pad}Val::fixnum({first} - {rest_chain})\n");
-                }
-                "/" | "quotient" | "remainder" | "modulo" => {
-                    return self.emit_arith(name, rest, heap, syms, &pad);
-                }
-
-                "=" | "<" | ">" | "<=" | ">=" | "even?" | "odd?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    match name {
-                        "even?" => return format!("{pad}bool_to_val({a}.as_fixnum().unwrap() % 2 == 0)\n"),
-                        "odd?" => return format!("{pad}bool_to_val({a}.as_fixnum().unwrap() % 2 != 0)\n"),
-                        _ => {
-                            let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                            let op = match name {
-                                "=" => "==", "<" => "<", ">" => ">",
-                                "<=" => "<=", ">=" => ">=", _ => "=="
-                            };
-                            return format!("{pad}bool_to_val({a}.as_fixnum().unwrap() {op} {b}.as_fixnum().unwrap())\n");
-                        }
-                    }
-                }
-
-                "null?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}bool_to_val(({a}) == Val::NIL)\n");
-                }
-
-                "pair?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}bool_to_val(({a}) != Val::NIL && !({a}).is_fixnum())\n");
-                }
-
-                "zero?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}bool_to_val({a}.as_fixnum() == Some(0))\n");
-                }
-
-                "cons" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}cons({a}, {b})\n");
-                }
-
-                "car" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}car({a})\n");
-                }
-
-                "cdr" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}cdr({a})\n");
-                }
-
-                "display" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}{{ let v = {a}; display(v); Val::NIL }}\n");
-                }
-
-                "newline" => {
-                    return format!("{pad}{{ println!(); Val::NIL }}\n");
-                }
-
-                "set!" => {
-                    let var = heap.car(rest);
-                    let val_expr = heap.car(heap.cdr(rest));
-                    let vname = syms.symbol_name(var).unwrap_or("_");
-                    let val_code = self.emit_expr_inline(val_expr, heap, syms);
-                    return format!("{pad}{} = {val_code};\n{pad}Val::NIL\n",
-                        rust_ident(vname));
-                }
-
-                "list" => {
-                    if rest == Val::NIL {
-                        return format!("{pad}Val::NIL\n");
-                    }
-                    // Build list from args
-                    let mut args = Vec::new();
-                    let mut a = rest;
-                    while heap.is_pair(a) {
-                        args.push(self.emit_expr_inline(heap.car(a), heap, syms));
-                        a = heap.cdr(a);
-                    }
-                    let mut s = "Val::NIL".to_string();
-                    for arg in args.iter().rev() {
-                        s = format!("cons({arg}, {s})");
-                    }
-                    return format!("{pad}{s}\n");
-                }
-
-                "not" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}bool_to_val(!is_true({a}))\n");
-                }
-
-                "or" => {
-                    if rest == Val::NIL {
-                        return format!("{pad}Val::NIL\n");
-                    }
-                    let mut parts = Vec::new();
-                    let mut r = rest;
-                    while heap.is_pair(r) {
-                        parts.push(self.emit_expr_inline(heap.car(r), heap, syms));
-                        r = heap.cdr(r);
-                    }
-                    return format!("{pad}{}\n", self.emit_or_chain(&parts));
-                }
-
+                // ── Control-flow forms that delegate back to emit_expr ──
+                // (do is NOT tail-safe but doesn't need it in practice)
                 "do" => {
                     return self.emit_do(rest, heap, syms, indent);
                 }
 
-                "lambda" => {
-                    let code = self.compile_lambda(rest, heap, syms);
-                    return format!("{pad}{code}\n");
-                }
-
-                // Additional builtins
-                "abs" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}Val::fixnum({a}.as_fixnum().unwrap().abs())\n");
-                }
-                "max" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}Val::fixnum({a}.as_fixnum().unwrap().max({b}.as_fixnum().unwrap()))\n");
-                }
-                "min" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}Val::fixnum({a}.as_fixnum().unwrap().min({b}.as_fixnum().unwrap()))\n");
-                }
-                "expt" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}{{ let mut r = 1i64; for _ in 0..{b}.as_fixnum().unwrap() {{ r *= {a}.as_fixnum().unwrap(); }} Val::fixnum(r) }}\n");
-                }
-                "gcd" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}{{ let (mut a, mut b) = ({a}.as_fixnum().unwrap().abs(), {b}.as_fixnum().unwrap().abs()); while b != 0 {{ let t = b; b = a % b; a = t; }} Val::fixnum(a) }}\n");
-                }
-                "number?" | "integer?" | "exact?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}bool_to_val({a}.is_fixnum())\n");
-                }
-                "positive?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}bool_to_val({a}.as_fixnum().map_or(false, |n| n > 0))\n");
-                }
-                "negative?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}bool_to_val({a}.as_fixnum().map_or(false, |n| n < 0))\n");
-                }
-                "boolean?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}bool_to_val({a} == Val::NIL || {a} == Val::fixnum(1))\n");
-                }
-                "eq?" | "eqv?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}bool_to_val({a} == {b})\n");
-                }
-                "equal?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}bool_to_val({a} == {b})\n"); // simplified
-                }
-                "set-car!" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}{{ set_car({a}, {b}); Val::NIL }}\n");
-                }
-                "set-cdr!" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}{{ set_cdr({a}, {b}); Val::NIL }}\n");
-                }
-                "length" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}{{ let mut n = 0i64; let mut l = {a}; while l != Val::NIL && !l.is_fixnum() {{ n += 1; l = cdr(l); }} Val::fixnum(n) }}\n");
-                }
-                "append" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}append({a}, {b})\n");
-                }
-                "reverse" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}{{ let mut r = Val::NIL; let mut l = {a}; while l != Val::NIL && !l.is_fixnum() {{ r = cons(car(l), r); l = cdr(l); }} r }}\n");
-                }
-                "list-ref" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}{{ let mut l = {a}; for _ in 0..{b}.as_fixnum().unwrap() {{ l = cdr(l); }} car(l) }}\n");
-                }
-                "list-tail" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}{{ let mut l = {a}; for _ in 0..{b}.as_fixnum().unwrap() {{ l = cdr(l); }} l }}\n");
-                }
-                "write" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}{{ display({a}); Val::NIL }}\n");
-                }
-                "write-char" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}{{ print!(\"{{}}\"  , {a}.as_fixnum().unwrap() as u8 as char); Val::NIL }}\n");
-                }
-                "apply" => {
-                    let f = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let args_list = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}apply_val({f}, {args_list})\n");
-                }
-
-                // ── String / char builtins ────────────
-                "string-length" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}string_length({a})\n");
-                }
-                "string-ref" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}string_ref({a}, {b})\n");
-                }
-                "string-append" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}string_append({a}, {b})\n");
-                }
-                "string=?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}bool_to_val(string_eq({a}, {b}))\n");
-                }
-                "string<?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}bool_to_val(string_cmp({a}, {b}) < 0)\n");
-                }
-                "string>?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}bool_to_val(string_cmp({a}, {b}) > 0)\n");
-                }
-                "string<=?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}bool_to_val(string_cmp({a}, {b}) <= 0)\n");
-                }
-                "string>=?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}bool_to_val(string_cmp({a}, {b}) >= 0)\n");
-                }
-                "string?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}bool_to_val(is_string({a}))\n");
-                }
-                "substring" => {
-                    let s = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let start = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    let end = self.emit_expr_inline(heap.car(heap.cdr(heap.cdr(rest))), heap, syms);
-                    return format!("{pad}substring({s}, {start}, {end})\n");
-                }
-                "make-string" => {
-                    let n = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let fill_rest = heap.cdr(rest);
-                    let fill = if heap.is_pair(fill_rest) {
-                        self.emit_expr_inline(heap.car(fill_rest), heap, syms)
-                    } else {
-                        "Val::fixnum(32)".to_string() // space
-                    };
-                    return format!("{pad}make_string_fill({n}, {fill})\n");
-                }
-                "char->integer" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}char_to_integer({a})\n");
-                }
-                "integer->char" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}make_char({a}.as_fixnum().unwrap())\n");
-                }
-                "char?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}bool_to_val(is_char({a}))\n");
-                }
-                "number->string" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}number_to_string({a})\n");
-                }
-                "string->number" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}string_to_number({a})\n");
-                }
-
-                // ── Algebra extension ────────────
-                "dot" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}Val::fixnum(CAYLEY[{a}.as_fixnum().unwrap() as usize][{b}.as_fixnum().unwrap() as usize] as i64)\n");
-                }
-                "tau" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("{pad}tau({a})\n");
-                }
-                "type-valid?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{pad}bool_to_val(CAYLEY[{a}.as_fixnum().unwrap() as usize][{b}.as_fixnum().unwrap() as usize] != TAG_BOT)\n");
-                }
-                "strict-mode" => {
-                    return format!("{pad}Val::NIL // strict-mode (no-op in compiled code)\n");
-                }
-                "permissive-mode" => {
-                    return format!("{pad}Val::NIL // permissive-mode (no-op in compiled code)\n");
-                }
-
                 _ => {
-                    // Function call
-                    let fname = rust_ident(name);
-                    let mut args = Vec::new();
-                    let mut a = rest;
-                    while heap.is_pair(a) {
-                        args.push(self.emit_expr_inline(heap.car(a), heap, syms));
-                        a = heap.cdr(a);
+                    // Check for self-tail-call (TCO)
+                    let is_self_tail = {
+                        let ctx = self.tco.borrow();
+                        ctx.as_ref().map_or(false, |c| c.fn_name == name)
+                    };
+                    if is_self_tail {
+                        let params: Vec<String> = {
+                            let ctx = self.tco.borrow();
+                            ctx.as_ref().unwrap().params.clone()
+                        };
+                        let mut args = Vec::new();
+                        let mut a = rest;
+                        while heap.is_pair(a) {
+                            args.push(self.emit_expr_inline(heap.car(a), heap, syms));
+                            a = heap.cdr(a);
+                        }
+                        let mut out = String::new();
+                        for (i, arg) in args.iter().enumerate() {
+                            out.push_str(&format!("{pad}let __t{i} = {arg};\n"));
+                        }
+                        for (i, p) in params.iter().enumerate() {
+                            out.push_str(&format!("{pad}{} = __t{i};\n", rust_ident(p)));
+                        }
+                        out.push_str(&format!("{pad}continue;\n"));
+                        return out;
                     }
-                    let args_str = args.join(", ");
-                    if self.is_known_function(name) {
-                        return format!("{pad}{fname}({args_str})\n");
-                    } else {
-                        return format!("{pad}call_val({fname}, &[{args_str}])\n");
-                    }
+
+                    // Not a self-tail-call — use emit_expr_inline + tco_return
+                    let code = self.emit_expr_inline(expr, heap, syms);
+                    return self.tco_return(&pad, &code);
                 }
             }
         }
 
-        // Generic function call (head is not a symbol) — e.g. ((lambda ...) args)
-        {
-            let head_code = self.emit_expr_inline(head, heap, syms);
-            let mut args = Vec::new();
-            let mut a = rest;
-            while heap.is_pair(a) {
-                args.push(self.emit_expr_inline(heap.car(a), heap, syms));
-                a = heap.cdr(a);
-            }
-            let args_str = args.join(", ");
-            format!("{pad}call_val({head_code}, &[{args_str}])\n")
-        }
+        // Non-symbol head — use emit_expr_inline + tco_return
+        let code = self.emit_expr_inline(expr, heap, syms);
+        self.tco_return(&pad, &code)
     }
 
     /// Emit an expression as an inline Rust expression (no trailing newline).
@@ -1500,17 +1212,6 @@ impl Compiler {
             out.push_str(&format!("{pad}}} else {{\n{pad}    Val::NIL\n{pad}}}\n"));
         }
         out
-    }
-
-    fn emit_arith(&self, op: &str, rest: Val, heap: &Heap, syms: &SymbolTable, pad: &str) -> String {
-        let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-        let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-        let rust_op = match op {
-            "+" => "+", "-" => "-", "*" => "*", "/" => "/",
-            "quotient" => "/", "remainder" => "%", "modulo" => "%",
-            _ => "+"
-        };
-        format!("{pad}Val::fixnum({a}.as_fixnum().unwrap() {rust_op} {b}.as_fixnum().unwrap())\n")
     }
 
     fn emit_and_chain(&self, parts: &[String]) -> String {
@@ -2527,5 +2228,64 @@ mod tests {
             (newline)
         "#);
         assert_eq!(out.trim(), "Hello, world!\n4");
+    }
+
+    // ── TCO tests ────────────────────────────────
+
+    #[test]
+    fn compiled_tco_simple() {
+        let out = compile_and_run("
+            (define (loop n) (if (= n 0) 0 (loop (- n 1))))
+            (display (loop 1000000))
+            (newline)
+        ");
+        assert_eq!(out.trim(), "0");
+    }
+
+    #[test]
+    fn compiled_tco_accumulator() {
+        let out = compile_and_run("
+            (define (sum n acc) (if (= n 0) acc (sum (- n 1) (+ acc n))))
+            (display (sum 100000 0))
+            (newline)
+        ");
+        // sum of 1..100000 = 100000 * 100001 / 2 = 5000050000
+        assert_eq!(out.trim(), "5000050000");
+    }
+
+    #[test]
+    fn compiled_tco_fib_iter() {
+        let out = compile_and_run("
+            (define (fib n a b) (if (= n 0) a (fib (- n 1) b (+ a b))))
+            (display (fib 50 0 1))
+            (newline)
+        ");
+        assert_eq!(out.trim(), "12586269025");
+    }
+
+    #[test]
+    fn compiled_tco_through_cond() {
+        let out = compile_and_run("
+            (define (classify n)
+              (cond ((= n 0) 0)
+                    ((> n 0) (classify (- n 1)))
+                    (else 99)))
+            (display (classify 500000))
+            (newline)
+        ");
+        assert_eq!(out.trim(), "0");
+    }
+
+    #[test]
+    fn compiled_tco_through_let() {
+        let out = compile_and_run("
+            (define (count n)
+              (let ((m (- n 1)))
+                (if (= m 0) 42
+                    (count m))))
+            (display (count 500000))
+            (newline)
+        ");
+        assert_eq!(out.trim(), "42");
     }
 }
