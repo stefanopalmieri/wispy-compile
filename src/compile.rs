@@ -241,8 +241,65 @@ impl Compiler {
                     return out;
                 }
 
+                "let*" => {
+                    let bindings = heap.car(rest);
+                    let body = heap.cdr(rest);
+                    let mut out = String::new();
+                    out.push_str(&format!("{pad}{{\n"));
+                    let mut b = bindings;
+                    while heap.is_pair(b) {
+                        let binding = heap.car(b);
+                        let var = heap.car(binding);
+                        let init = heap.car(heap.cdr(binding));
+                        let vname = syms.symbol_name(var).unwrap_or("_");
+                        let init_code = self.emit_expr_inline(init, heap, syms);
+                        out.push_str(&format!("{pad}    let {vn} = {init_code};\n",
+                            vn = rust_ident(vname)));
+                        b = heap.cdr(b);
+                    }
+                    out.push_str(&self.emit_begin(body, heap, syms, indent + 1));
+                    out.push_str(&format!("{pad}}}\n"));
+                    return out;
+                }
+
+                "letrec" => {
+                    let bindings = heap.car(rest);
+                    let body = heap.cdr(rest);
+                    let mut out = String::new();
+                    out.push_str(&format!("{pad}{{\n"));
+                    // First pass: declare all as mut NIL
+                    let mut b = bindings;
+                    while heap.is_pair(b) {
+                        let binding = heap.car(b);
+                        let var = heap.car(binding);
+                        let vname = syms.symbol_name(var).unwrap_or("_");
+                        out.push_str(&format!("{pad}    let mut {} = Val::NIL;\n",
+                            rust_ident(vname)));
+                        b = heap.cdr(b);
+                    }
+                    // Second pass: assign
+                    b = bindings;
+                    while heap.is_pair(b) {
+                        let binding = heap.car(b);
+                        let var = heap.car(binding);
+                        let init = heap.car(heap.cdr(binding));
+                        let vname = syms.symbol_name(var).unwrap_or("_");
+                        let init_code = self.emit_expr_inline(init, heap, syms);
+                        out.push_str(&format!("{pad}    {} = {init_code};\n",
+                            rust_ident(vname)));
+                        b = heap.cdr(b);
+                    }
+                    out.push_str(&self.emit_begin(body, heap, syms, indent + 1));
+                    out.push_str(&format!("{pad}}}\n"));
+                    return out;
+                }
+
                 "cond" => {
                     return self.emit_cond(rest, heap, syms, indent);
+                }
+
+                "case" => {
+                    return self.emit_case(rest, heap, syms, indent);
                 }
 
                 "and" => {
@@ -255,13 +312,45 @@ impl Compiler {
                         parts.push(self.emit_expr_inline(heap.car(r), heap, syms));
                         r = heap.cdr(r);
                     }
-                    let _chain = parts.join(" && is_true(") + ")".repeat(parts.len() - 1).as_str();
-                    // Simplified: just check truthiness
-                    return format!("{pad}{{ let _and = {}; _and }}\n",
-                        self.emit_and_chain(&parts));
+                    return format!("{pad}{}\n", self.emit_and_chain(&parts));
                 }
 
-                "+" | "-" | "*" | "/" | "quotient" | "remainder" | "modulo" => {
+                "+" | "*" => {
+                    // Variadic: (+ a b c ...) → a + b + c + ...
+                    let mut args = Vec::new();
+                    let mut r = rest;
+                    while heap.is_pair(r) {
+                        args.push(self.emit_expr_inline(heap.car(r), heap, syms));
+                        r = heap.cdr(r);
+                    }
+                    if args.is_empty() {
+                        return format!("{pad}Val::fixnum({})\n", if name == "+" { "0" } else { "1" });
+                    }
+                    let op = if name == "+" { "+" } else { "*" };
+                    let chain = args.iter()
+                        .map(|a| format!("{a}.as_fixnum().unwrap()"))
+                        .collect::<Vec<_>>()
+                        .join(&format!(" {op} "));
+                    return format!("{pad}Val::fixnum({chain})\n");
+                }
+                "-" => {
+                    let mut args = Vec::new();
+                    let mut r = rest;
+                    while heap.is_pair(r) {
+                        args.push(self.emit_expr_inline(heap.car(r), heap, syms));
+                        r = heap.cdr(r);
+                    }
+                    if args.len() == 1 {
+                        return format!("{pad}Val::fixnum(-{}.as_fixnum().unwrap())\n", args[0]);
+                    }
+                    let first = format!("{}.as_fixnum().unwrap()", args[0]);
+                    let rest_chain = args[1..].iter()
+                        .map(|a| format!("{a}.as_fixnum().unwrap()"))
+                        .collect::<Vec<_>>()
+                        .join(" - ");
+                    return format!("{pad}Val::fixnum({first} - {rest_chain})\n");
+                }
+                "/" | "quotient" | "remainder" | "modulo" => {
                     return self.emit_arith(name, rest, heap, syms, &pad);
                 }
 
@@ -353,6 +442,129 @@ impl Compiler {
                     return format!("{pad}bool_to_val(!is_true({a}))\n");
                 }
 
+                "or" => {
+                    if rest == Val::NIL {
+                        return format!("{pad}Val::NIL\n");
+                    }
+                    let mut parts = Vec::new();
+                    let mut r = rest;
+                    while heap.is_pair(r) {
+                        parts.push(self.emit_expr_inline(heap.car(r), heap, syms));
+                        r = heap.cdr(r);
+                    }
+                    return format!("{pad}{}\n", self.emit_or_chain(&parts));
+                }
+
+                "do" => {
+                    return self.emit_do(rest, heap, syms, indent);
+                }
+
+                "lambda" => {
+                    // Lambda as value: emit a Rust closure
+                    // For now, only handles lambdas that are immediately called
+                    // or passed to known higher-order functions.
+                    // Full closure conversion is future work.
+                    return format!("{pad}Val::NIL // lambda-as-value not yet compiled\n");
+                }
+
+                // Additional builtins
+                "abs" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}Val::fixnum({a}.as_fixnum().unwrap().abs())\n");
+                }
+                "max" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}Val::fixnum({a}.as_fixnum().unwrap().max({b}.as_fixnum().unwrap()))\n");
+                }
+                "min" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}Val::fixnum({a}.as_fixnum().unwrap().min({b}.as_fixnum().unwrap()))\n");
+                }
+                "expt" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}{{ let mut r = 1i64; for _ in 0..{b}.as_fixnum().unwrap() {{ r *= {a}.as_fixnum().unwrap(); }} Val::fixnum(r) }}\n");
+                }
+                "gcd" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}{{ let (mut a, mut b) = ({a}.as_fixnum().unwrap().abs(), {b}.as_fixnum().unwrap().abs()); while b != 0 {{ let t = b; b = a % b; a = t; }} Val::fixnum(a) }}\n");
+                }
+                "number?" | "integer?" | "exact?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}bool_to_val({a}.is_fixnum())\n");
+                }
+                "positive?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}bool_to_val({a}.as_fixnum().map_or(false, |n| n > 0))\n");
+                }
+                "negative?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}bool_to_val({a}.as_fixnum().map_or(false, |n| n < 0))\n");
+                }
+                "boolean?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}bool_to_val({a} == Val::NIL || {a} == Val::fixnum(1))\n");
+                }
+                "eq?" | "eqv?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}bool_to_val({a} == {b})\n");
+                }
+                "equal?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}bool_to_val({a} == {b})\n"); // simplified
+                }
+                "set-car!" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}{{ set_car({a}, {b}); Val::NIL }}\n");
+                }
+                "set-cdr!" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}{{ set_cdr({a}, {b}); Val::NIL }}\n");
+                }
+                "length" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}{{ let mut n = 0i64; let mut l = {a}; while l != Val::NIL && !l.is_fixnum() {{ n += 1; l = cdr(l); }} Val::fixnum(n) }}\n");
+                }
+                "append" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}append({a}, {b})\n");
+                }
+                "reverse" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}{{ let mut r = Val::NIL; let mut l = {a}; while l != Val::NIL && !l.is_fixnum() {{ r = cons(car(l), r); l = cdr(l); }} r }}\n");
+                }
+                "list-ref" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}{{ let mut l = {a}; for _ in 0..{b}.as_fixnum().unwrap() {{ l = cdr(l); }} car(l) }}\n");
+                }
+                "list-tail" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}{{ let mut l = {a}; for _ in 0..{b}.as_fixnum().unwrap() {{ l = cdr(l); }} l }}\n");
+                }
+                "write" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}{{ display({a}); Val::NIL }}\n");
+                }
+                "write-char" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}{{ print!(\"{{}}\"  , {a}.as_fixnum().unwrap() as u8 as char); Val::NIL }}\n");
+                }
+                "apply" => {
+                    let f = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let args = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}apply_fn({f}, {args})\n");
+                }
+
                 _ => {
                     // Function call
                     let fname = rust_ident(name);
@@ -397,11 +609,28 @@ impl Compiler {
         if heap.is_symbol(head) {
             let name = syms.symbol_name(head).unwrap_or("");
             match name {
-                "+" | "-" | "*" | "/" | "quotient" | "remainder" | "modulo" => {
+                "+" | "*" => {
+                    let mut args = Vec::new();
+                    let mut r = rest;
+                    while heap.is_pair(r) {
+                        args.push(self.emit_expr_inline(heap.car(r), heap, syms));
+                        r = heap.cdr(r);
+                    }
+                    let op = if name == "+" { "+" } else { "*" };
+                    let chain = args.iter()
+                        .map(|a| format!("{a}.as_fixnum().unwrap()"))
+                        .collect::<Vec<_>>()
+                        .join(&format!(" {op} "));
+                    return format!("Val::fixnum({chain})");
+                }
+                "-" | "/" | "quotient" | "remainder" | "modulo" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    if name == "-" && heap.cdr(rest) == Val::NIL {
+                        return format!("Val::fixnum(-{a}.as_fixnum().unwrap())");
+                    }
                     let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    let op = match name { "+" => "+", "-" => "-", "*" => "*",
-                                          "/" | "quotient" => "/", "remainder" | "modulo" => "%", _ => "+" };
+                    let op = match name { "-" => "-", "/" | "quotient" => "/",
+                                          "remainder" | "modulo" => "%", _ => "-" };
                     return format!("Val::fixnum({a}.as_fixnum().unwrap() {op} {b}.as_fixnum().unwrap())");
                 }
                 "=" | "<" | ">" | "<=" | ">=" => {
@@ -435,9 +664,82 @@ impl Compiler {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
                     return format!("bool_to_val({a} == Val::NIL)");
                 }
-                "quote" => {
-                    let datum = heap.car(rest);
-                    return self.emit_datum(datum, heap, syms);
+                "pair?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val({a} != Val::NIL && !{a}.is_fixnum())");
+                }
+                "number?" | "integer?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val({a}.is_fixnum())");
+                }
+                "zero?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val({a}.as_fixnum() == Some(0))");
+                }
+                "positive?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val({a}.as_fixnum().map_or(false, |n| n > 0))");
+                }
+                "negative?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val({a}.as_fixnum().map_or(false, |n| n < 0))");
+                }
+                "even?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val({a}.as_fixnum().unwrap() % 2 == 0)");
+                }
+                "odd?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val({a}.as_fixnum().unwrap() % 2 != 0)");
+                }
+                "not" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val(!is_true({a}))");
+                }
+                "eq?" | "eqv?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val({a} == {b})");
+                }
+                "abs" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("Val::fixnum({a}.as_fixnum().unwrap().abs())");
+                }
+                "max" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("Val::fixnum({a}.as_fixnum().unwrap().max({b}.as_fixnum().unwrap()))");
+                }
+                "min" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("Val::fixnum({a}.as_fixnum().unwrap().min({b}.as_fixnum().unwrap()))");
+                }
+                "length" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{{ let mut n = 0i64; let mut l = {a}; while l != Val::NIL && !l.is_fixnum() {{ n += 1; l = cdr(l); }} Val::fixnum(n) }}");
+                }
+                "list" => {
+                    let mut args = Vec::new();
+                    let mut r = rest;
+                    while heap.is_pair(r) {
+                        args.push(self.emit_expr_inline(heap.car(r), heap, syms));
+                        r = heap.cdr(r);
+                    }
+                    let mut s = "Val::NIL".to_string();
+                    for arg in args.iter().rev() {
+                        s = format!("cons({arg}, {s})");
+                    }
+                    return s;
+                }
+                "reverse" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{{ let mut r = Val::NIL; let mut l = {a}; while l != Val::NIL && !l.is_fixnum() {{ r = cons(car(l), r); l = cdr(l); }} r }}");
+                }
+                "append" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("append({a}, {b})");
                 }
                 "display" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
@@ -446,9 +748,44 @@ impl Compiler {
                 "newline" => {
                     return "{ println!(); Val::NIL }".to_string();
                 }
-                "zero?" => {
+                "and" => {
+                    let mut parts = Vec::new();
+                    let mut r = rest;
+                    while heap.is_pair(r) {
+                        parts.push(self.emit_expr_inline(heap.car(r), heap, syms));
+                        r = heap.cdr(r);
+                    }
+                    if parts.is_empty() { return "Val::fixnum(1)".to_string(); }
+                    return self.emit_and_chain(&parts);
+                }
+                "or" => {
+                    let mut parts = Vec::new();
+                    let mut r = rest;
+                    while heap.is_pair(r) {
+                        parts.push(self.emit_expr_inline(heap.car(r), heap, syms));
+                        r = heap.cdr(r);
+                    }
+                    if parts.is_empty() { return "Val::NIL".to_string(); }
+                    return self.emit_or_chain(&parts);
+                }
+                "gcd" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("bool_to_val({a}.as_fixnum() == Some(0))");
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{{ let (mut a, mut b) = ({a}.as_fixnum().unwrap().abs(), {b}.as_fixnum().unwrap().abs()); while b != 0 {{ let t = b; b = a % b; a = t; }} Val::fixnum(a) }}");
+                }
+                "set-car!" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{{ set_car({a}, {b}); Val::NIL }}");
+                }
+                "set-cdr!" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{{ set_cdr({a}, {b}); Val::NIL }}");
+                }
+                "quote" => {
+                    let datum = heap.car(rest);
+                    return self.emit_datum(datum, heap, syms);
                 }
                 _ => {
                     let fname = rust_ident(name);
@@ -538,6 +875,131 @@ impl Compiler {
         for _ in 0..parts.len()-1 { s.push_str(" }"); }
         s.push_str(" }");
         s
+    }
+
+    fn emit_or_chain(&self, parts: &[String]) -> String {
+        if parts.is_empty() { return "Val::NIL".to_string(); }
+        if parts.len() == 1 { return parts[0].clone(); }
+        // Build: { let _v = p0; if is_true(_v) { _v } else { let _v = p1; if is_true(_v) { _v } else { pN } } }
+        let mut s = format!("{{ let _v = {}; if is_true(_v) {{ _v }}", parts[0]);
+        for p in &parts[1..parts.len()-1] {
+            s.push_str(&format!(" else {{ let _v = {}; if is_true(_v) {{ _v }}", p));
+        }
+        s.push_str(&format!(" else {{ {} }}", parts.last().unwrap()));
+        // Close: one for each else block + one for the outer
+        for _ in 0..parts.len()-1 { s.push_str(" }"); }
+        s
+    }
+
+    fn emit_case(&self, rest: Val, heap: &Heap, syms: &SymbolTable, indent: usize) -> String {
+        let pad = "    ".repeat(indent);
+        let key_expr = heap.car(rest);
+        let key_code = self.emit_expr_inline(key_expr, heap, syms);
+        let mut out = format!("{pad}{{ let _key = {key_code};\n");
+
+        let mut clauses = heap.cdr(rest);
+        let mut first = true;
+        while heap.is_pair(clauses) {
+            let clause = heap.car(clauses);
+            let datums = heap.car(clause);
+            let body = heap.cdr(clause);
+
+            if heap.is_symbol(datums) && syms.sym_eq(datums, "else") {
+                out.push_str(&format!("{pad}}} else {{\n"));
+                out.push_str(&self.emit_begin(body, heap, syms, indent + 1));
+                out.push_str(&format!("{pad}}}}}\n"));
+                return out;
+            }
+
+            // Build condition: _key == datum1 || _key == datum2 || ...
+            let mut conds = Vec::new();
+            let mut d = datums;
+            while heap.is_pair(d) {
+                let datum = heap.car(d);
+                let dc = self.emit_datum(datum, heap, syms);
+                conds.push(format!("_key == {dc}"));
+                d = heap.cdr(d);
+            }
+            let cond = conds.join(" || ");
+
+            if first {
+                out.push_str(&format!("{pad}if {cond} {{\n"));
+                first = false;
+            } else {
+                out.push_str(&format!("{pad}}} else if {cond} {{\n"));
+            }
+            out.push_str(&self.emit_begin(body, heap, syms, indent + 1));
+            clauses = heap.cdr(clauses);
+        }
+        if !first {
+            out.push_str(&format!("{pad}}} else {{\n{pad}    Val::NIL\n{pad}}}}}\n"));
+        } else {
+            out.push_str(&format!("{pad}Val::NIL }}\n"));
+        }
+        out
+    }
+
+    fn emit_do(&self, rest: Val, heap: &Heap, syms: &SymbolTable, indent: usize) -> String {
+        let pad = "    ".repeat(indent);
+        let var_specs = heap.car(rest);
+        let test_clause = heap.car(heap.cdr(rest));
+        let commands = heap.cdr(heap.cdr(rest));
+
+        let mut out = format!("{pad}{{\n");
+
+        // Initialize vars
+        let mut vars = Vec::new();
+        let mut vs = var_specs;
+        while heap.is_pair(vs) {
+            let spec = heap.car(vs);
+            let var = heap.car(spec);
+            let init = heap.car(heap.cdr(spec));
+            let step_rest = heap.cdr(heap.cdr(spec));
+            let step = if heap.is_pair(step_rest) { Some(heap.car(step_rest)) } else { None };
+
+            let vname = syms.symbol_name(var).unwrap_or("_").to_string();
+            let init_code = self.emit_expr_inline(init, heap, syms);
+            out.push_str(&format!("{pad}    let mut {} = {init_code};\n", rust_ident(&vname)));
+            vars.push((vname, step));
+            vs = heap.cdr(vs);
+        }
+
+        let test_expr = heap.car(test_clause);
+        let result_exprs = heap.cdr(test_clause);
+
+        out.push_str(&format!("{pad}    loop {{\n"));
+
+        // Test
+        let test_code = self.emit_expr_inline(test_expr, heap, syms);
+        out.push_str(&format!("{pad}        if is_true({test_code}) {{ break\n"));
+        out.push_str(&self.emit_begin(result_exprs, heap, syms, indent + 3));
+        out.push_str(&format!("{pad}        }}\n"));
+
+        // Commands
+        let mut cmd = commands;
+        while heap.is_pair(cmd) {
+            let code = self.emit_expr_inline(heap.car(cmd), heap, syms);
+            out.push_str(&format!("{pad}        {code};\n"));
+            cmd = heap.cdr(cmd);
+        }
+
+        // Step vars (compute all first, then assign)
+        let mut step_codes = Vec::new();
+        for (vname, step) in &vars {
+            if let Some(step_expr) = step {
+                step_codes.push((vname.clone(), self.emit_expr_inline(*step_expr, heap, syms)));
+            }
+        }
+        for (vname, code) in &step_codes {
+            out.push_str(&format!("{pad}        let _next_{vn} = {code};\n", vn = rust_ident(vname)));
+        }
+        for (vname, _) in &step_codes {
+            out.push_str(&format!("{pad}        {vn} = _next_{vn};\n", vn = rust_ident(vname)));
+        }
+
+        out.push_str(&format!("{pad}    }}\n"));
+        out.push_str(&format!("{pad}}}\n"));
+        out
     }
 
     fn emit_datum(&self, datum: Val, heap: &Heap, syms: &SymbolTable) -> String {
@@ -659,10 +1121,50 @@ fn bool_to_val(b: bool) -> Val {
     if b { Val::fixnum(1) } else { Val::NIL }
 }
 
+fn set_car(v: Val, new_car: Val) {
+    if !v.is_fixnum() && v != Val::NIL {
+        unsafe { HEAP[v.as_rib()].car = new_car; }
+    }
+}
+
+fn set_cdr(v: Val, new_cdr: Val) {
+    if !v.is_fixnum() && v != Val::NIL {
+        unsafe { HEAP[v.as_rib()].cdr = new_cdr; }
+    }
+}
+
+fn append(a: Val, b: Val) -> Val {
+    if a == Val::NIL || a.is_fixnum() { return b; }
+    let c = car(a);
+    let rest = append(cdr(a), b);
+    cons(c, rest)
+}
+
 fn display(v: Val) {
     if v == Val::NIL { print!("()"); }
     else if let Some(n) = v.as_fixnum() { print!("{n}"); }
-    else { print!("<rib>"); }
+    else {
+        unsafe {
+            let rib = &HEAP[v.as_rib()];
+            if rib.tag == T_PAIR {
+                print!("(");
+                display(rib.car);
+                let mut rest = rib.cdr;
+                while rest != Val::NIL && !rest.is_fixnum() && HEAP[rest.as_rib()].tag == T_PAIR {
+                    print!(" ");
+                    display(HEAP[rest.as_rib()].car);
+                    rest = HEAP[rest.as_rib()].cdr;
+                }
+                if rest != Val::NIL {
+                    print!(" . ");
+                    display(rest);
+                }
+                print!(")");
+            } else {
+                print!("<rib>");
+            }
+        }
+    }
 }
 "#;
 
@@ -774,5 +1276,170 @@ mod tests {
             .expect("failed to run compiled program");
         let stdout = String::from_utf8_lossy(&run.stdout);
         assert_eq!(stdout.trim(), "92");
+    }
+
+    /// Helper: compile, build with rustc -O, run, return stdout
+    fn compile_and_run(src: &str) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+
+        let code = compile(src);
+        let rs_path = format!("/tmp/wispy_test_{id}.rs");
+        let bin_path = format!("/tmp/wispy_test_{id}");
+        std::fs::write(&rs_path, &code).unwrap();
+        let output = std::process::Command::new("rustc")
+            .args(["-O", "-o", &bin_path, &rs_path])
+            .output()
+            .expect("failed to run rustc");
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("rustc failed:\n{stderr}\n\nGenerated:\n{code}");
+        }
+        let run = std::process::Command::new(&bin_path)
+            .output()
+            .expect("failed to run");
+        let _ = std::fs::remove_file(&rs_path);
+        let _ = std::fs::remove_file(&bin_path);
+        String::from_utf8_lossy(&run.stdout).to_string()
+    }
+
+    #[test]
+    fn compiled_let_star() {
+        let out = compile_and_run("
+            (define (f) (let* ((x 1) (y (+ x 10))) (display y)))
+            (f) (newline)
+        ");
+        assert_eq!(out.trim(), "11");
+    }
+
+    #[test]
+    fn compiled_cond() {
+        let out = compile_and_run("
+            (define (classify n)
+              (cond ((< n 0) 1)
+                    ((= n 0) 2)
+                    (else 3)))
+            (display (classify (- 0 5)))
+            (display (classify 0))
+            (display (classify 7))
+            (newline)
+        ");
+        assert_eq!(out.trim(), "123");
+    }
+
+    #[test]
+    fn compiled_or() {
+        let out = compile_and_run("
+            (define (f) (or 0 0 42))
+            (display (f)) (newline)
+        ");
+        // 0 is truthy (non-NIL fixnum), so result is 0
+        assert_eq!(out.trim(), "0");
+    }
+
+    #[test]
+    fn compiled_variadic_plus() {
+        let out = compile_and_run("(display (+ 1 2 3 4 5)) (newline)");
+        assert_eq!(out.trim(), "15");
+    }
+
+    #[test]
+    fn compiled_list_ops() {
+        let out = compile_and_run("
+            (define (sum-list lst)
+              (if (null? lst) 0
+                  (+ (car lst) (sum-list (cdr lst)))))
+            (display (sum-list (list 10 20 30))) (newline)
+            (display (length (list 1 2 3 4 5))) (newline)
+        ");
+        assert_eq!(out.trim(), "60\n5");
+    }
+
+    #[test]
+    fn compiled_set_bang() {
+        let out = compile_and_run("
+            (define (f n) (if (= n 0) 99 (f (- n 1))))
+            (display (f 5)) (newline)
+        ");
+        assert_eq!(out.trim(), "99");
+    }
+
+    #[test]
+    fn compiled_abs_max_min() {
+        let out = compile_and_run("
+            (display (abs -7))
+            (display (max 3 9))
+            (display (min 3 9))
+            (newline)
+        ");
+        assert_eq!(out.trim(), "793");
+    }
+
+    #[test]
+    fn compiled_predicates() {
+        let out = compile_and_run("
+            (define (show x) (display (if x 1 0)))
+            (show (null? '()))
+            (show (pair? (cons 1 2)))
+            (show (number? 5))
+            (show (zero? 0))
+            (show (positive? 5))
+            (newline)
+        ");
+        assert_eq!(out.trim(), "11111");
+    }
+
+    #[test]
+    fn compiled_do_loop() {
+        let out = compile_and_run("
+            (define (sum-1-to-10)
+              (do ((i 1 (+ i 1))
+                   (sum 0 (+ sum i)))
+                  ((> i 10) sum)))
+            (display (sum-1-to-10)) (newline)
+        ");
+        assert_eq!(out.trim(), "55");
+    }
+
+    #[test]
+    fn compiled_gcd() {
+        let out = compile_and_run("
+            (display (gcd 12 8)) (newline)
+        ");
+        assert_eq!(out.trim(), "4");
+    }
+
+    #[test]
+    fn compiled_display_list() {
+        let out = compile_and_run("
+            (display (list 1 2 3)) (newline)
+        ");
+        assert_eq!(out.trim(), "(1 2 3)");
+    }
+
+    #[test]
+    fn compiled_reverse() {
+        let out = compile_and_run("
+            (display (reverse (list 1 2 3))) (newline)
+        ");
+        assert_eq!(out.trim(), "(3 2 1)");
+    }
+
+    #[test]
+    fn compiled_append() {
+        let out = compile_and_run("
+            (display (append (list 1 2) (list 3 4))) (newline)
+        ");
+        assert_eq!(out.trim(), "(1 2 3 4)");
+    }
+
+    #[test]
+    fn compiled_eq() {
+        let out = compile_and_run("
+            (define (f) (if (eq? 1 1) 10 20))
+            (display (f)) (newline)
+        ");
+        assert_eq!(out.trim(), "10");
     }
 }
