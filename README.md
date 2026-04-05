@@ -43,6 +43,51 @@ ev.eval_str("(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))");
 let result = ev.eval_str("(fib 10)"); // 55
 ```
 
+## The Algebra Extension
+
+Standard R4RS Scheme works as expected. The algebra is also available directly — the programmer can reach into the table:
+
+```scheme
+;; The table operation: CAYLEY[a][b]
+(dot CAR T_PAIR)          ; → T_PAIR (car of pair is valid)
+(dot CAR T_STR)           ; → BOT (car of string is a type error)
+
+;; The classifier: what type is this value?
+(tau (cons 1 2))          ; → T_PAIR
+(tau "hello")             ; → T_STR
+(tau 42)                  ; → BOT (fixnum, not a rib)
+
+;; Query the algebra: is this operation valid on this type?
+(type-valid? CAR T_PAIR)  ; → #t
+(type-valid? CAR T_STR)   ; → #f
+
+;; The retraction pair: Q and E are exact inverses on core elements
+(dot E (dot Q CAR))       ; → CAR (round-trip)
+(dot Q (dot E CAR))       ; → CAR (round-trip)
+
+;; The Y fixed point: algebraic, not computed
+(dot RHO (dot Y RHO))     ; → (dot Y RHO) (fixed point of ρ)
+
+;; Build your own dispatcher from the table
+(define (type-name x)
+  (let ((t (tau x)))
+    (cond ((= t T_PAIR) "pair")
+          ((= t T_SYM)  "symbol")
+          ((= t T_STR)  "string")
+          (else          "other"))))
+
+;; Enumerate valid operations for a type
+(define (count-valid-ops type-tag)
+  (let loop ((op 0) (count 0))
+    (if (= op 12) count
+        (loop (+ op 1)
+              (+ count (if (type-valid? op type-tag) 1 0))))))
+```
+
+All 12 core elements (`TOP`, `BOT`, `Q`, `E`, `CAR`, `CDR`, `CONS`, `RHO`, `APPLY`, `CC`, `TAU`, `Y`) and 8 type tags (`T_PAIR`, `T_SYM`, `T_CLS`, `T_STR`, `T_VEC`, `T_CHAR`, `T_CONT`, `T_PORT`) are bound as constants. `dot`, `tau`, and `type-valid?` are the three primitives. Everything else is sugar.
+
+BOT as a return value instead of an exception means type dispatch is data flow, not control flow. The programmer can query the capability matrix of the entire language with a 1KB lookup.
+
 ## Architecture
 
 ```

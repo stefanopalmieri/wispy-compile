@@ -862,11 +862,33 @@ impl Eval {
             ("eof-object?", 101),
             ("write-char", 102),
             ("error", 103),
+            // ── Algebra extension (wispy algebra) ────────────
+            ("dot", 200),       // (dot a b) → CAYLEY[a][b]
+            ("tau", 201),       // (tau x) → type tag of x
+            ("type-valid?", 202), // (type-valid? op tag) → #t if not BOT
         ];
 
         for (name, id) in builtins {
             let sym = self.intern(name);
             self.define_global(sym, Val::fixnum(id));
+        }
+
+        // Algebra element constants — the programmer can reach into the table
+        let elements = [
+            ("TOP", table::TOP), ("BOT", table::BOT),
+            ("Q", table::Q), ("E", table::E),
+            ("CAR", table::CAR), ("CDR", table::CDR), ("CONS", table::CONS),
+            ("RHO", table::RHO), ("APPLY", table::APPLY), ("CC", table::CC),
+            ("TAU", table::TAU), ("Y", table::Y),
+            ("T_PAIR", table::T_PAIR), ("T_SYM", table::T_SYM),
+            ("T_CLS", table::T_CLS), ("T_STR", table::T_STR),
+            ("T_VEC", table::T_VEC), ("T_CHAR", table::T_CHAR),
+            ("T_CONT", table::T_CONT), ("T_PORT", table::T_PORT),
+            ("TRUE", table::TRUE), ("EOF", table::EOF), ("VOID", table::VOID),
+        ];
+        for (name, elem) in elements {
+            let sym = self.intern(name);
+            self.define_global(sym, Val::fixnum(elem as i64));
         }
     }
 
@@ -1375,6 +1397,22 @@ impl Eval {
                 Val::NIL
             }
 
+            // ── Algebra extension ─────────────────────────────
+            200 => { // dot: (dot a b) → CAYLEY[a][b]
+                let a = a1.as_fixnum().unwrap_or(0) as u8;
+                let b = a2.as_fixnum().unwrap_or(0) as u8;
+                Val::fixnum(table::dot(a, b) as i64)
+            }
+            201 => { // tau: (tau x) → type tag of x
+                let tag = self.heap.tag(a1);
+                Val::fixnum(tag as i64)
+            }
+            202 => { // type-valid?: (type-valid? op tag) → #t if not BOT
+                let op = a1.as_fixnum().unwrap_or(0) as u8;
+                let tag = a2.as_fixnum().unwrap_or(0) as u8;
+                self.scheme_bool(table::dot(op, tag) != table::BOT)
+            }
+
             _ => Val::NIL,
         }
     }
@@ -1818,5 +1856,113 @@ mod tests {
         assert_eq!(ev.heap.car(result), Val::fixnum(3));
         assert_eq!(ev.heap.car(ev.heap.cdr(result)), Val::fixnum(2));
         assert_eq!(ev.heap.car(ev.heap.cdr(ev.heap.cdr(result))), Val::fixnum(1));
+    }
+
+    // ── Algebra extension tests ──────────────────────────────
+
+    #[test]
+    fn algebra_dot() {
+        let mut ev = Eval::new();
+        // CAR applied to T_PAIR type tag → T_PAIR (valid)
+        assert_eq!(ev.eval_str("(dot CAR T_PAIR)"), Val::fixnum(table::T_PAIR as i64));
+        // CAR applied to T_STR type tag → BOT (error)
+        assert_eq!(ev.eval_str("(dot CAR T_STR)"), Val::fixnum(table::BOT as i64));
+    }
+
+    #[test]
+    fn algebra_tau() {
+        let mut ev = Eval::new();
+        // tau of a pair → T_PAIR
+        assert_eq!(ev.eval_str("(tau (cons 1 2))"), Val::fixnum(table::T_PAIR as i64));
+        // tau of nil → TOP
+        assert_eq!(ev.eval_str("(tau '())"), Val::fixnum(table::TOP as i64));
+        // tau of a string → T_STR
+        assert_eq!(ev.eval_str("(tau \"hello\")"), Val::fixnum(table::T_STR as i64));
+    }
+
+    #[test]
+    fn algebra_type_valid() {
+        let mut ev = Eval::new();
+        let r1 = ev.eval_str("(type-valid? CAR T_PAIR)");
+        assert!(ev.is_true(r1));
+        let r2 = ev.eval_str("(type-valid? CAR T_STR)");
+        assert!(!ev.is_true(r2));
+        let r3 = ev.eval_str("(type-valid? CAR T_SYM)");
+        assert!(!ev.is_true(r3));
+    }
+
+    #[test]
+    fn algebra_elements_bound() {
+        let mut ev = Eval::new();
+        assert_eq!(ev.eval_str("TOP"), Val::fixnum(0));
+        assert_eq!(ev.eval_str("BOT"), Val::fixnum(1));
+        assert_eq!(ev.eval_str("T_PAIR"), Val::fixnum(table::T_PAIR as i64));
+        assert_eq!(ev.eval_str("Y"), Val::fixnum(table::Y as i64));
+    }
+
+    #[test]
+    fn algebra_user_dispatcher() {
+        let mut ev = Eval::new();
+        // Build a user-space type dispatcher from tau and dot
+        ev.eval_str("
+            (define (type-name x)
+              (let ((t (tau x)))
+                (cond ((= t T_PAIR) 1)
+                      ((= t T_STR) 2)
+                      ((= t T_SYM) 3)
+                      (else 0))))
+        ");
+        assert_eq!(ev.eval_str("(type-name (cons 1 2))"), Val::fixnum(1));
+        assert_eq!(ev.eval_str("(type-name \"hello\")"), Val::fixnum(2));
+        assert_eq!(ev.eval_str("(type-name 'foo)"), Val::fixnum(3));
+    }
+
+    #[test]
+    fn algebra_retraction() {
+        let mut ev = Eval::new();
+        // The Q/E retraction: dot(E, dot(Q, x)) = x for core elements
+        // We can verify this from Scheme
+        assert_eq!(
+            ev.eval_str("(dot E (dot Q CAR))"),
+            ev.eval_str("CAR")
+        );
+        assert_eq!(
+            ev.eval_str("(dot Q (dot E CAR))"),
+            ev.eval_str("CAR")
+        );
+    }
+
+    #[test]
+    fn algebra_y_fixed_point() {
+        let mut ev = Eval::new();
+        // Y(RHO) is a fixed point of RHO: dot(RHO, dot(Y, RHO)) = dot(Y, RHO)
+        let yp = ev.eval_str("(dot Y RHO)");
+        let ryp = ev.eval_str("(dot RHO (dot Y RHO))");
+        assert_eq!(yp, ryp);
+        // And it's not an absorber
+        let r = ev.eval_str("(> (dot Y RHO) 1)");
+        assert!(ev.is_true(r));
+    }
+
+    #[test]
+    fn algebra_enumerate_valid_ops() {
+        let mut ev = Eval::new();
+        // The programmer can ask: which operations are valid on pairs?
+        // This is the "introspect the capability matrix" use case
+        ev.eval_str("
+            (define (count-valid-ops type-tag)
+              (let loop ((op 0) (count 0))
+                (if (= op 12)
+                    count
+                    (loop (+ op 1)
+                          (+ count (if (type-valid? op type-tag) 1 0))))))
+        ");
+        // Pairs should have more valid operations than strings
+        let pair_ops = ev.eval_str("(count-valid-ops T_PAIR)");
+        let str_ops = ev.eval_str("(count-valid-ops T_STR)");
+        // At minimum, CAR and CDR are valid on pairs
+        assert!(pair_ops.as_fixnum().unwrap() >= 2);
+        // CAR and CDR are NOT valid on strings
+        assert!(str_ops.as_fixnum().unwrap() < pair_ops.as_fixnum().unwrap());
     }
 }
