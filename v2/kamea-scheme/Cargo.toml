@@ -1,0 +1,10 @@
+[package]
+name = "kamea-scheme"
+version = "0.2.0"
+edition = "2021"
+description = "R4RS Scheme in 1KB. Rib-based, table-driven, no_std."
+license = "MIT"
+
+[features]
+default = ["std"]
+std = []
