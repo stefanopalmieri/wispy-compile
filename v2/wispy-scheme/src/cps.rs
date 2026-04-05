@@ -50,6 +50,7 @@ enum State {
 impl CpsEval {
     pub fn new() -> Self {
         let mut heap = Heap::new();
+        heap.strict = false; // CPS evaluator uses rib_car/rib_cdr internally
         let syms = SymbolTable::new();
         let true_val = heap.alloc_special(table::TRUE);
         let false_val = heap.alloc_special(table::BOT);

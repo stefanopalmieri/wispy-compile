@@ -29,11 +29,14 @@ pub struct Eval {
     pub void_val: Val,
     /// Continuation value slots for call/cc (escape continuations).
     cont_values: Vec<(usize, Val)>,
+    /// When true, type errors in car/cdr builtins panic instead of returning NIL.
+    pub strict: bool,
 }
 
 impl Eval {
     pub fn new() -> Self {
         let mut heap = Heap::new();
+        heap.strict = false; // heap is always permissive; strict checks in builtins
         let syms = SymbolTable::new();
         let true_val = heap.alloc_special(table::TRUE);
         let false_val = heap.alloc_special(table::BOT);
@@ -47,6 +50,7 @@ impl Eval {
             false_val,
             void_val,
             cont_values: Vec::new(),
+            strict: false,
         };
         ev.register_builtins();
         ev
@@ -866,6 +870,8 @@ impl Eval {
             ("dot", 200),       // (dot a b) → CAYLEY[a][b]
             ("tau", 201),       // (tau x) → type tag of x
             ("type-valid?", 202), // (type-valid? op tag) → #t if not BOT
+            ("strict-mode", 203),    // type errors panic
+            ("permissive-mode", 204), // type errors return NIL (default)
         ];
 
         for (name, id) in builtins {
@@ -963,8 +969,18 @@ impl Eval {
 
             // Pairs
             11 => self.heap.cons(a1, a2),           // cons
-            12 => self.heap.car(a1),                 // car
-            13 => self.heap.cdr(a1),                 // cdr
+            12 => { // car
+                if self.strict && !self.heap.is_pair(a1) {
+                    panic!("car: not a pair: {:?}", a1);
+                }
+                self.heap.car(a1)
+            }
+            13 => { // cdr
+                if self.strict && !self.heap.is_pair(a1) {
+                    panic!("cdr: not a pair: {:?}", a1);
+                }
+                self.heap.cdr(a1)
+            }
             14 => { self.heap.set_car(a1, a2); self.void_val } // set-car!
             15 => { self.heap.set_cdr(a1, a2); self.void_val } // set-cdr!
 
@@ -1411,6 +1427,14 @@ impl Eval {
                 let op = a1.as_fixnum().unwrap_or(0) as u8;
                 let tag = a2.as_fixnum().unwrap_or(0) as u8;
                 self.scheme_bool(table::dot(op, tag) != table::BOT)
+            }
+            203 => { // strict-mode
+                self.strict = true;
+                self.void_val
+            }
+            204 => { // permissive-mode
+                self.strict = false;
+                self.void_val
             }
 
             _ => Val::NIL,
@@ -1942,6 +1966,27 @@ mod tests {
         // And it's not an absorber
         let r = ev.eval_str("(> (dot Y RHO) 1)");
         assert!(ev.is_true(r));
+    }
+
+    #[test]
+    fn algebra_strict_mode() {
+        let mut ev = Eval::new();
+        // Default is permissive
+        assert!(!ev.strict);
+        // Turn on strict mode
+        ev.eval_str("(strict-mode)");
+        assert!(ev.strict);
+        // Turn it off
+        ev.eval_str("(permissive-mode)");
+        assert!(!ev.strict);
+    }
+
+    #[test]
+    #[should_panic(expected = "car: not a pair")]
+    fn algebra_strict_catches_type_error() {
+        let mut ev = Eval::new();
+        ev.eval_str("(strict-mode)");
+        ev.eval_str("(car 42)"); // should panic
     }
 
     #[test]

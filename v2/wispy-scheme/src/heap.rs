@@ -31,6 +31,10 @@ pub struct Rib {
 /// Bump-allocated rib heap.
 pub struct Heap {
     ribs: Vec<Rib>,
+    /// When true, type errors (car of non-pair, etc.) panic instead
+    /// of silently returning NIL. Default: true. The algebra extension
+    /// can set this to false for total algebraic dispatch.
+    pub strict: bool,
 }
 
 impl Heap {
@@ -39,7 +43,7 @@ impl Heap {
     pub fn new() -> Self {
         let mut ribs = Vec::with_capacity(65536);
         ribs.push(Self::EMPTY_RIB); // index 0 = nil sentinel
-        Heap { ribs }
+        Heap { ribs, strict: true }
     }
 
     /// Reset the heap (free all allocations except nil).
@@ -174,23 +178,33 @@ impl Heap {
     }
 
     /// car of a value. Uses the Cayley table for type dispatch.
+    /// In strict mode, panics on type errors. In permissive mode, returns NIL.
     #[inline]
     pub fn car(&self, v: Val) -> Val {
-        if v.is_fixnum() || v == Val::NIL { return Val::NIL; }
+        if v.is_fixnum() || v == Val::NIL {
+            if self.strict { panic!("car: not a pair: {:?}", v); }
+            return Val::NIL;
+        }
         let tag = self.tag(v);
         if table::dot(table::CAR, tag) == table::BOT {
-            Val::NIL // type error: car of non-pair
+            if self.strict { panic!("car: not a pair (tag {})", tag); }
+            Val::NIL
         } else {
             self.rib(v).car
         }
     }
 
     /// cdr of a value. Uses the Cayley table for type dispatch.
+    /// In strict mode, panics on type errors. In permissive mode, returns NIL.
     #[inline]
     pub fn cdr(&self, v: Val) -> Val {
-        if v.is_fixnum() || v == Val::NIL { return Val::NIL; }
+        if v.is_fixnum() || v == Val::NIL {
+            if self.strict { panic!("cdr: not a pair: {:?}", v); }
+            return Val::NIL;
+        }
         let tag = self.tag(v);
         if table::dot(table::CDR, tag) == table::BOT {
+            if self.strict { panic!("cdr: not a pair (tag {})", tag); }
             Val::NIL
         } else {
             self.rib(v).cdr
@@ -290,9 +304,17 @@ mod tests {
     #[test]
     fn car_of_non_pair_is_nil() {
         let mut h = Heap::new();
+        h.strict = false; // permissive mode: type errors return NIL
         let sym = h.symbol(Val::NIL, Val::NIL);
         assert_eq!(h.car(sym), Val::NIL); // type error → nil
         assert_eq!(h.car(Val::fixnum(42)), Val::NIL);
+    }
+
+    #[test]
+    #[should_panic(expected = "car: not a pair")]
+    fn car_of_non_pair_panics_strict() {
+        let h = Heap::new(); // strict mode by default
+        h.car(Val::fixnum(42)); // should panic
     }
 
     #[test]
