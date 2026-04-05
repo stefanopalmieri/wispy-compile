@@ -155,11 +155,26 @@ The 32×32 table (1KB) is a finite algebra with a Z3-verified core:
 
 The core satisfies the same axiom set as [Kamea's Ψ₁₆](https://github.com/stefanopalmieri/Kamea) (absorbers, retraction, classifier dichotomy, branch, composition, Y), making it axiomatically equivalent but not isomorphic (different carrier size, different table entries). The three independent capabilities carry over: self-representation (Q/E), self-description (τ), and self-execution (branch + composition).
 
+## `no_std` Support
+
+WispyScheme compiles in three configurations:
+
+| Configuration | Cargo flags | Heap | Symbols | Use case |
+|---|---|---|---|---|
+| **std** (default) | `--features std` | `Vec<Rib>` (growable) | `Vec<(String, Val)>` | Desktop, servers |
+| **alloc** | `--no-default-features --features alloc` | `Vec<Rib>` (growable) | `Vec<(String, Val)>` | WASM, custom allocators |
+| **bare metal** | `--no-default-features` | `[Rib; 8192]` (fixed) | `[([u8; 48], u8, Val); 512]` (fixed) | RP2040, ESP32, cortex-m |
+
+The table, value representation, reader, heap, and symbol interning all compile without `std` or `alloc`. The evaluators (`eval.rs`, `cps.rs`) and compiler (`compile.rs`) require `std` due to I/O and string formatting.
+
+```bash
+# Verify bare-metal build
+cargo check --no-default-features --lib
+```
+
 ## Future Work
 
 - **MMTk Immix GC** as an optional feature (`features = ["gc"]`). The bump allocator is the default for `no_std` embedded targets. Long-running applications can opt into garbage collection via [MMTk](https://www.mmtk.io/). The Kamea project already has a working MMTk Immix binding that achieves 184 µs on N-Queens(8).
-
-- **`no_std` heap variant.** Replace `Vec<Rib>` with a fixed-size `&mut [Rib]` buffer for bare-metal targets. The table and evaluator are already `no_std` compatible; the heap is the only blocker.
 
 - **Lean verification.** Prove the 32×32 table's algebraic properties in Lean 4 via `native_decide` (1024 entries, well within capacity).
 

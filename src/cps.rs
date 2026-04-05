@@ -38,6 +38,7 @@ pub struct CpsEval {
     pub true_val: Val,
     pub false_val: Val,
     pub void_val: Val,
+    pub strict: bool,
 }
 
 enum State {
@@ -59,6 +60,7 @@ impl CpsEval {
         let mut ev = CpsEval {
             heap, syms, globals: Val::NIL,
             true_val, false_val, void_val,
+            strict: false,
         };
         ev.register_builtins();
         ev
@@ -884,10 +886,34 @@ impl CpsEval {
             ("integer?", 91), ("exact?", 92),
             ("eof-object?", 101),
             ("error", 103),
+            // ── Algebra extension (wispy algebra) ────────────
+            ("dot", 200),       // (dot a b) → CAYLEY[a][b]
+            ("tau", 201),       // (tau x) → type tag of x
+            ("type-valid?", 202), // (type-valid? op tag) → #t if not BOT
+            ("strict-mode", 203),    // type errors panic
+            ("permissive-mode", 204), // type errors return NIL (default)
         ];
         for (name, id) in builtins {
             let sym = self.syms.intern(name, &mut self.heap);
             self.define_global(sym, Val::fixnum(id));
+        }
+
+        // Algebra element constants
+        let elements = [
+            ("TOP", table::TOP), ("BOT", table::BOT),
+            ("Q", table::Q), ("E", table::E),
+            ("CAR", table::CAR), ("CDR", table::CDR), ("CONS", table::CONS),
+            ("RHO", table::RHO), ("APPLY", table::APPLY), ("CC", table::CC),
+            ("TAU", table::TAU), ("Y", table::Y),
+            ("T_PAIR", table::T_PAIR), ("T_SYM", table::T_SYM),
+            ("T_CLS", table::T_CLS), ("T_STR", table::T_STR),
+            ("T_VEC", table::T_VEC), ("T_CHAR", table::T_CHAR),
+            ("T_CONT", table::T_CONT), ("T_PORT", table::T_PORT),
+            ("TRUE", table::TRUE), ("EOF", table::EOF), ("VOID", table::VOID),
+        ];
+        for (name, elem) in elements {
+            let sym = self.syms.intern(name, &mut self.heap);
+            self.define_global(sym, Val::fixnum(elem as i64));
         }
     }
 
@@ -967,6 +993,29 @@ impl CpsEval {
                     let mut r = 1i64; for _ in 0..exp { r *= base; } Val::fixnum(r) }
             101 => self.scheme_bool(self.heap.tag(a1) == table::EOF),
             103 => { eprintln!("Error"); Val::NIL }
+            // ── Algebra extension ────────────
+            200 => { // dot: (dot a b) → CAYLEY[a][b]
+                let a = a1.as_fixnum().unwrap_or(0) as u8;
+                let b = a2.as_fixnum().unwrap_or(0) as u8;
+                Val::fixnum(table::dot(a, b) as i64)
+            }
+            201 => { // tau: (tau x) → type tag of x
+                let tag = self.heap.tag(a1);
+                Val::fixnum(tag as i64)
+            }
+            202 => { // type-valid?: (type-valid? op tag) → #t if not BOT
+                let op = a1.as_fixnum().unwrap_or(0) as u8;
+                let tag = a2.as_fixnum().unwrap_or(0) as u8;
+                self.scheme_bool(table::dot(op, tag) != table::BOT)
+            }
+            203 => { // strict-mode
+                self.strict = true;
+                self.void_val
+            }
+            204 => { // permissive-mode
+                self.strict = false;
+                self.void_val
+            }
             _ => Val::NIL,
         }
     }
@@ -1069,7 +1118,7 @@ impl CpsEval {
         let exprs = crate::reader::read_all(src, &mut self.heap, &mut self.syms)
             .unwrap_or_default();
         let mut result = self.void_val;
-        for expr in exprs {
+        for &expr in exprs.iter() {
             result = self.eval(expr, Val::NIL);
         }
         result
@@ -1176,6 +1225,92 @@ mod tests {
                   x))
         ");
         assert_eq!(result, Val::fixnum(20));
+    }
+
+    // ── Algebra extension tests ────────────
+
+    #[test]
+    fn cps_algebra_dot() {
+        let mut ev = CpsEval::new();
+        assert_eq!(ev.eval_str("(dot CAR T_PAIR)"), Val::fixnum(table::T_PAIR as i64));
+        assert_eq!(ev.eval_str("(dot CAR T_STR)"), Val::fixnum(table::BOT as i64));
+    }
+
+    #[test]
+    fn cps_algebra_tau() {
+        let mut ev = CpsEval::new();
+        assert_eq!(ev.eval_str("(tau (cons 1 2))"), Val::fixnum(table::T_PAIR as i64));
+        assert_eq!(ev.eval_str("(tau '())"), Val::fixnum(table::TOP as i64));
+        assert_eq!(ev.eval_str("(tau \"hello\")"), Val::fixnum(table::T_STR as i64));
+    }
+
+    #[test]
+    fn cps_algebra_type_valid() {
+        let mut ev = CpsEval::new();
+        let r1 = ev.eval_str("(type-valid? CAR T_PAIR)");
+        assert!(ev.is_true(r1));
+        let r2 = ev.eval_str("(type-valid? CAR T_STR)");
+        assert!(!ev.is_true(r2));
+        let r3 = ev.eval_str("(type-valid? CAR T_SYM)");
+        assert!(!ev.is_true(r3));
+    }
+
+    #[test]
+    fn cps_algebra_elements_bound() {
+        let mut ev = CpsEval::new();
+        assert_eq!(ev.eval_str("TOP"), Val::fixnum(0));
+        assert_eq!(ev.eval_str("BOT"), Val::fixnum(1));
+        assert_eq!(ev.eval_str("T_PAIR"), Val::fixnum(table::T_PAIR as i64));
+        assert_eq!(ev.eval_str("Y"), Val::fixnum(table::Y as i64));
+    }
+
+    #[test]
+    fn cps_algebra_user_dispatcher() {
+        let mut ev = CpsEval::new();
+        ev.eval_str("
+            (define (type-name x)
+              (let ((t (tau x)))
+                (cond ((= t T_PAIR) 1)
+                      ((= t T_STR) 2)
+                      ((= t T_SYM) 3)
+                      (else 0))))
+        ");
+        assert_eq!(ev.eval_str("(type-name (cons 1 2))"), Val::fixnum(1));
+        assert_eq!(ev.eval_str("(type-name \"hello\")"), Val::fixnum(2));
+        assert_eq!(ev.eval_str("(type-name 'foo)"), Val::fixnum(3));
+    }
+
+    #[test]
+    fn cps_algebra_retraction() {
+        let mut ev = CpsEval::new();
+        assert_eq!(
+            ev.eval_str("(dot E (dot Q CAR))"),
+            ev.eval_str("CAR")
+        );
+        assert_eq!(
+            ev.eval_str("(dot Q (dot E CAR))"),
+            ev.eval_str("CAR")
+        );
+    }
+
+    #[test]
+    fn cps_algebra_y_fixed_point() {
+        let mut ev = CpsEval::new();
+        let yp = ev.eval_str("(dot Y RHO)");
+        let ryp = ev.eval_str("(dot RHO (dot Y RHO))");
+        assert_eq!(yp, ryp);
+        let r = ev.eval_str("(> (dot Y RHO) 1)");
+        assert!(ev.is_true(r));
+    }
+
+    #[test]
+    fn cps_algebra_strict_mode() {
+        let mut ev = CpsEval::new();
+        assert!(!ev.strict);
+        ev.eval_str("(strict-mode)");
+        assert!(ev.strict);
+        ev.eval_str("(permissive-mode)");
+        assert!(!ev.strict);
     }
 
     #[test]

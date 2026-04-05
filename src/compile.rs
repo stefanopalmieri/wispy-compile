@@ -99,8 +99,10 @@ impl Compiler {
         // Inline the Cayley table
         out.push_str("// 32×32 Cayley table (1KB)\n");
         out.push_str(&format!("const N: usize = {};\n", table::N));
-        out.push_str("const TOP: u8 = 0;\nconst BOT: u8 = 1;\n");
-        out.push_str(&format!("const T_PAIR: u8 = {};\n", table::T_PAIR));
+        // u8 constants for runtime internals (heap tags)
+        out.push_str(&format!("const TAG_TOP: u8 = {};\n", table::TOP));
+        out.push_str(&format!("const TAG_BOT: u8 = {};\n", table::BOT));
+        out.push_str(&format!("const TAG_PAIR: u8 = {};\n", table::T_PAIR));
         out.push_str("\n");
 
         // Inline the table data
@@ -110,6 +112,26 @@ impl Compiler {
 
         // Value type and heap
         out.push_str(RUNTIME_PRELUDE);
+        out.push_str("\n");
+
+        // Algebra element constants (Val) — accessible from compiled Scheme code
+        let elements: &[(&str, u8)] = &[
+            ("TOP", table::TOP), ("BOT", table::BOT),
+            ("Q", table::Q), ("E", table::E),
+            ("CAR", table::CAR), ("CDR", table::CDR), ("CONS", table::CONS),
+            ("RHO", table::RHO), ("APPLY", table::APPLY), ("CC", table::CC),
+            // TAU clashes with the tau() function name — Rust is case-sensitive so it's fine
+            ("TAU", table::TAU), ("Y", table::Y),
+            ("T_PAIR", table::T_PAIR), ("T_SYM", table::T_SYM),
+            ("T_CLS", table::T_CLS), ("T_STR", table::T_STR),
+            ("T_VEC", table::T_VEC), ("T_CHAR", table::T_CHAR),
+            ("T_CONT", table::T_CONT), ("T_PORT", table::T_PORT),
+            ("TRUE", table::TRUE), ("EOF", table::EOF), ("VOID", table::VOID),
+        ];
+        out.push_str("// Algebra element constants\n");
+        for (name, val) in elements {
+            out.push_str(&format!("const {name}: Val = Val::fixnum({} as i64);\n", *val));
+        }
         out.push_str("\n");
 
         // Function definitions
@@ -565,6 +587,28 @@ impl Compiler {
                     return format!("{pad}apply_fn({f}, {args})\n");
                 }
 
+                // ── Algebra extension ────────────
+                "dot" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}Val::fixnum(CAYLEY[{a}.as_fixnum().unwrap() as usize][{b}.as_fixnum().unwrap() as usize] as i64)\n");
+                }
+                "tau" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}tau({a})\n");
+                }
+                "type-valid?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}bool_to_val(CAYLEY[{a}.as_fixnum().unwrap() as usize][{b}.as_fixnum().unwrap() as usize] != TAG_BOT)\n");
+                }
+                "strict-mode" => {
+                    return format!("{pad}Val::NIL // strict-mode (no-op in compiled code)\n");
+                }
+                "permissive-mode" => {
+                    return format!("{pad}Val::NIL // permissive-mode (no-op in compiled code)\n");
+                }
+
                 _ => {
                     // Function call
                     let fname = rust_ident(name);
@@ -786,6 +830,27 @@ impl Compiler {
                 "quote" => {
                     let datum = heap.car(rest);
                     return self.emit_datum(datum, heap, syms);
+                }
+                // ── Algebra extension ────────────
+                "dot" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("Val::fixnum(CAYLEY[{a}.as_fixnum().unwrap() as usize][{b}.as_fixnum().unwrap() as usize] as i64)");
+                }
+                "tau" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("tau({a})");
+                }
+                "type-valid?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(CAYLEY[{a}.as_fixnum().unwrap() as usize][{b}.as_fixnum().unwrap() as usize] != TAG_BOT)");
+                }
+                "strict-mode" => {
+                    return "Val::NIL".to_string();
+                }
+                "permissive-mode" => {
+                    return "Val::NIL".to_string();
                 }
                 _ => {
                     let fname = rust_ident(name);
@@ -1087,14 +1152,14 @@ static mut HEAP: Vec<Rib> = Vec::new();
 
 fn heap_init() {
     unsafe { HEAP = Vec::with_capacity(65536);
-             HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: TOP }); }
+             HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: TAG_TOP }); }
 }
 
 #[inline]
 fn cons(car: Val, cdr: Val) -> Val {
     unsafe {
         let idx = HEAP.len();
-        HEAP.push(Rib { car, cdr, tag: T_PAIR });
+        HEAP.push(Rib { car, cdr, tag: TAG_PAIR });
         Val::rib(idx)
     }
 }
@@ -1140,17 +1205,24 @@ fn append(a: Val, b: Val) -> Val {
     cons(c, rest)
 }
 
+#[inline(always)]
+fn tau(v: Val) -> Val {
+    if v == Val::NIL { return Val::fixnum(TAG_TOP as i64); }
+    if v.is_fixnum() { return Val::fixnum(TAG_TOP as i64); }
+    unsafe { Val::fixnum(HEAP[v.as_rib()].tag as i64) }
+}
+
 fn display(v: Val) {
     if v == Val::NIL { print!("()"); }
     else if let Some(n) = v.as_fixnum() { print!("{n}"); }
     else {
         unsafe {
             let rib = &HEAP[v.as_rib()];
-            if rib.tag == T_PAIR {
+            if rib.tag == TAG_PAIR {
                 print!("(");
                 display(rib.car);
                 let mut rest = rib.cdr;
-                while rest != Val::NIL && !rest.is_fixnum() && HEAP[rest.as_rib()].tag == T_PAIR {
+                while rest != Val::NIL && !rest.is_fixnum() && HEAP[rest.as_rib()].tag == TAG_PAIR {
                     print!(" ");
                     display(HEAP[rest.as_rib()].car);
                     rest = HEAP[rest.as_rib()].cdr;
@@ -1175,7 +1247,7 @@ pub fn compile(src: &str) -> String {
     let exprs = crate::reader::read_all(src, &mut heap, &mut syms)
         .unwrap_or_default();
     let mut compiler = Compiler::new();
-    compiler.process(&exprs, &heap, &syms);
+    compiler.process(exprs.as_slice(), &heap, &syms);
     compiler.emit_rust(&heap, &syms)
 }
 
@@ -1439,6 +1511,75 @@ mod tests {
         let out = compile_and_run("
             (define (f) (if (eq? 1 1) 10 20))
             (display (f)) (newline)
+        ");
+        assert_eq!(out.trim(), "10");
+    }
+
+    // ── Algebra extension round-trip tests ────────────
+
+    #[test]
+    fn compiled_algebra_dot() {
+        let out = compile_and_run("
+            (display (dot CAR T_PAIR)) (newline)
+            (display (dot CAR T_STR)) (newline)
+        ");
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines[0], format!("{}", table::T_PAIR));
+        assert_eq!(lines[1], format!("{}", table::BOT));
+    }
+
+    #[test]
+    fn compiled_algebra_tau() {
+        let out = compile_and_run("
+            (display (tau (cons 1 2))) (newline)
+            (display (tau '())) (newline)
+        ");
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines[0], format!("{}", table::T_PAIR));
+        assert_eq!(lines[1], format!("{}", table::TOP));
+    }
+
+    #[test]
+    fn compiled_algebra_type_valid() {
+        let out = compile_and_run("
+            (display (if (type-valid? CAR T_PAIR) 1 0))
+            (display (if (type-valid? CAR T_STR) 1 0))
+            (newline)
+        ");
+        assert_eq!(out.trim(), "10");
+    }
+
+    #[test]
+    fn compiled_algebra_constants() {
+        let out = compile_and_run("
+            (display TOP) (display BOT) (display T_PAIR) (display Y) (newline)
+        ");
+        assert_eq!(
+            out.trim(),
+            format!("{}{}{}{}", table::TOP, table::BOT, table::T_PAIR, table::Y)
+        );
+    }
+
+    #[test]
+    fn compiled_algebra_retraction() {
+        let out = compile_and_run("
+            (display (dot E (dot Q CAR))) (newline)
+            (display CAR) (newline)
+        ");
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines[0], lines[1]);
+    }
+
+    #[test]
+    fn compiled_algebra_user_dispatcher() {
+        let out = compile_and_run("
+            (define (type-dispatch x)
+              (let ((t (tau x)))
+                (cond ((= t T_PAIR) 1)
+                      (else 0))))
+            (display (type-dispatch (cons 1 2)))
+            (display (type-dispatch '()))
+            (newline)
         ");
         assert_eq!(out.trim(), "10");
     }

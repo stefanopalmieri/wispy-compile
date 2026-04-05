@@ -1582,7 +1582,7 @@ impl Eval {
             .unwrap_or_default();
         let mut result = self.void_val;
         let env = Val::NIL;
-        for expr in exprs {
+        for &expr in exprs.iter() {
             result = self.eval(expr, env);
         }
         result

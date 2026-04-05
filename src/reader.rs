@@ -2,11 +2,156 @@
 //!
 //! Parses a string into rib-based Scheme values on the heap.
 //! Symbols are interned via the shared SymbolTable.
+//!
+//! Two backends for internal buffers:
+//! - `alloc` feature: `Vec`.
+//! - no `alloc`: fixed-size stack arrays.
+
+#[cfg(all(feature = "alloc", not(feature = "std")))]
+use alloc::vec::Vec;
 
 use crate::heap::Heap;
 use crate::symbol::SymbolTable;
 use crate::val::Val;
 use crate::table;
+
+// ── Small-buffer types ──────────────────────────────────────────
+
+/// Stack-allocated Val buffer (used for list elements, vector elements, results).
+struct ValBuf {
+    #[cfg(feature = "alloc")]
+    inner: Vec<Val>,
+    #[cfg(not(feature = "alloc"))]
+    buf: [Val; 256],
+    #[cfg(not(feature = "alloc"))]
+    len: usize,
+}
+
+impl ValBuf {
+    fn new() -> Self {
+        #[cfg(feature = "alloc")]
+        { ValBuf { inner: Vec::new() } }
+        #[cfg(not(feature = "alloc"))]
+        { ValBuf { buf: [Val::NIL; 256], len: 0 } }
+    }
+
+    fn push(&mut self, v: Val) {
+        #[cfg(feature = "alloc")]
+        { self.inner.push(v); }
+        #[cfg(not(feature = "alloc"))]
+        {
+            assert!(self.len < 256, "buffer overflow");
+            self.buf[self.len] = v;
+            self.len += 1;
+        }
+    }
+
+    fn as_slice(&self) -> &[Val] {
+        #[cfg(feature = "alloc")]
+        { &self.inner }
+        #[cfg(not(feature = "alloc"))]
+        { &self.buf[..self.len] }
+    }
+}
+
+/// Stack-allocated byte buffer (used for string literals).
+struct ByteBuf {
+    #[cfg(feature = "alloc")]
+    inner: Vec<u8>,
+    #[cfg(not(feature = "alloc"))]
+    buf: [u8; 1024],
+    #[cfg(not(feature = "alloc"))]
+    len: usize,
+}
+
+impl ByteBuf {
+    fn new() -> Self {
+        #[cfg(feature = "alloc")]
+        { ByteBuf { inner: Vec::new() } }
+        #[cfg(not(feature = "alloc"))]
+        { ByteBuf { buf: [0u8; 1024], len: 0 } }
+    }
+
+    fn push(&mut self, b: u8) {
+        #[cfg(feature = "alloc")]
+        { self.inner.push(b); }
+        #[cfg(not(feature = "alloc"))]
+        {
+            assert!(self.len < 1024, "string too long");
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        #[cfg(feature = "alloc")]
+        { &self.inner }
+        #[cfg(not(feature = "alloc"))]
+        { &self.buf[..self.len] }
+    }
+}
+
+// ── ReadResults ─────────────────────────────────────────────────
+
+/// A collection of read expressions.
+pub struct ReadResults {
+    #[cfg(feature = "alloc")]
+    inner: Vec<Val>,
+    #[cfg(not(feature = "alloc"))]
+    buf: [Val; 256],
+    #[cfg(not(feature = "alloc"))]
+    len: usize,
+}
+
+impl ReadResults {
+    fn new() -> Self {
+        #[cfg(feature = "alloc")]
+        { ReadResults { inner: Vec::new() } }
+        #[cfg(not(feature = "alloc"))]
+        { ReadResults { buf: [Val::NIL; 256], len: 0 } }
+    }
+
+    fn push(&mut self, v: Val) {
+        #[cfg(feature = "alloc")]
+        { self.inner.push(v); }
+        #[cfg(not(feature = "alloc"))]
+        {
+            assert!(self.len < 256, "too many expressions");
+            self.buf[self.len] = v;
+            self.len += 1;
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        #[cfg(feature = "alloc")]
+        { self.inner.len() }
+        #[cfg(not(feature = "alloc"))]
+        { self.len }
+    }
+
+    pub fn as_slice(&self) -> &[Val] {
+        #[cfg(feature = "alloc")]
+        { &self.inner }
+        #[cfg(not(feature = "alloc"))]
+        { &self.buf[..self.len] }
+    }
+
+    pub fn get(&self, i: usize) -> Val {
+        self.as_slice()[i]
+    }
+
+    pub fn iter(&self) -> core::slice::Iter<'_, Val> {
+        self.as_slice().iter()
+    }
+}
+
+impl Default for ReadResults {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Reader ──────────────────────────────────────────────────────
 
 /// Reader state: a cursor into a source string.
 pub struct Reader<'a> {
@@ -123,7 +268,7 @@ impl<'a> Reader<'a> {
             }
         }
 
-        let mut elems = Vec::new();
+        let mut elems = ValBuf::new();
         elems.push(first);
         loop {
             self.skip_whitespace_and_comments();
@@ -144,7 +289,7 @@ impl<'a> Reader<'a> {
                         }
                         self.advance();
                         let mut result = cdr;
-                        for &e in elems.iter().rev() {
+                        for &e in elems.as_slice().iter().rev() {
                             result = heap.cons(e, result);
                         }
                         return Ok(result);
@@ -160,7 +305,7 @@ impl<'a> Reader<'a> {
         }
 
         let mut result = Val::NIL;
-        for &e in elems.iter().rev() {
+        for &e in elems.as_slice().iter().rev() {
             result = heap.cons(e, result);
         }
         Ok(result)
@@ -175,7 +320,8 @@ impl<'a> Reader<'a> {
             self.advance();
         }
         let s = core::str::from_utf8(&self.src[start..self.pos]).unwrap();
-        let n: i64 = s.parse().unwrap();
+        // Manual i64 parse to avoid pulling in std::str::FromStr impls
+        let n = parse_i64(s);
         Ok(Val::fixnum(n))
     }
 
@@ -191,7 +337,7 @@ impl<'a> Reader<'a> {
 
     fn read_string(&mut self, heap: &mut Heap) -> Result<Val> {
         self.advance(); // consume opening '"'
-        let mut chars = Vec::new();
+        let mut chars = ByteBuf::new();
         loop {
             match self.advance() {
                 None => return Err(ReadError::UnterminatedString),
@@ -209,11 +355,12 @@ impl<'a> Reader<'a> {
                 Some(c) => chars.push(c),
             }
         }
+        let cs = chars.as_slice();
         let mut char_list = Val::NIL;
-        for &b in chars.iter().rev() {
+        for &b in cs.iter().rev() {
             char_list = heap.cons(Val::fixnum(b as i64), char_list);
         }
-        Ok(heap.string(char_list, Val::fixnum(chars.len() as i64)))
+        Ok(heap.string(char_list, Val::fixnum(cs.len() as i64)))
     }
 
     fn read_hash(&mut self, heap: &mut Heap, syms: &mut SymbolTable) -> Result<Val> {
@@ -266,7 +413,7 @@ impl<'a> Reader<'a> {
 
     fn read_vector(&mut self, heap: &mut Heap, syms: &mut SymbolTable) -> Result<Val> {
         self.advance(); // consume '('
-        let mut elems = Vec::new();
+        let mut elems = ValBuf::new();
         loop {
             self.skip_whitespace_and_comments();
             match self.peek() {
@@ -275,9 +422,10 @@ impl<'a> Reader<'a> {
                 _ => elems.push(self.read(heap, syms)?),
             }
         }
-        let len = elems.len() as i64;
+        let es = elems.as_slice();
+        let len = es.len() as i64;
         let mut list = Val::NIL;
-        for &e in elems.iter().rev() {
+        for &e in es.iter().rev() {
             list = heap.cons(e, list);
         }
         Ok(heap.vector(list, Val::fixnum(len)))
@@ -296,8 +444,8 @@ impl<'a> Reader<'a> {
     }
 
     /// Read all datums from the source.
-    pub fn read_all(&mut self, heap: &mut Heap, syms: &mut SymbolTable) -> Result<Vec<Val>> {
-        let mut results = Vec::new();
+    pub fn read_all(&mut self, heap: &mut Heap, syms: &mut SymbolTable) -> Result<ReadResults> {
+        let mut results = ReadResults::new();
         loop {
             self.skip_whitespace_and_comments();
             if self.peek().is_none() { break; }
@@ -307,13 +455,29 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Parse an i64 from a decimal string without std. Supports optional leading +/-.
+fn parse_i64(s: &str) -> i64 {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() { return 0; }
+    let (neg, start) = match bytes[0] {
+        b'-' => (true, 1),
+        b'+' => (false, 1),
+        _ => (false, 0),
+    };
+    let mut n: i64 = 0;
+    for &b in &bytes[start..] {
+        n = n * 10 + (b - b'0') as i64;
+    }
+    if neg { -n } else { n }
+}
+
 /// Convenience: read a single expression.
 pub fn read(src: &str, heap: &mut Heap, syms: &mut SymbolTable) -> Result<Val> {
     Reader::new(src).read(heap, syms)
 }
 
 /// Convenience: read all expressions.
-pub fn read_all(src: &str, heap: &mut Heap, syms: &mut SymbolTable) -> Result<Vec<Val>> {
+pub fn read_all(src: &str, heap: &mut Heap, syms: &mut SymbolTable) -> Result<ReadResults> {
     Reader::new(src).read_all(heap, syms)
 }
 
@@ -439,8 +603,8 @@ mod tests {
         let (mut h, mut s) = setup();
         let vs = read_all("1 2 (+ 3 4)", &mut h, &mut s).unwrap();
         assert_eq!(vs.len(), 3);
-        assert_eq!(vs[0], Val::fixnum(1));
-        assert_eq!(vs[1], Val::fixnum(2));
-        assert!(h.is_pair(vs[2]));
+        assert_eq!(vs.get(0), Val::fixnum(1));
+        assert_eq!(vs.get(1), Val::fixnum(2));
+        assert!(h.is_pair(vs.get(2)));
     }
 }

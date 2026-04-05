@@ -7,6 +7,16 @@
 //! are all ribs — same struct, different tag.
 //!
 //! Based on Ribbit's rib model, extended with algebraic type dispatch.
+//!
+//! Two backends:
+//! - `alloc` feature: `Vec<Rib>`, growable.
+//! - no `alloc`: fixed `[Rib; HEAP_CAP]` array, bump pointer.
+
+#[cfg(feature = "alloc")]
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+#[cfg(feature = "std")]
+use std::vec::Vec;
 
 use crate::val::Val;
 use crate::table;
@@ -28,9 +38,18 @@ pub struct Rib {
     pub tag: u8,
 }
 
+/// Fixed heap capacity for no_std builds (number of ribs).
+#[cfg(not(feature = "alloc"))]
+pub const HEAP_CAP: usize = 8192;
+
 /// Bump-allocated rib heap.
 pub struct Heap {
+    #[cfg(feature = "alloc")]
     ribs: Vec<Rib>,
+    #[cfg(not(feature = "alloc"))]
+    ribs: [Rib; HEAP_CAP],
+    #[cfg(not(feature = "alloc"))]
+    len: usize,
     /// When true, type errors (car of non-pair, etc.) panic instead
     /// of silently returning NIL. Default: true. The algebra extension
     /// can set this to false for total algebraic dispatch.
@@ -40,20 +59,38 @@ pub struct Heap {
 impl Heap {
     const EMPTY_RIB: Rib = Rib { car: Val::NIL, cdr: Val::NIL, tag: table::TOP };
 
+    #[cfg(feature = "alloc")]
     pub fn new() -> Self {
         let mut ribs = Vec::with_capacity(65536);
         ribs.push(Self::EMPTY_RIB); // index 0 = nil sentinel
         Heap { ribs, strict: true }
     }
 
+    #[cfg(not(feature = "alloc"))]
+    pub fn new() -> Self {
+        let mut h = Heap {
+            ribs: [Self::EMPTY_RIB; HEAP_CAP],
+            len: 1, // index 0 = nil sentinel
+            strict: true,
+        };
+        h.ribs[0] = Self::EMPTY_RIB;
+        h
+    }
+
     /// Reset the heap (free all allocations except nil).
     pub fn reset(&mut self) {
-        self.ribs.truncate(1);
+        #[cfg(feature = "alloc")]
+        { self.ribs.truncate(1); }
+        #[cfg(not(feature = "alloc"))]
+        { self.len = 1; }
     }
 
     /// Number of allocated ribs.
     pub fn len(&self) -> usize {
-        self.ribs.len()
+        #[cfg(feature = "alloc")]
+        { self.ribs.len() }
+        #[cfg(not(feature = "alloc"))]
+        { self.len }
     }
 
     // ── Allocation ───────────────────────────────────────────────
@@ -61,9 +98,20 @@ impl Heap {
     /// Allocate a rib with the given fields and tag.
     #[inline]
     fn alloc(&mut self, car: Val, cdr: Val, tag: u8) -> Val {
-        let idx = self.ribs.len();
-        self.ribs.push(Rib { car, cdr, tag });
-        Val::rib(idx)
+        #[cfg(feature = "alloc")]
+        {
+            let idx = self.ribs.len();
+            self.ribs.push(Rib { car, cdr, tag });
+            Val::rib(idx)
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            let idx = self.len;
+            assert!(idx < HEAP_CAP, "heap overflow");
+            self.ribs[idx] = Rib { car, cdr, tag };
+            self.len = idx + 1;
+            Val::rib(idx)
+        }
     }
 
     /// Allocate a pair.
@@ -128,7 +176,7 @@ impl Heap {
         }
     }
 
-    // ── Access ───────────────────────────────────────────────────
+    // ── Access ────��──────────────────────────────────────────────
 
     /// Get the rib at a given index.
     #[inline(always)]
@@ -266,7 +314,7 @@ impl Heap {
         table::dot(table::TAU, self.tag(v))
     }
 
-    // ── List utilities ───────────────────────────────────────────
+    // ── List utilities ────���──────────────────────────────────────
 
     /// Build a list from a slice.
     pub fn list(&mut self, vals: &[Val]) -> Val {

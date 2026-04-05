@@ -8,4 +8,5 @@ repository = "https://github.com/stefanopalmieri/WispyScheme"
 
 [features]
 default = ["std"]
-std = []
+std = ["alloc"]
+alloc = []

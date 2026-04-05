@@ -14,11 +14,17 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+#[cfg(all(feature = "alloc", not(feature = "std")))]
+extern crate alloc;
+
 pub mod table;
 pub mod val;
 pub mod heap;
 pub mod symbol;
 pub mod reader;
+#[cfg(feature = "std")]
 pub mod eval;
+#[cfg(feature = "std")]
 pub mod cps;
+#[cfg(feature = "std")]
 pub mod compile;
