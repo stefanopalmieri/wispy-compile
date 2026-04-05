@@ -1,14 +1,24 @@
 # WispyScheme
 
-An R4RS Scheme grounded in a 1KB Cayley table. Compiles to native Rust. Targets `no_std` embedded.
+A small, finite algebra (1KB) replaces conventional runtime type dispatch, encoding control flow, reflection, and recursion in a single Cayley table while compiling to native Rust for `no_std` embedded targets.
 
 Named after Wispy the guinea pig.
 
 ## What it is
 
-A Scheme implementation where type dispatch is algebraic. Applying `car` to a pair, a string, or a number doesn't branch on a tag bit — it indexes into a 32×32 lookup table. The table encodes which operations are valid on which types. The table is `const`, lives in flash on embedded targets, and is transparent to the optimizer.
+An R4RS Scheme where type dispatch is data-driven rather than control-flow-driven. Each builtin operation is a row in a 32×32 lookup table. The operand's type tag indexes the column. The cell determines whether the operation is valid or a type error:
 
-The table's 12-element algebraic core was found by Z3 and satisfies the same axioms as the [Kamea](https://github.com/stefanopalmieri/Kamea) project's Ψ₁₆ algebra: absorbers, extensionality, Q/E retraction, classifier dichotomy, branch, composition, and the Y fixed point.
+```
+TABLE[CAR][T_PAIR] → T_PAIR   (valid: proceed to car field)
+TABLE[CAR][T_STR]  → BOT      (type error)
+TABLE[CAR][T_SYM]  → BOT      (type error)
+TABLE[TAU][T_PAIR] → T_PAIR   (classify: it's a pair)
+TABLE[TAU][T_SYM]  → T_SYM    (classify: it's a symbol)
+```
+
+This replaces the tag-bit branch chains in conventional Scheme implementations with constant-time table indexing. The table is `const`, lives in flash on embedded targets, and is transparent to the optimizer.
+
+The table's 12-element algebraic core was found by Z3 and is axiomatically equivalent to the [Kamea](https://github.com/stefanopalmieri/Kamea) project's Ψ₁₆ algebra (same axiom set satisfied, not isomorphic). The remaining 20 elements extend the core with R4RS type tags (pair, symbol, closure, string, vector, character, continuation, port) and special values (#t, eof, void).
 
 Values are ribs (3-field structs: car, cdr, tag), following the [Ribbit](https://github.com/udem-dlteam/ribbit) model. Pairs, symbols, closures, strings, vectors, characters, continuations, and ports are all the same struct with a different tag byte.
 
@@ -21,7 +31,7 @@ Values are ribs (3-field structs: car, cdr, tag), following the [Ribbit](https:/
 | **LuaJIT** | 212 µs | 0.170 µs |
 | **SBCL** (native Common Lisp) | 440 µs | 0.187 µs |
 
-WispyScheme compiled to Rust is 1.5x faster than LuaJIT and 3.2x faster than SBCL on N-Queens(8).
+On this cons-heavy, branch-heavy workload, compiled WispyScheme is 1.5x faster than LuaJIT and 3.2x faster than SBCL. Results are workload-sensitive; LuaJIT's trace compiler can outperform on tight numeric loops. All benchmarks on Apple M-series, single-threaded.
 
 ## Quick Start
 
@@ -81,11 +91,11 @@ The 32×32 table (1KB) is a finite algebra with a Z3-verified core:
 - **Classifier:** τ partitions the core into two boolean classes
 - **Branch:** ρ dispatches on the classifier (conditional evaluation)
 - **Composition:** cdr = ρ ∘ cons (second projection factors through branch)
-- **Y fixed point:** Y(ρ) = ρ(Y(ρ)), non-absorber (unbounded recursion)
+- **Y fixed point:** Y(ρ) = ρ(Y(ρ)), non-absorber. This is an algebraic fixed point in the magma; unbounded recursion is a property of the interpreted language that this fixed point enables, not a property of the finite table itself.
 - **Extensionality:** all 32 rows are distinct
 - **Type dispatch:** CAR × T_PAIR → valid, CAR × T_STR → error, etc.
 
-The core sub-algebra embeds the same independence structure as [Kamea's Ψ₁₆](https://github.com/stefanopalmieri/Kamea): self-representation (Q/E), self-description (τ), and self-execution (branch + composition) are three independent capabilities.
+The core satisfies the same axiom set as [Kamea's Ψ₁₆](https://github.com/stefanopalmieri/Kamea) (absorbers, retraction, classifier dichotomy, branch, composition, Y), making it axiomatically equivalent but not isomorphic (different carrier size, different table entries). The three independent capabilities carry over: self-representation (Q/E), self-description (τ), and self-execution (branch + composition).
 
 ## Future Work
 
