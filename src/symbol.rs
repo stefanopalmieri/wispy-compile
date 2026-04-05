@@ -113,6 +113,28 @@ impl SymbolTable {
         self.symbol_name(sym) == Some(name)
     }
 
+    /// Look up a symbol Val by name (without allocating). Returns None if not interned.
+    #[cfg(feature = "alloc")]
+    pub fn symbol_name_lookup(&self, name: &str) -> Option<Val> {
+        for (n, &v) in self.entries.iter().map(|(n, v)| (n, v)) {
+            if n == name { return Some(v); }
+        }
+        None
+    }
+
+    #[cfg(not(feature = "alloc"))]
+    pub fn symbol_name_lookup(&self, name: &str) -> Option<Val> {
+        let name_bytes = name.as_bytes();
+        let name_len = name_bytes.len();
+        for i in 0..self.len {
+            let (ref buf, slen, val) = self.entries[i];
+            if slen as usize == name_len && &buf[..name_len] == name_bytes {
+                return Some(val);
+            }
+        }
+        None
+    }
+
     fn make_string(s: &str, heap: &mut Heap) -> Val {
         let mut chars = Val::NIL;
         for &b in s.as_bytes().iter().rev() {

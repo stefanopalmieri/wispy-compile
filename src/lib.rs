@@ -23,6 +23,8 @@ pub mod heap;
 pub mod symbol;
 pub mod reader;
 #[cfg(feature = "std")]
+pub mod macros;
+#[cfg(feature = "std")]
 pub mod eval;
 #[cfg(feature = "std")]
 pub mod cps;

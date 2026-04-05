@@ -64,25 +64,76 @@ impl Compiler {
         }
     }
 
-    /// Parse and collect top-level forms.
-    pub fn process(&mut self, exprs: &[Val], heap: &Heap, syms: &SymbolTable) {
+    /// Parse and collect top-level forms, expanding macros.
+    pub fn process(&mut self, exprs: &[Val], heap: &mut Heap, syms: &mut SymbolTable) {
+        let mut macros: Vec<(Val, crate::macros::Macro)> = Vec::new();
         for &expr in exprs {
             if heap.is_pair(expr) {
                 let head = heap.car(expr);
                 if heap.is_symbol(head) {
                     if let Some(name) = syms.symbol_name(head) {
+                        if name == "define-syntax" {
+                            let rest = heap.cdr(expr);
+                            let name_sym = heap.car(rest);
+                            let transformer = heap.car(heap.cdr(rest));
+                            if let Some(mac) = crate::macros::parse_syntax_rules(
+                                transformer, heap, syms
+                            ) {
+                                macros.push((name_sym, mac));
+                            }
+                            continue;
+                        }
                         if name == "define" {
-                            self.process_define(expr, heap, syms);
+                            let expanded = self.expand_all(expr, &macros, heap, syms);
+                            self.process_define(expanded, heap, syms);
                             continue;
                         }
                     }
                 }
             }
-            self.main_exprs.push(expr);
+            let expanded = self.expand_all(expr, &macros, heap, syms);
+            self.main_exprs.push(expanded);
         }
     }
 
-    fn process_define(&mut self, expr: Val, heap: &Heap, syms: &SymbolTable) {
+    /// Recursively expand all macros in an expression.
+    fn expand_all(&self, expr: Val, macros: &[(Val, crate::macros::Macro)],
+                  heap: &mut Heap, syms: &SymbolTable) -> Val {
+        if !heap.is_pair(expr) { return expr; }
+        let head = heap.car(expr);
+        // Check if head is a macro name
+        if heap.is_symbol(head) {
+            let mac = macros.iter().find(|(n, _)| *n == head).map(|(_, m)| m);
+            if let Some(mac) = mac {
+                if let Some(expanded) = crate::macros::expand_macro(mac, expr, heap, syms) {
+                    return self.expand_all(expanded, macros, heap, syms);
+                }
+            }
+        }
+        // Recursively expand in sub-expressions
+        let car = heap.car(expr);
+        let cdr = heap.cdr(expr);
+        let new_car = self.expand_all(car, macros, heap, syms);
+        let new_cdr = self.expand_all_list(cdr, macros, heap, syms);
+        heap.cons(new_car, new_cdr)
+    }
+
+    fn expand_all_list(&self, mut list: Val, macros: &[(Val, crate::macros::Macro)],
+                       heap: &mut Heap, syms: &SymbolTable) -> Val {
+        if !heap.is_pair(list) { return list; }
+        let mut items = Vec::new();
+        while heap.is_pair(list) {
+            items.push(self.expand_all(heap.car(list), macros, heap, syms));
+            list = heap.cdr(list);
+        }
+        let mut result = list; // preserve tail (NIL or dotted)
+        for v in items.iter().rev() {
+            result = heap.cons(*v, result);
+        }
+        result
+    }
+
+    fn process_define(&mut self, expr: Val, heap: &mut Heap, syms: &mut SymbolTable) {
         let rest = heap.cdr(expr);
         let target = heap.car(rest);
 
@@ -1745,7 +1796,7 @@ pub fn compile(src: &str) -> String {
     let exprs = crate::reader::read_all(src, &mut heap, &mut syms)
         .unwrap_or_default();
     let mut compiler = Compiler::new();
-    compiler.process(exprs.as_slice(), &heap, &syms);
+    compiler.process(exprs.as_slice(), &mut heap, &mut syms);
     compiler.emit_rust(&heap, &syms)
 }
 
@@ -2287,5 +2338,36 @@ mod tests {
             (newline)
         ");
         assert_eq!(out.trim(), "42");
+    }
+
+    // ── syntax-rules compiled tests ────────────────────
+
+    #[test]
+    fn compiled_syntax_rules_basic() {
+        let out = compile_and_run("
+            (define-syntax my-when
+              (syntax-rules ()
+                ((my-when test body)
+                 (if test body 0))))
+            (define (f x) (my-when (> x 0) (* x 2)))
+            (display (f 5))
+            (display (f 0))
+            (newline)
+        ");
+        assert_eq!(out.trim(), "100");
+    }
+
+    #[test]
+    fn compiled_syntax_rules_ellipsis() {
+        let out = compile_and_run("
+            (define-syntax my-let
+              (syntax-rules ()
+                ((my-let ((var init) ...) body ...)
+                 ((lambda (var ...) body ...) init ...))))
+            (define (f) (my-let ((x 10) (y 20)) (+ x y)))
+            (display (f))
+            (newline)
+        ");
+        assert_eq!(out.trim(), "30");
     }
 }

@@ -39,6 +39,7 @@ pub struct CpsEval {
     pub false_val: Val,
     pub void_val: Val,
     pub strict: bool,
+    pub macros: Vec<(Val, crate::macros::Macro)>,
 }
 
 enum State {
@@ -61,6 +62,7 @@ impl CpsEval {
             heap, syms, globals: Val::NIL,
             true_val, false_val, void_val,
             strict: false,
+            macros: Vec::new(),
         };
         ev.register_builtins();
         ev
@@ -212,6 +214,17 @@ impl CpsEval {
                 }
             }
 
+            if self.syms.sym_eq(head, "define-syntax") {
+                let name_sym = self.heap.car(rest);
+                let transformer_expr = self.heap.car(self.heap.cdr(rest));
+                if let Some(mac) = crate::macros::parse_syntax_rules(
+                    transformer_expr, &self.heap, &self.syms
+                ) {
+                    self.macros.push((name_sym, mac));
+                }
+                return State::ApplyCont { val: self.void_val, cont };
+            }
+
             if self.syms.sym_eq(head, "lambda") {
                 let params = self.heap.car(rest);
                 let body = self.wrap_body(self.heap.cdr(rest));
@@ -277,6 +290,16 @@ impl CpsEval {
                 let template = self.heap.car(rest);
                 let val = self.expand_quasiquote(template, env);
                 return State::ApplyCont { val, cont };
+            }
+        }
+
+        // Macro expansion
+        if self.heap.is_symbol(head) {
+            let mac = self.macros.iter().find(|(n, _)| *n == head).map(|(_, m)| m.clone());
+            if let Some(mac) = mac {
+                if let Some(expanded) = crate::macros::expand_macro(&mac, expr, &mut self.heap, &self.syms) {
+                    return State::Eval { expr: expanded, env, cont };
+                }
             }
         }
 

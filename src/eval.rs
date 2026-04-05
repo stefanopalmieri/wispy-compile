@@ -31,6 +31,8 @@ pub struct Eval {
     cont_values: Vec<(usize, Val)>,
     /// When true, type errors in car/cdr builtins panic instead of returning NIL.
     pub strict: bool,
+    /// syntax-rules macros: (symbol, Macro) pairs
+    pub macros: Vec<(Val, crate::macros::Macro)>,
 }
 
 impl Eval {
@@ -51,6 +53,7 @@ impl Eval {
             void_val,
             cont_values: Vec::new(),
             strict: false,
+            macros: Vec::new(),
         };
         ev.register_builtins();
         ev
@@ -270,6 +273,17 @@ impl Eval {
                 }
             }
 
+            if self.sym_eq(head, "define-syntax") {
+                let name_sym = self.heap.car(rest);
+                let transformer_expr = self.heap.car(self.heap.cdr(rest));
+                if let Some(mac) = crate::macros::parse_syntax_rules(
+                    transformer_expr, &self.heap, &self.syms
+                ) {
+                    self.macros.push((name_sym, mac));
+                }
+                return Trampoline::Done(self.void_val);
+            }
+
             if self.sym_eq(head, "lambda") {
                 let params = self.heap.car(rest);
                 let body_exprs = self.heap.cdr(rest);
@@ -339,6 +353,16 @@ impl Eval {
                 let template = self.heap.car(rest);
                 let result = self.expand_quasiquote(template, env);
                 return Trampoline::Done(result);
+            }
+        }
+
+        // Macro expansion: check if head is a macro name
+        if self.heap.is_symbol(head) {
+            let mac = self.macros.iter().find(|(n, _)| *n == head).map(|(_, m)| m.clone());
+            if let Some(mac) = mac {
+                if let Some(expanded) = crate::macros::expand_macro(&mac, expr, &mut self.heap, &self.syms) {
+                    return self.eval_inner(expanded, env);
+                }
             }
         }
 
@@ -2007,5 +2031,108 @@ mod tests {
         assert!(pair_ops.as_fixnum().unwrap() >= 2);
         // CAR and CDR are NOT valid on strings
         assert!(str_ops.as_fixnum().unwrap() < pair_ops.as_fixnum().unwrap());
+    }
+
+    // ── syntax-rules tests ──��─────────────────────────
+
+    #[test]
+    fn syntax_rules_basic() {
+        let mut ev = Eval::new();
+        ev.eval_str("
+            (define-syntax my-when
+              (syntax-rules ()
+                ((my-when test body)
+                 (if test body 0))))
+        ");
+        assert_eq!(ev.eval_str("(my-when #t 42)"), Val::fixnum(42));
+        assert_eq!(ev.eval_str("(my-when #f 42)"), Val::fixnum(0));
+    }
+
+    #[test]
+    fn syntax_rules_ellipsis() {
+        let mut ev = Eval::new();
+        ev.eval_str("
+            (define-syntax my-begin
+              (syntax-rules ()
+                ((my-begin e) e)
+                ((my-begin e1 e2 ...)
+                 (let ((t e1)) (my-begin e2 ...)))))
+        ");
+        assert_eq!(ev.eval_str("(my-begin 1 2 3)"), Val::fixnum(3));
+    }
+
+    #[test]
+    fn syntax_rules_nested() {
+        let mut ev = Eval::new();
+        ev.eval_str("
+            (define-syntax my-when
+              (syntax-rules ()
+                ((my-when test body ...)
+                 (if test (begin body ...) #f))))
+        ");
+        ev.eval_str("(define x 0)");
+        ev.eval_str("(my-when #t (set! x 10))");
+        assert_eq!(ev.eval_str("x"), Val::fixnum(10));
+    }
+
+    #[test]
+    fn syntax_rules_literals() {
+        let mut ev = Eval::new();
+        ev.eval_str("
+            (define-syntax my-cond
+              (syntax-rules (else)
+                ((my-cond (else e)) e)
+                ((my-cond (test e)) (if test e #f))))
+        ");
+        assert_eq!(ev.eval_str("(my-cond (else 99))"), Val::fixnum(99));
+        assert_eq!(ev.eval_str("(my-cond (#t 42))"), Val::fixnum(42));
+    }
+
+    #[test]
+    fn syntax_rules_let_macro() {
+        let mut ev = Eval::new();
+        ev.eval_str("
+            (define-syntax my-let
+              (syntax-rules ()
+                ((my-let ((var init) ...) body ...)
+                 ((lambda (var ...) body ...) init ...))))
+        ");
+        assert_eq!(
+            ev.eval_str("(my-let ((x 10) (y 20)) (+ x y))"),
+            Val::fixnum(30)
+        );
+    }
+
+    #[test]
+    fn syntax_rules_or_macro() {
+        let mut ev = Eval::new();
+        ev.eval_str("
+            (define-syntax my-or
+              (syntax-rules ()
+                ((my-or) 0)
+                ((my-or e) e)
+                ((my-or e1 e2 ...)
+                 (let ((t e1))
+                   (if t t (my-or e2 ...))))))
+        ");
+        assert_eq!(ev.eval_str("(my-or)"), Val::fixnum(0));
+        assert_eq!(ev.eval_str("(my-or #f #f 42)"), Val::fixnum(42));
+        assert_eq!(ev.eval_str("(my-or 10 20)"), Val::fixnum(10));
+    }
+
+    #[test]
+    fn syntax_rules_multiple_rules() {
+        let mut ev = Eval::new();
+        ev.eval_str("
+            (define-syntax my-if
+              (syntax-rules ()
+                ((my-if test then)
+                 (if test then 0))
+                ((my-if test then else-expr)
+                 (if test then else-expr))))
+        ");
+        assert_eq!(ev.eval_str("(my-if #t 1)"), Val::fixnum(1));
+        assert_eq!(ev.eval_str("(my-if #f 1)"), Val::fixnum(0));
+        assert_eq!(ev.eval_str("(my-if #f 1 2)"), Val::fixnum(2));
     }
 }

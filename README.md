@@ -111,6 +111,7 @@ src/
 ├── heap.rs         Rib heap: uniform (car, cdr, tag) for all types
 ├── symbol.rs       Symbol interning (shared reader/evaluator)
 ├── reader.rs       S-expression parser
+├── macros.rs       syntax-rules: pattern matching, ellipsis, template instantiation
 ├── eval.rs         Tree-walking evaluator, 104 builtins, tail call trampoline
 ├── cps.rs          CPS evaluator with first-class continuations (call/cc)
 └── compile.rs      Scheme → Rust compiler (standalone native binaries)
@@ -125,7 +126,9 @@ Three execution paths:
 
 ### Implemented
 
-**Special forms:** `quote`, `if`, `define`, `lambda` (multi-body), `set!`, `begin`, `cond`, `case`, `and`, `or`, `let`, `let*`, `letrec`, named `let`, `do`, `delay`, `quasiquote`/`unquote`/`unquote-splicing`
+**Special forms:** `quote`, `if`, `define`, `define-syntax`, `lambda` (multi-body), `set!`, `begin`, `cond`, `case`, `and`, `or`, `let`, `let*`, `letrec`, named `let`, `do`, `delay`, `quasiquote`/`unquote`/`unquote-splicing`
+
+**Macros:** `syntax-rules` with pattern matching, ellipsis (`...`), literals, wildcards (`_`), and multiple clauses. Expansion in all three execution paths (interpreter, CPS, compiler).
 
 **Control:** `call-with-current-continuation` (CPS evaluator), tail call optimization, rest parameters
 
@@ -133,12 +136,12 @@ Three execution paths:
 
 ### Not yet implemented
 
-- `syntax-rules` (hygienic macros)
 - `read` (S-expression input from ports)
 - Port I/O (`open-input-file`, `open-output-file`, `close-input-port`, `close-output-port`, `current-input-port`, `current-output-port`, `call-with-input-file`, `call-with-output-file`, `input-port?`, `output-port?`, `peek-char`, `char-ready?`)
 - `load`
 - Case-insensitive character and string comparisons (`char-ci=?`, `string-ci=?`, etc.)
 - `dynamic-wind`
+- Full macro hygiene (current implementation is unhygienic — macro-introduced bindings can capture)
 - `call/cc` in the compiler (only the CPS evaluator supports `call/cc`)
 
 ## The Cayley Table
