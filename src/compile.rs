@@ -441,6 +441,8 @@ impl Compiler {
         out.push_str(&format!("const TAG_BOT: u8 = {};\n", table::BOT));
         out.push_str(&format!("const TAG_PAIR: u8 = {};\n", table::T_PAIR));
         out.push_str(&format!("const TAG_CLS: u8 = {};\n", table::T_CLS));
+        out.push_str(&format!("const TAG_STR: u8 = {};\n", table::T_STR));
+        out.push_str(&format!("const TAG_CHAR: u8 = {};\n", table::T_CHAR));
         out.push_str("\n");
 
         // Inline the table data
@@ -576,6 +578,15 @@ impl Compiler {
                 return format!("{pad}make_closure({id}, Val::NIL)\n");
             }
             return format!("{pad}{}\n", rust_ident(name));
+        }
+
+        if tag == table::T_STR {
+            return format!("{pad}{}\n", self.emit_string_rib(expr, heap));
+        }
+
+        if tag == table::T_CHAR {
+            let cp = heap.rib_car(expr).as_fixnum().unwrap_or(0);
+            return format!("{pad}make_char({cp})\n");
         }
 
         if tag != table::T_PAIR {
@@ -954,6 +965,87 @@ impl Compiler {
                     return format!("{pad}apply_val({f}, {args_list})\n");
                 }
 
+                // ── String / char builtins ────────────
+                "string-length" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}string_length({a})\n");
+                }
+                "string-ref" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}string_ref({a}, {b})\n");
+                }
+                "string-append" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}string_append({a}, {b})\n");
+                }
+                "string=?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}bool_to_val(string_eq({a}, {b}))\n");
+                }
+                "string<?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}bool_to_val(string_cmp({a}, {b}) < 0)\n");
+                }
+                "string>?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}bool_to_val(string_cmp({a}, {b}) > 0)\n");
+                }
+                "string<=?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}bool_to_val(string_cmp({a}, {b}) <= 0)\n");
+                }
+                "string>=?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{pad}bool_to_val(string_cmp({a}, {b}) >= 0)\n");
+                }
+                "string?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}bool_to_val(is_string({a}))\n");
+                }
+                "substring" => {
+                    let s = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let start = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    let end = self.emit_expr_inline(heap.car(heap.cdr(heap.cdr(rest))), heap, syms);
+                    return format!("{pad}substring({s}, {start}, {end})\n");
+                }
+                "make-string" => {
+                    let n = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let fill_rest = heap.cdr(rest);
+                    let fill = if heap.is_pair(fill_rest) {
+                        self.emit_expr_inline(heap.car(fill_rest), heap, syms)
+                    } else {
+                        "Val::fixnum(32)".to_string() // space
+                    };
+                    return format!("{pad}make_string_fill({n}, {fill})\n");
+                }
+                "char->integer" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}char_to_integer({a})\n");
+                }
+                "integer->char" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}make_char({a}.as_fixnum().unwrap())\n");
+                }
+                "char?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}bool_to_val(is_char({a}))\n");
+                }
+                "number->string" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}number_to_string({a})\n");
+                }
+                "string->number" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{pad}string_to_number({a})\n");
+                }
+
                 // ── Algebra extension ────────────
                 "dot" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
@@ -1028,6 +1120,13 @@ impl Compiler {
                 return format!("make_closure({id}, Val::NIL)");
             }
             return rust_ident(name);
+        }
+        if tag == table::T_STR {
+            return self.emit_string_rib(expr, heap);
+        }
+        if tag == table::T_CHAR {
+            let cp = heap.rib_car(expr).as_fixnum().unwrap_or(0);
+            return format!("make_char({cp})");
         }
         if tag != table::T_PAIR {
             return "Val::NIL".to_string();
@@ -1217,6 +1316,87 @@ impl Compiler {
                     let datum = heap.car(rest);
                     return self.emit_datum(datum, heap, syms);
                 }
+                // ── String / char builtins ────────────
+                "string-length" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("string_length({a})");
+                }
+                "string-ref" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("string_ref({a}, {b})");
+                }
+                "string-append" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("string_append({a}, {b})");
+                }
+                "string=?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(string_eq({a}, {b}))");
+                }
+                "string<?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(string_cmp({a}, {b}) < 0)");
+                }
+                "string>?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(string_cmp({a}, {b}) > 0)");
+                }
+                "string<=?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(string_cmp({a}, {b}) <= 0)");
+                }
+                "string>=?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(string_cmp({a}, {b}) >= 0)");
+                }
+                "string?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val(is_string({a}))");
+                }
+                "substring" => {
+                    let s = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let start = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    let end = self.emit_expr_inline(heap.car(heap.cdr(heap.cdr(rest))), heap, syms);
+                    return format!("substring({s}, {start}, {end})");
+                }
+                "make-string" => {
+                    let n = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let fill_rest = heap.cdr(rest);
+                    let fill = if heap.is_pair(fill_rest) {
+                        self.emit_expr_inline(heap.car(fill_rest), heap, syms)
+                    } else {
+                        "Val::fixnum(32)".to_string()
+                    };
+                    return format!("make_string_fill({n}, {fill})");
+                }
+                "char->integer" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("char_to_integer({a})");
+                }
+                "integer->char" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("make_char({a}.as_fixnum().unwrap())");
+                }
+                "char?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val(is_char({a}))");
+                }
+                "number->string" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("number_to_string({a})");
+                }
+                "string->number" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("string_to_number({a})");
+                }
+
                 // ── Algebra extension ────────────
                 "dot" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
@@ -1484,7 +1664,40 @@ impl Compiler {
             let hash = name.bytes().fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
             return format!("Val::fixnum({hash}) /* '{name} */");
         }
+        if heap.tag(datum) == table::T_STR {
+            return self.emit_string_rib(datum, heap);
+        }
+        if heap.tag(datum) == table::T_CHAR {
+            let cp = heap.rib_car(datum).as_fixnum().unwrap_or(0);
+            return format!("make_char({cp})");
+        }
+        if heap.is_pair(datum) {
+            // Quoted list — recursively emit
+            let car_code = self.emit_datum(heap.car(datum), heap, syms);
+            let cdr_code = self.emit_datum(heap.cdr(datum), heap, syms);
+            return format!("cons({car_code}, {cdr_code})");
+        }
         "Val::NIL".to_string()
+    }
+
+    /// Emit code that constructs a string rib at runtime from a parsed string Val.
+    fn emit_string_rib(&self, str_val: Val, heap: &Heap) -> String {
+        // Walk the char list in the string rib
+        let mut bytes = Vec::new();
+        let mut chars = heap.rib_car(str_val);
+        while heap.is_pair(chars) {
+            if let Some(cp) = heap.car(chars).as_fixnum() {
+                bytes.push(cp);
+            }
+            chars = heap.cdr(chars);
+        }
+        let len = bytes.len();
+        // Build: { let c = cons(fixnum(h), cons(fixnum(e), ...NIL)); make_string(c, fixnum(len)) }
+        let mut s = "Val::NIL".to_string();
+        for &b in bytes.iter().rev() {
+            s = format!("cons(Val::fixnum({b}), {s})");
+        }
+        format!("{{ let __c = {s}; make_string(__c, Val::fixnum({len} as i64)) }}")
     }
 }
 
@@ -1616,6 +1829,143 @@ fn tau(v: Val) -> Val {
     unsafe { Val::fixnum(HEAP[v.as_rib()].tag as i64) }
 }
 
+// ── String / char support ────────────────────────────────────────
+
+fn make_string(chars: Val, len: Val) -> Val {
+    unsafe {
+        let idx = HEAP.len();
+        HEAP.push(Rib { car: chars, cdr: len, tag: TAG_STR });
+        Val::rib(idx)
+    }
+}
+
+fn make_char(codepoint: i64) -> Val {
+    unsafe {
+        let idx = HEAP.len();
+        HEAP.push(Rib { car: Val::fixnum(codepoint), cdr: Val::NIL, tag: TAG_CHAR });
+        Val::rib(idx)
+    }
+}
+
+fn is_string(v: Val) -> bool {
+    !v.is_fixnum() && v != Val::NIL && unsafe { HEAP[v.as_rib()].tag == TAG_STR }
+}
+
+fn is_char(v: Val) -> bool {
+    !v.is_fixnum() && v != Val::NIL && unsafe { HEAP[v.as_rib()].tag == TAG_CHAR }
+}
+
+fn string_length(s: Val) -> Val {
+    if is_string(s) { cdr(s) } else { Val::fixnum(0) }
+}
+
+fn string_ref(s: Val, idx: Val) -> Val {
+    let n = idx.as_fixnum().unwrap_or(0);
+    let mut chars = car(s);
+    for _ in 0..n {
+        chars = cdr(chars);
+    }
+    make_char(car(chars).as_fixnum().unwrap_or(0))
+}
+
+fn string_eq(a: Val, b: Val) -> bool {
+    let mut ca = car(a);
+    let mut cb = car(b);
+    loop {
+        if ca == Val::NIL && cb == Val::NIL { return true; }
+        if ca == Val::NIL || cb == Val::NIL { return false; }
+        if ca.is_fixnum() || cb.is_fixnum() { return ca == cb; }
+        if car(ca) != car(cb) { return false; }
+        ca = cdr(ca);
+        cb = cdr(cb);
+    }
+}
+
+fn string_cmp(a: Val, b: Val) -> i64 {
+    let mut ca = car(a);
+    let mut cb = car(b);
+    loop {
+        if ca == Val::NIL && cb == Val::NIL { return 0; }
+        if ca == Val::NIL { return -1; }
+        if cb == Val::NIL { return 1; }
+        let va = car(ca).as_fixnum().unwrap_or(0);
+        let vb = car(cb).as_fixnum().unwrap_or(0);
+        if va != vb { return va - vb; }
+        ca = cdr(ca);
+        cb = cdr(cb);
+    }
+}
+
+fn string_append(a: Val, b: Val) -> Val {
+    let chars_a = car(a);
+    let chars_b = car(b);
+    let la = cdr(a).as_fixnum().unwrap_or(0);
+    let lb = cdr(b).as_fixnum().unwrap_or(0);
+    let merged = append(chars_a, chars_b);
+    make_string(merged, Val::fixnum(la + lb))
+}
+
+fn substring(s: Val, start: Val, end: Val) -> Val {
+    let si = start.as_fixnum().unwrap_or(0);
+    let ei = end.as_fixnum().unwrap_or(0);
+    let mut chars = car(s);
+    for _ in 0..si { chars = cdr(chars); }
+    let mut result = Val::NIL;
+    let mut collected = Vec::new();
+    for _ in si..ei {
+        collected.push(car(chars));
+        chars = cdr(chars);
+    }
+    for v in collected.iter().rev() {
+        result = cons(*v, result);
+    }
+    make_string(result, Val::fixnum(ei - si))
+}
+
+fn make_string_fill(n: Val, fill: Val) -> Val {
+    let len = n.as_fixnum().unwrap_or(0);
+    let cp = if is_char(fill) { car(fill).as_fixnum().unwrap_or(32) } else { fill.as_fixnum().unwrap_or(32) };
+    let mut chars = Val::NIL;
+    for _ in 0..len {
+        chars = cons(Val::fixnum(cp), chars);
+    }
+    make_string(chars, Val::fixnum(len))
+}
+
+fn char_to_integer(c: Val) -> Val {
+    if is_char(c) { car(c) } else { Val::fixnum(0) }
+}
+
+fn number_to_string(n: Val) -> Val {
+    let num = n.as_fixnum().unwrap_or(0);
+    let s = format!("{num}");
+    let len = s.len() as i64;
+    let mut chars = Val::NIL;
+    for b in s.bytes().rev() {
+        chars = cons(Val::fixnum(b as i64), chars);
+    }
+    make_string(chars, Val::fixnum(len))
+}
+
+fn string_to_number(s: Val) -> Val {
+    let mut chars = car(s);
+    let mut num: i64 = 0;
+    let mut neg = false;
+    let mut first = true;
+    while chars != Val::NIL && !chars.is_fixnum() {
+        let cp = car(chars).as_fixnum().unwrap_or(0);
+        if first && cp == 45 { neg = true; } // '-'
+        else if cp >= 48 && cp <= 57 { num = num * 10 + (cp - 48); }
+        else { return Val::NIL; } // not a number
+        first = false;
+        chars = cdr(chars);
+    }
+    if neg { num = -num; }
+    Val::fixnum(num)
+}
+
+// ── Display ──────────────────────────────────────────────────────
+
 fn display(v: Val) {
     if v == Val::NIL { print!("()"); }
     else if let Some(n) = v.as_fixnum() { print!("{n}"); }
@@ -1636,6 +1986,17 @@ fn display(v: Val) {
                     display(rest);
                 }
                 print!(")");
+            } else if rib.tag == TAG_STR {
+                // Walk the char list and print each codepoint
+                let mut chars = rib.car;
+                while chars != Val::NIL && !chars.is_fixnum() {
+                    let cp = HEAP[chars.as_rib()].car.as_fixnum().unwrap_or(0);
+                    print!("{}", cp as u8 as char);
+                    chars = HEAP[chars.as_rib()].cdr;
+                }
+            } else if rib.tag == TAG_CHAR {
+                let cp = rib.car.as_fixnum().unwrap_or(0);
+                print!("{}", cp as u8 as char);
             } else {
                 print!("<rib>");
             }
@@ -2096,5 +2457,75 @@ mod tests {
             (newline)
         ");
         assert_eq!(out.trim(), "42");
+    }
+
+    // ── String / char tests ────────────────────────────
+
+    #[test]
+    fn compiled_string_display() {
+        let out = compile_and_run(r#"
+            (display "hello")
+            (newline)
+        "#);
+        assert_eq!(out.trim(), "hello");
+    }
+
+    #[test]
+    fn compiled_string_length() {
+        let out = compile_and_run(r#"
+            (display (string-length "hello"))
+            (newline)
+        "#);
+        assert_eq!(out.trim(), "5");
+    }
+
+    #[test]
+    fn compiled_string_append() {
+        let out = compile_and_run(r#"
+            (display (string-append "he" "llo"))
+            (newline)
+        "#);
+        assert_eq!(out.trim(), "hello");
+    }
+
+    #[test]
+    fn compiled_string_equality() {
+        let out = compile_and_run(r#"
+            (display (if (string=? "abc" "abc") 1 0))
+            (display (if (string=? "abc" "def") 1 0))
+            (newline)
+        "#);
+        assert_eq!(out.trim(), "10");
+    }
+
+    #[test]
+    fn compiled_char_display() {
+        let out = compile_and_run(r#"
+            (display #\A)
+            (newline)
+        "#);
+        assert_eq!(out.trim(), "A");
+    }
+
+    #[test]
+    fn compiled_string_in_list() {
+        let out = compile_and_run(r#"
+            (display (list "a" "b" "c"))
+            (newline)
+        "#);
+        assert_eq!(out.trim(), "(a b c)");
+    }
+
+    #[test]
+    fn compiled_string_mixed() {
+        let out = compile_and_run(r#"
+            (define (greet name)
+              (display (string-append "Hello, " (string-append name "!"))))
+            (greet "world")
+            (newline)
+            (display (string-length "test"))
+            (newline)
+        "#);
+        assert_eq!(out.trim(), "Hello, world!\n4");
     }
 }
