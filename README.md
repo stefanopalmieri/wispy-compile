@@ -35,6 +35,17 @@ On this cons-heavy, branch-heavy workload, compiled WispyScheme is 1.5x faster t
 
 ## Quick Start
 
+```bash
+cargo run                            # REPL
+cargo run -- examples/fib.scm        # run a file
+cargo run -- -e '(+ 1 2)'           # evaluate expression
+cargo run -- --strict examples/fib.scm   # strict type checking
+cargo run -- --compile examples/nqueens.scm > nqueens.rs  # compile to Rust
+rustc -O -o nqueens nqueens.rs && ./nqueens   # native binary
+```
+
+As a library:
+
 ```rust
 use wispy_scheme::eval::Eval;
 
@@ -91,21 +102,23 @@ BOT as a return value instead of an exception means type dispatch is data flow, 
 ## Architecture
 
 ```
-wispy-scheme/src/
-├── table.rs      32×32 Cayley table (1KB const array), algebraic axiom tests
-├── val.rs        Val = tagged pointer (fixnum | rib index)
-├── heap.rs       Rib heap: uniform (car, cdr, tag) for all types
-├── symbol.rs     Symbol interning (shared reader/evaluator)
-├── reader.rs     S-expression parser
-├── eval.rs       Tree-walking evaluator, 104 builtins, tail call trampoline
-├── cps.rs        CPS evaluator with first-class continuations (call/cc)
-└── compile.rs    Scheme → Rust compiler (standalone binaries)
+src/
+├── lib.rs          crate root
+├── bin/wispy.rs    REPL, file runner, -e flag, --compile, --strict
+├── table.rs        32×32 Cayley table (1KB const array), algebraic axiom tests
+├── val.rs          Val = tagged pointer (fixnum | rib index)
+├── heap.rs         Rib heap: uniform (car, cdr, tag) for all types
+├── symbol.rs       Symbol interning (shared reader/evaluator)
+├── reader.rs       S-expression parser
+├── eval.rs         Tree-walking evaluator, 104 builtins, tail call trampoline
+├── cps.rs          CPS evaluator with first-class continuations (call/cc)
+└── compile.rs      Scheme → Rust compiler (standalone native binaries)
 ```
 
 Three execution paths:
-- `eval.rs` — interpreter with tail call optimization (fast, no call/cc)
-- `cps.rs` — CPS state machine with first-class continuations (R4RS compliant)
-- `compile.rs` — generates standalone Rust programs (native speed)
+- **Interpreter** (`eval.rs`): tail call optimization, 104 builtins, `(strict-mode)` / `(permissive-mode)` toggle
+- **CPS evaluator** (`cps.rs`): first-class continuations, `call/cc`, re-entrant
+- **Compiler** (`compile.rs`): Scheme → standalone Rust, 1.5x faster than LuaJIT on nqueens(8). Handles `if`, `cond`, `case`, `let`, `let*`, `letrec`, `begin`, `and`, `or`, `do`, `quote`, `set!`, `define`, `list`, variadic `+`/`*`, and 40+ inlined builtins.
 
 ## R4RS Coverage
 
@@ -150,7 +163,7 @@ The core satisfies the same axiom set as [Kamea's Ψ₁₆](https://github.com/s
 
 - **Lean verification.** Prove the 32×32 table's algebraic properties in Lean 4 via `native_decide` (1024 entries, well within capacity).
 
-- **Compiler improvements.** Closure conversion, tail call optimization via loop, `call/cc` support in compiled output.
+- **Compiler improvements.** Closure conversion (lambda as value), tail call optimization via loop, `call/cc` support in compiled output, string literals in compiled code.
 
 - **Embedded demo.** Run WispyScheme on an RP2040 or ESP32-C3: read sensor values, apply user-defined Scheme rules, actuate outputs. Upload new `.scm` files over serial without reflashing.
 
