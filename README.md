@@ -16,7 +16,7 @@ TABLE[TAU][T_PAIR] → T_PAIR   (classify: it's a pair)
 TABLE[TAU][T_SYM]  → T_SYM    (classify: it's a symbol)
 ```
 
-This replaces the tag-bit branch chains in conventional Scheme implementations with constant-time table indexing. The table is `const`, lives in flash on embedded targets, and is transparent to the optimizer.
+This replaces the tag-bit branch chains in conventional Scheme implementations with constant-time table indexing. The table is `const`, lives in flash on embedded targets, and is transparent to the optimizer. The operational semantics of the language are finite, explicit, and queryable — the programmer can inspect the table at runtime via the algebra extension (`dot`, `tau`, `type-valid?`).
 
 The table's 12-element algebraic core was found by Z3 and is axiomatically equivalent to the [Kamea](https://github.com/stefanopalmieri/Kamea) project's Ψ₁₆ algebra (same axiom set satisfied, not isomorphic). The remaining 20 elements extend the core with R4RS type tags (pair, symbol, closure, string, vector, character, continuation, port) and special values (#t, eof, void).
 
