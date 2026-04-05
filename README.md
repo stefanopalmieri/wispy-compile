@@ -42,6 +42,7 @@ cargo run -- -e '(+ 1 2)'           # evaluate expression
 cargo run -- --strict examples/fib.scm   # strict type checking
 cargo run -- --compile examples/nqueens.scm > nqueens.rs  # compile to Rust
 rustc -O -o nqueens nqueens.rs && ./nqueens   # native binary
+cd lean && lake build                        # verify table proofs (14 theorems, ~6s)
 ```
 
 As a library:
@@ -142,7 +143,7 @@ Three execution paths:
 
 ## The Cayley Table
 
-The 32×32 table (1KB) is a finite algebra with a Z3-verified core:
+The 32×32 table (1KB) is a finite algebra. All properties are Lean-proved (`lean/WispyScheme.lean`, 14 theorems, zero `sorry`, verified by `native_decide` in ~6 seconds):
 
 - **Absorbers:** ⊤ (nil) and ⊥ (#f) are left absorbers
 - **Retraction pair:** Q and E are mutual inverses on the core (quote/eval)
@@ -175,8 +176,6 @@ cargo check --no-default-features --lib
 ## Future Work
 
 - **MMTk Immix GC** as an optional feature (`features = ["gc"]`). The bump allocator is the default for `no_std` embedded targets. Long-running applications can opt into garbage collection via [MMTk](https://www.mmtk.io/). The Kamea project already has a working MMTk Immix binding that achieves 184 µs on N-Queens(8).
-
-- **Lean verification.** Prove the 32×32 table's algebraic properties in Lean 4 via `native_decide` (1024 entries, well within capacity).
 
 - **Compiler improvements.** Tail call optimization via loop, `call/cc` support in compiled output, string literals in compiled code.
 
