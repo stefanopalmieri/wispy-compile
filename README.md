@@ -1,6 +1,6 @@
 # WispyScheme
 
-A small, finite algebra (1KB) replaces conventional runtime type dispatch, encoding control flow, reflection, and recursion in a single Cayley table while compiling to native Rust for `no_std` embedded targets.
+A small, finite algebra (1KB) replaces conventional runtime type dispatch, encoding control flow and reflection in a single Cayley table while compiling to native Rust for `no_std` embedded targets.
 
 Named after Wispy the guinea pig.
 
@@ -153,7 +153,7 @@ The 32×32 table (1KB) is a finite algebra. All properties are Lean-proved (`lea
 - **Classifier:** τ partitions the core into two boolean classes
 - **Branch:** ρ dispatches on the classifier (conditional evaluation)
 - **Composition:** cdr = ρ ∘ cons (second projection factors through branch)
-- **Y fixed point:** Y(ρ) = ρ(Y(ρ)), non-absorber. This is an algebraic fixed point in the magma; unbounded recursion is a property of the interpreted language that this fixed point enables, not a property of the finite table itself.
+- **Y fixed point:** Y(ρ) = ρ(Y(ρ)), non-absorber. The table contains a fixed-point *equation*, not unbounded computation. The algebra supplies the equation; the interpreter (or compiled loop) supplies the unbounded unfolding. Recursion is a collaboration between the finite table and the infinite evaluator, not a property of either one alone.
 - **Extensionality:** all 32 rows are distinct
 - **Type dispatch:** CAR × T_PAIR → valid, CAR × T_STR → error, etc.
 
