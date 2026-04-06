@@ -1,22 +1,22 @@
 # WispyScheme
 
-A small, finite algebra (1KB) replaces conventional runtime type dispatch, encoding control flow and reflection in a single Cayley table while compiling to native Rust for `no_std` embedded targets.
+A 1KB Cayley table replaces branch-chain type dispatch with constant-time table indexing, encoding type validity, classification, and reflection in a single finite algebra while compiling to native Rust for `no_std` embedded targets.
 
 Named after Wispy the guinea pig.
 
 ## What it is
 
-An R4RS Scheme where type dispatch is data-driven rather than control-flow-driven. Each builtin operation is a row in a 32×32 lookup table. The operand's type tag indexes the column. The cell determines whether the operation is valid or a type error:
+An R4RS Scheme where type dispatch is branchless: instead of tag-bit branch chains (`if tag == T_PAIR { ... } else if ...`), every dispatch decision is a single table index into a 32×32 lookup table. The language is still dynamically typed — values still carry tags, and dispatch still happens at runtime — but the *mechanism* is a constant-time array lookup instead of a conditional cascade:
 
 ```
 TABLE[CAR][T_PAIR] → T_PAIR   (valid: proceed to car field)
-TABLE[CAR][T_STR]  → BOT      (type error)
-TABLE[CAR][T_SYM]  → BOT      (type error)
+TABLE[CAR][T_STR]  → BOT      (type error → returned as a value, not an exception)
+TABLE[CAR][T_SYM]  → BOT      (type error → returned as a value, not an exception)
 TABLE[TAU][T_PAIR] → T_PAIR   (classify: it's a pair)
 TABLE[TAU][T_SYM]  → T_SYM    (classify: it's a symbol)
 ```
 
-This replaces the tag-bit branch chains in conventional Scheme implementations with constant-time table indexing. The table is `const`, lives in flash on embedded targets, and is transparent to the optimizer. The operational semantics of the language are finite, explicit, and queryable — the programmer can inspect the table at runtime via the algebra extension (`dot`, `tau`, `type-valid?`).
+The table is `const`, lives in flash on embedded targets, and is transparent to the optimizer. It is a semantic kernel for dispatch and reflection — the programmer can inspect the type-validity matrix at runtime via `dot`, `tau`, and `type-valid?`. The full language semantics (evaluation order, scoping, closures, continuations) live in the evaluator and compiler; the table captures which operations are valid on which types, how to classify values, and the algebraic relationships between operations.
 
 The table's 12-element algebraic core was found by Z3 and is axiomatically equivalent to the [Kamea](https://github.com/stefanopalmieri/Kamea) project's Ψ₁₆ algebra (same axiom set satisfied, not isomorphic). The remaining 20 elements extend the core with R4RS type tags (pair, symbol, closure, string, vector, character, continuation, port) and special values (#t, eof, void).
 
@@ -100,7 +100,7 @@ Standard R4RS Scheme works as expected. The algebra is also available directly �
 
 All 12 core elements (`TOP`, `BOT`, `Q`, `E`, `CAR`, `CDR`, `CONS`, `RHO`, `APPLY`, `CC`, `TAU`, `Y`) and 8 type tags (`T_PAIR`, `T_SYM`, `T_CLS`, `T_STR`, `T_VEC`, `T_CHAR`, `T_CONT`, `T_PORT`) are bound as constants. `dot`, `tau`, and `type-valid?` are the three primitives. Everything else is sugar.
 
-BOT as a return value instead of an exception means type dispatch is data flow, not control flow. The programmer can query the capability matrix of the entire language with a 1KB lookup.
+BOT as a return value instead of an exception makes the algebra total: every input produces an output, no operation throws. This gives composability (chain operations without try/catch) and analyzability (the specializer can constant-fold through error cases). The tradeoff is silent error propagation — `(car "hello")` returns BOT and continues rather than crashing. The `--strict` flag restores Scheme's error-on-type-mismatch behavior for code that needs it. Philosophically this is closer to total functions with error values than to Scheme's dynamic error model.
 
 ## Architecture
 
@@ -166,6 +166,10 @@ The 32×32 table (1KB) is a finite algebra. All properties are Lean-proved (`lea
 - **Type dispatch:** CAR × T_PAIR → valid, CAR × T_STR → error, etc.
 
 The core satisfies the same axiom set as [Kamea's Ψ₁₆](https://github.com/stefanopalmieri/Kamea) (absorbers, retraction, classifier dichotomy, branch, composition, Y), making it axiomatically equivalent but not isomorphic (different carrier size, different table entries). The three independent capabilities carry over: self-representation (Q/E), self-description (τ), and self-execution (branch + composition).
+
+### Extensibility
+
+The table is frozen by default but extensible by design. The 32×32 grid uses 23 elements (12 core + 8 type tags + 3 specials); rows/columns 23-31 are unused. New types can be added by filling in those rows without touching the proven 12×12 core — the algebraic invariants (absorbers, retraction, classifier, Y) depend only on the core block. On embedded targets, the table can be flashed separately from firmware, giving different sensor configurations different algebra extensions without recompiling the evaluator. The Lean proofs cover the default table; a swapped or extended table operates correctly but without formal guarantees on the new entries.
 
 ## Self-Hosted Tools
 
