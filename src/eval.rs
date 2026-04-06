@@ -1090,7 +1090,9 @@ impl Eval {
             21 => self.scheme_bool(self.heap.is_vector(a1)),           // vector?
             22 => self.scheme_bool(self.heap.tag(a1) == table::T_CHAR), // char?
             23 => self.scheme_bool(self.heap.is_closure(a1) || a1.is_fixnum()), // procedure?
-            24 => self.scheme_bool(a1 == self.true_val || a1 == self.false_val), // boolean?
+            24 => self.scheme_bool(
+                (a1.is_rib() && (self.heap.tag(a1) == table::TRUE || self.heap.tag(a1) == table::BOT))
+                || a1 == self.true_val || a1 == self.false_val), // boolean?
 
             // Boolean
             25 => self.scheme_bool(!self.is_true(a1)), // not
