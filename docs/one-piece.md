@@ -6,7 +6,7 @@ A computer you can own and trust, from the axioms to the silicon.
 
 Type dispatch in every language runtime is a program — conditionals, vtables, match arms, method resolution. Programs have bugs. Programs are opaque. Programs are maintained by someone else.
 
-Type dispatch can be a mathematical object instead. A 32x32 Cayley table. 1KB. Constant. Verified by Z3 and Lean. It doesn't execute — it *is*. The same table is the runtime, the type system, the error model, and the API.
+Type dispatch can be a mathematical object instead. A 32×32 Cayley table. 1KB. Constant. Verified by Z3 and Lean. It doesn't execute — it *is*. The same table is the runtime, the type system, the error model, and the API.
 
 This single insight cascades into everything below.
 
@@ -34,6 +34,47 @@ When you reach for it:
 ```
 
 Three primitives — `dot`, `tau`, `type-valid?` — expose the entire dispatch mechanism. The programmer works with the same algebraic elements the evaluator uses. The boundary between language and implementation dissolves. This is the only language where the runtime is also the API.
+
+## The Meta-Programming Stack
+
+The algebra doesn't just dispatch types — it enables a self-hosted meta-programming tower that most languages can only dream about.
+
+### Reflective Tower
+
+A three-level Smith (1984) reflective tower, written in WispyScheme itself:
+
+- **Level 0:** Programs run through a defunctionalized CPS meta-evaluator. Continuations are tagged lists, not closures — inspectable, serializable, modifiable. `fib(8) = 21` through a meta-interpreter that is itself a Scheme program.
+- **Level 1:** The meta-evaluator probes the Cayley table algebraically. Absorber identities, TAU classification, QE retraction, composition laws — all verified at runtime through the same table the host evaluator uses.
+- **Level 2:** `reify` captures the evaluator's state as a first-class value. `reflect` resumes from a modified state. A program can navigate its own continuation chain, swap branches in an `if` expression, and resume execution on the path not taken.
+
+The branch swap is the signature demonstration: the program inspects its own continuation, finds a pending `if`, swaps the consequent and alternative, and reflects — causing the evaluator to take the opposite branch. This is not eval-of-a-string. This is algebraic surgery on a live computation.
+
+### Futamura Projections
+
+All three Futamura projections, demonstrated on a real Scheme evaluator:
+
+- **Projection 1:** `specialize(interpreter, program) = compiled program`. A 40-line direct-style evaluator (`deval`) is specialized with respect to a known program. The partial evaluator unfolds every `cond` dispatch, every `car`/`cdr` traversal, every symbol lookup — the interpreter vanishes. What remains is the bare computation: `21`.
+- **Projection 2:** `specialize(specializer, interpreter) = compiler`. The specializer itself becomes the input.
+- **Projection 3:** `specialize(specializer, specializer) = compiler-compiler`.
+
+Four-path verification confirms the projection: direct Scheme, deval interpretation, and PE specialization all produce identical results. The interpreter is provably gone.
+
+### Online Partial Evaluator
+
+The PE that makes the projections possible: an online partial evaluator for Scheme, written in Scheme, running on WispyScheme. It handles arithmetic, comparison, conditionals, `let`, `begin`, `car`/`cdr`/`cons`, type predicates, `eq?`/`equal?`, boolean connectives, and depth-limited function unfolding.
+
+When all arguments are known, the PE folds everything to a value. When some are unknown, it residualizes code with proper variable names:
+
+```scheme
+(pe-specialize 'power (make-unknown 'base) 3)
+;; → (* base (* base (* base 1)))
+```
+
+The classic PE benchmark: exponent unrolling with the base left symbolic. The loop is gone. Only the multiplications remain.
+
+### Why This Matters
+
+Most languages have *either* a reflective tower *or* partial evaluation *or* algebraic dispatch. WispyScheme has all three, and they compose. The PE can specialize the meta-evaluator. The meta-evaluator can reify the PE's continuations. The Cayley table governs dispatch at every level. This isn't a collection of features — it's a single algebra expressing itself through increasingly powerful lenses.
 
 ## The Verification Chain
 
@@ -66,10 +107,9 @@ This is what Lisp machines were trying to be. Symbolics spent $100 million and a
 ## The Stack
 
 ```
-Wisp syntax over serial / MQTT / HTTP
-        │
 WispyScheme (R4RS + algebra extension)
   Evaluator: 104 builtins + FFI to Rust/C
+  Meta-programming: reflective tower, PE, Futamura projections
   Cayley table: 1KB, proved correct (Lean)
         │
 CantripOS (Google's Project Sparrow)
@@ -98,7 +138,22 @@ Google's [Project Sparrow](https://github.com/AmbiML/sparrow-cantrip-full) built
 
 What CantripOS doesn't have is a language runtime with algebraic dispatch. WispyScheme fills that gap: the Cayley table is the application-level type policy, seL4 capabilities are the kernel-level access policy, and the hardware MMU is the physical-level memory policy. Three layers, all verified, all static. Swapping the table swaps what the language can do. Swapping the capability set swaps what the process can access. No runtime flags.
 
-## The Shell
+## The Agent
+
+The algebra extension and the meta-programming stack together make WispyScheme a uniquely auditable agent harness:
+
+- **TAU classifies** — the agent knows what it's looking at
+- **DOT dispatches** — the agent's decisions are table lookups, auditable and finite
+- **Q/E reify and reflect** — the agent can represent its own actions as data and execute data as actions
+- **BOT propagates** — invalid operations return BOT instead of throwing, so type dispatch is data flow
+- **The PE specializes** — an agent's decision procedure can be partially evaluated with respect to its policy, eliminating interpretation overhead before deployment
+- **The reflective tower inspects** — an agent's pending computation can be reified, its continuation chain walked, its next action inspected *before execution*
+
+A finite algebra with 32 elements can't express an operation the table doesn't contain. The decision space is enumerable. An agent running on this algebra can be audited exhaustively — not by reading logs, but by querying the table. And with continuation reification, a supervisor can inspect what the agent *is about to do* and intervene algebraically.
+
+On a [ZClaw-like](https://zclaw.dev/) edge node — rewritten in Rust + WispyScheme with a Scheme shell — SOPs are Scheme scripts uploaded over MQTT. The Cayley table is the security policy — swap the table, swap the autonomy level. CantripOS capabilities isolate the evaluator from the drivers. The agent can query its own capability matrix with `(dot op tag)`.
+
+## The Shell (Future Work)
 
 Wisp syntax (SRFI-119) replaces parentheses with indentation:
 
@@ -121,20 +176,7 @@ On a workstation, brace/paren switching (inspired by schemesh) gives you shell a
 (for-each display (sh-run/lines {find . -name "*.scm"}))  ;; Scheme
 ```
 
-The scsh lineage (1994) proved Scheme could be a shell. Schemesh (2024) proved it could be a good one. WispyScheme proves it can run on a $5 chip with algebraic dispatch.
-
-## The Agent
-
-The algebra extension makes WispyScheme a natural agent harness:
-
-- **TAU classifies** — the agent knows what it's looking at
-- **DOT dispatches** — the agent's decisions are table lookups, auditable and finite
-- **Q/E reify and reflect** — the agent can represent its own actions as data and execute data as actions
-- **BOT propagates** — invalid operations return BOT instead of throwing, so type dispatch is data flow
-
-A finite algebra with 32 elements can't express an operation the table doesn't contain. The decision space is enumerable. An agent running on this algebra can be audited exhaustively — not by reading logs, but by querying the table.
-
-On a [ZClaw-like](https://zclaw.dev/) edge node — rewritten in Rust + WispyScheme with a Scheme shell — SOPs are Scheme scripts uploaded over MQTT. The Cayley table is the security policy — swap the table, swap the autonomy level. CantripOS capabilities isolate the evaluator from the drivers. The agent can query its own capability matrix with `(dot op tag)`.
+The scsh lineage (1994) proved Scheme could be a shell. Schemesh (2024) proved it could be a good one. WispyScheme would prove it can run on a $5 chip with algebraic dispatch.
 
 ## The Security Model
 
@@ -169,10 +211,12 @@ A computer where:
 
 - The language runtime is a 1KB mathematical object, not a program
 - The programmer can see and query the dispatch mechanism with three primitives
+- The language can specialize away its own interpreter, inspect its own continuations, and reflect on its own execution — all self-hosted
 - The OS kernel is proved correct, not just tested
 - The hardware is open source, auditable, and modifiable
 - Every layer of the verification chain is machine-checked
 - New behavior is uploaded as Scheme scripts, not firmware reflashes
+- An agent's decisions are finite, enumerable, and inspectable before execution
 - The whole thing costs less than lunch
 
 This is what computing was supposed to be. A machine that does what you say and nothing else, because every layer — from the axioms to the silicon — is proved, open, and yours.
