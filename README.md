@@ -127,7 +127,8 @@ Three execution paths:
 - **Compiler** (`compile.rs`): Scheme → standalone Rust, 1.7x faster than Chez Scheme on nqueens(8). Self-tail-call → loop optimization, closure conversion, strings, characters, 55+ inlined builtins, and the algebra extension.
 
 Self-hosted tools (all `.scm` files running on WispyScheme itself):
-- **Specializer** (`examples/specialize.scm`): partial evaluator over algebraic expressions
+- **Online PE** (`examples/pe.scm`): partial evaluator for Scheme — Futamura Projection 1 on a real interpreter
+- **Specializer** (`examples/specialize.scm`): partial evaluator over algebraic IR expressions
 - **Metacircular evaluator** (`examples/metacircular.scm`): defunctionalized CPS with inspectable continuations, reify/reflect
 - **Transpiler** (`examples/transpile.scm`): IR → Rust code generator
 - **Reflective tower** (`examples/reflective-tower.scm`): three-level Smith (1984) tower with continuation modification
@@ -175,17 +176,35 @@ The table is frozen by default but extensible by design. The 32×32 grid uses 23
 
 ## Self-Hosted Tools
 
-Six Scheme programs that run on WispyScheme itself, ported from the [Kamea](https://github.com/stefanopalmieri/Kamea) project's Psi Lisp originals:
+Scheme programs that run on WispyScheme itself, ported from the [Kamea](https://github.com/stefanopalmieri/Kamea) project's Psi Lisp originals:
 
 | File | What it does |
 |---|---|
 | `examples/algebra-smoke.scm` | 83 assertions validating absorbers, retraction, classifier, composition, Y fixed point |
 | `examples/ir-lib.scm` | Shared 7-node tagged-pair IR (Atom, Var, Dot, If, Let, Lam, App) |
-| `examples/specialize.scm` | Partial evaluator: constant-folds `dot`, cancels QE pairs, eliminates dead branches, beta-reduces |
-| `examples/futamura.scm` | All three Futamura projections on the 32×32 algebra |
+| `examples/specialize.scm` | Partial evaluator for algebraic IR: constant-folds `dot`, cancels QE pairs, eliminates dead branches |
+| `examples/futamura.scm` | All three Futamura projections on the 32×32 algebra (three-path verification) |
+| `examples/pe.scm` | Online partial evaluator for Scheme: folds arithmetic, branches, list ops, function calls |
+| `examples/futamura-real.scm` | **Futamura Projection 1 on a real Scheme evaluator** (four-path verification) |
 | `examples/metacircular.scm` | Defunctionalized CPS evaluator with 14 inspectable continuation types |
 | `examples/transpile.scm` | IR → Rust code generator (emits standalone binaries with inlined Cayley table) |
 | `examples/reflective-tower.scm` | Three-level Smith (1984) reflective tower |
+
+**Futamura Projection 1** — the interpreter vanishes:
+
+```
+specialize(interpreter, program) = compiled program
+```
+
+A direct-style Scheme evaluator (`deval`) is specialized with respect to a known fib program by the online partial evaluator (`pe.scm`). The PE unfolds all of deval's dispatch — the cond branches, car/cdr traversal of the AST, symbol lookup, environment extension — and folds everything to the bare result. Four paths to the same answer:
+
+```
+Path A  (direct Scheme):    (fib 8)                       → 21
+Path B  (deval interpreter): (deval '(fib 8) env fns)      → 21
+Path C  (PE specialized):    (pe deval {program=fib, n=8})  → 21
+```
+
+The classic PE benchmark also works: `power(base, 3)` with unknown base produces `(* base (* base (* base 1)))` — a straight-line multiplication chain with no recursion, no conditionals.
 
 **The reflective tower** demonstrates three levels grounded in the Cayley table:
 
@@ -195,22 +214,11 @@ Six Scheme programs that run on WispyScheme itself, ported from the [Kamea](http
 
 Every continuation is a tagged list, not a closure. The program can read, modify, and rewrite its own control flow.
 
-**The Futamura projections** demonstrate the specializer eliminating all interpretation overhead:
-
-```scheme
-;; Three paths to the same result:
-;;   Path A: direct table lookup          (dot Q (dot Q (dot Q CAR)))    → 8
-;;   Path B: specialize(interp, program)  fully fold interpreter+program → 8
-;;   Path C: compile then apply           specialize partial → dot chain → 8
-
-;; The compiled output has 3 dots, 0 lambdas, 0 applications.
-;; All interpretation overhead is gone.
-```
-
 ```bash
-cargo run -- examples/reflective-tower.scm   # three-level tower with branch swap
-cargo run -- examples/algebra-smoke.scm      # 83 algebra assertions
-cargo run -- -e '(load "examples/ir-lib.scm") (load "examples/specialize.scm") (load "examples/futamura.scm")'
+cargo run -- examples/futamura-real.scm          # Futamura P1: the interpreter vanishes
+cargo run -- examples/reflective-tower.scm       # three-level tower with branch swap
+cargo run -- examples/pe.scm                     # PE tests (power residualization, etc.)
+cargo run -- examples/algebra-smoke.scm          # 83 algebra assertions
 ```
 
 ## `no_std` Support
