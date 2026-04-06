@@ -29,9 +29,10 @@ Values are ribs (3-field structs: car, cdr, tag), following the [Ribbit](https:/
 | **C** (gcc -O2, bump alloc) | 96 µs | 0.017 µs |
 | **WispyScheme → Rust** (rustc -O) | **136 µs** | **0.105 µs** |
 | **LuaJIT** | 212 µs | 0.170 µs |
+| **Chez Scheme** (10.3.0) | 228 µs | 0.213 µs |
 | **SBCL** (native Common Lisp) | 440 µs | 0.187 µs |
 
-On this cons-heavy, branch-heavy workload, compiled WispyScheme is 1.5x faster than LuaJIT and 3.2x faster than SBCL. Results are workload-sensitive; LuaJIT's trace compiler can outperform on tight numeric loops. All benchmarks on Apple M-series, single-threaded.
+On this cons-heavy, branch-heavy workload, compiled WispyScheme is 1.7x faster than Chez Scheme, 1.5x faster than LuaJIT, and 3.2x faster than SBCL. Chez Scheme is a production-quality R6RS compiler with full continuations, threads, and a generational GC — the comparison shows the cost/benefit of WispyScheme's simpler rib model on allocation-heavy workloads. Results are workload-sensitive; LuaJIT's trace compiler can outperform on tight numeric loops. All benchmarks on Apple M-series, single-threaded.
 
 ## Quick Start
 
