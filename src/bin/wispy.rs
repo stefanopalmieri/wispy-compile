@@ -4,7 +4,7 @@
 //!   cargo run                          # REPL
 //!   cargo run -- file.scm              # run a file
 //!   cargo run -- -e '(+ 1 2)'         # evaluate expression
-//!   cargo run -- --strict file.scm     # strict mode (type errors panic)
+//!   cargo run -- --permissive file.scm # permissive mode (type errors return BOT)
 //!   cargo run -- --compile file.scm    # compile to Rust, print to stdout
 
 use wispy_scheme::eval::Eval;
@@ -15,7 +15,7 @@ use std::io::{self, Write, BufRead};
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    let mut strict = false;
+    let mut permissive = false;
     let mut compile_mode = false;
     let mut expr = None;
     let mut files = Vec::new();
@@ -23,7 +23,8 @@ fn main() {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--strict" => strict = true,
+            "--strict" => {}  // now the default; accepted for backwards compat
+            "--permissive" => permissive = true,
             "--compile" => compile_mode = true,
             "-e" => {
                 i += 1;
@@ -33,7 +34,7 @@ fn main() {
             }
             arg if !arg.starts_with('-') => files.push(arg.to_string()),
             _ => {
-                eprintln!("Usage: wispy [--strict] [--compile] [-e expr] [file.scm ...]");
+                eprintln!("Usage: wispy [--permissive] [--compile] [-e expr] [file.scm ...]");
                 std::process::exit(1);
             }
         }
@@ -56,11 +57,9 @@ fn main() {
         return;
     }
 
-    // Evaluator
+    // Evaluator — strict by default
     let mut ev = Eval::new();
-    if strict {
-        ev.strict = true;
-    }
+    ev.strict = !permissive;
 
     // Evaluate expression from -e
     if let Some(src) = expr {
@@ -85,8 +84,13 @@ fn main() {
 }
 
 fn repl(ev: &mut Eval) {
+    use std::panic::{catch_unwind, AssertUnwindSafe, set_hook};
+
+    // Suppress default panic output in the REPL; we handle errors ourselves
+    set_hook(Box::new(|_| {}));
+
     println!("WispyScheme v0.1.0");
-    println!("Type (strict-mode) for type error checking, (permissive-mode) to disable.");
+    println!("Type (permissive-mode) to silence type errors, (strict-mode) to restore.");
     println!();
 
     let stdin = io::stdin();
@@ -120,12 +124,28 @@ fn repl(ev: &mut Eval) {
             input.push_str(cont.trim());
         }
 
-        let result = ev.eval_str(&input);
+        // Catch panics (type errors, unbound variables, etc.) so the REPL continues
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            ev.eval_str(&input)
+        }));
 
-        // Don't print void
-        if result != ev.void_val {
-            ev.display(result);
-            println!();
+        match result {
+            Ok(val) => {
+                if val != ev.void_val {
+                    ev.display(val);
+                    println!();
+                }
+            }
+            Err(payload) => {
+                let msg = if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = payload.downcast_ref::<&str>() {
+                    s.to_string()
+                } else {
+                    "unknown error".to_string()
+                };
+                eprintln!("error: {msg}");
+            }
         }
     }
 }

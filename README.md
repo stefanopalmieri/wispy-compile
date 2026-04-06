@@ -40,7 +40,7 @@ On this cons-heavy, branch-heavy workload, compiled WispyScheme is 1.7x faster t
 cargo run                            # REPL
 cargo run -- examples/fib.scm        # run a file
 cargo run -- -e '(+ 1 2)'           # evaluate expression
-cargo run -- --strict examples/fib.scm   # strict type checking
+cargo run -- --permissive examples/fib.scm   # permissive mode (type errors return BOT)
 cargo run -- --compile examples/nqueens.scm > nqueens.rs  # compile to Rust
 rustc -O -o nqueens nqueens.rs && ./nqueens   # native binary
 cd lean && lake build                        # verify table proofs (14 theorems, ~6s)
@@ -100,7 +100,9 @@ Standard R4RS Scheme works as expected. The algebra is also available directly �
 
 All 12 core elements (`TOP`, `BOT`, `Q`, `E`, `CAR`, `CDR`, `CONS`, `RHO`, `APPLY`, `CC`, `TAU`, `Y`) and 8 type tags (`T_PAIR`, `T_SYM`, `T_CLS`, `T_STR`, `T_VEC`, `T_CHAR`, `T_CONT`, `T_PORT`) are bound as constants. `dot`, `tau`, and `type-valid?` are the three primitives. Everything else is sugar.
 
-BOT as a return value instead of an exception makes the algebra total: every input produces an output, no operation throws. This gives composability (chain operations without try/catch) and analyzability (the specializer can constant-fold through error cases). The tradeoff is silent error propagation — `(car "hello")` returns BOT and continues rather than crashing. The `--strict` flag restores Scheme's error-on-type-mismatch behavior for code that needs it. Philosophically this is closer to total functions with error values than to Scheme's dynamic error model.
+The algebra layer (`dot`, `tau`, `type-valid?`) is always total: every input produces an output, no operation throws. This gives the specializer and reflective tower composability and analyzability — they can fold through error cases because BOT is just another value.
+
+The evaluator layer (`car`, `cdr`, etc. on actual values) is strict by default: `(car "hello")` raises an error, matching R4RS expectations. The REPL catches these errors and continues, so typos don't kill your session. The `--permissive` flag silences type errors (returns BOT instead), which is useful on embedded targets where panicking kills the device. The Scheme-level `(strict-mode)` and `(permissive-mode)` toggle at runtime.
 
 ## Architecture
 
@@ -120,7 +122,7 @@ src/
 ```
 
 Three execution paths:
-- **Interpreter** (`eval.rs`): tail call optimization, 104 builtins, `(strict-mode)` / `(permissive-mode)` toggle
+- **Interpreter** (`eval.rs`): tail call optimization, 104 builtins, strict by default (`--permissive` for embedded fault tolerance)
 - **CPS evaluator** (`cps.rs`): first-class continuations, `call/cc`, re-entrant
 - **Compiler** (`compile.rs`): Scheme → standalone Rust, 1.7x faster than Chez Scheme on nqueens(8). Self-tail-call → loop optimization, closure conversion, strings, characters, 55+ inlined builtins, and the algebra extension.
 

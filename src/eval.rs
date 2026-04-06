@@ -82,7 +82,7 @@ impl Eval {
             false_val,
             void_val,
             cont_values: Vec::new(),
-            strict: false,
+            strict: true,
             macros: Vec::new(),
             ports,
             stdin_port,
@@ -2490,14 +2490,14 @@ mod tests {
     #[test]
     fn algebra_strict_mode() {
         let mut ev = Eval::new();
-        // Default is permissive
-        assert!(!ev.strict);
-        // Turn on strict mode
-        ev.eval_str("(strict-mode)");
+        // Default is strict
         assert!(ev.strict);
-        // Turn it off
+        // Turn off strict mode
         ev.eval_str("(permissive-mode)");
         assert!(!ev.strict);
+        // Turn it back on
+        ev.eval_str("(strict-mode)");
+        assert!(ev.strict);
     }
 
     #[test]
