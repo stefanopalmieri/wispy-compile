@@ -193,6 +193,57 @@ Everything that isn't application logic stays in C:
 
 WispyScheme replaces the decision layer, not the infrastructure.
 
+## Known Risks and Mitigations
+
+### The evaluator port is the gate
+
+The ~24 KiB evaluator estimate is extrapolated from native code ratios. The actual `no_std` RISC-V evaluator might be larger. If it comes in at 30 KiB instead of 24 KiB, the 19 KiB headroom evaporates.
+
+**Mitigation:** Port the evaluator to `no_std` and measure before committing to this architecture. The port is scoped: replace `println!`/`format!` with direct byte writes to a port buffer, replace `String` with rib-allocated char lists (which we already use for Scheme strings). If the port exceeds budget, the evaluator can be stripped to a minimal subset — the builtins that zclaw doesn't need (port I/O, `load`, file operations) can be compiled out with feature flags.
+
+### LLM-generated Scheme reliability
+
+The LLM will produce incorrect Scheme. Wrong pin numbers, off-by-one in schedules, closures that capture stale state. On a headless microcontroller, a bad `schedule-every` can be hard to debug.
+
+**Mitigations:**
+
+1. **Dry-run mode.** `(dry-run expr)` evaluates the expression but suppresses all GPIO writes and network calls, returning a log of what *would* have happened. The LLM can test its tool before activating it.
+
+2. **Undo stack.** `(undo)` reverts the last `define` or `schedule` call. Implemented as a before/after snapshot of the global environment. Limited depth (last 5 actions) to fit in SRAM.
+
+3. **Sandbox table.** A restricted Cayley table where GPIO writes and schedule calls return BOT. The LLM composes in the sandbox, then the user promotes to the live table. Swapping is a pointer change.
+
+4. **`(strict-mode)` by default.** Type errors in `car`/`cdr` panic with a message rather than silently propagating BOT. The LLM gets error feedback it can use to self-correct.
+
+### Symbol table ceiling
+
+512 entries at 48 bytes each is 24 KiB. A user building a library of automations, plus LLM-defined helpers, could hit that ceiling.
+
+**Mitigations:**
+
+1. **Eviction.** The symbol table is a fixed array with a bump pointer. When full, evict least-recently-defined entries (not builtins, not currently-scheduled functions). This is a simple circular buffer with a protected zone for essentials.
+
+2. **Persistence to flash.** Definitions that the user marks as permanent (`(persist 'garage-monitor)`) are serialized to a flash partition as `.scm` text. On reboot, the agent loads them via `load`. The symbol table is a hot cache, not the ground truth.
+
+3. **Configurable size.** The 512 limit is a compile-time constant. On ESP32-S3 (512 KB SRAM vs the C3's 400 KB), the symbol table can be larger.
+
+### Scheme as user-facing language
+
+Most zclaw users won't type S-expressions in Telegram. The natural language path stays the default:
+
+```
+User: "Monitor the garage temperature"
+LLM: (writes Scheme internally)
+Agent: "Done. Monitoring garage sensor every 5 minutes, alert threshold 40°C."
+```
+
+The Scheme surface is for three audiences:
+1. **The LLM itself** — it composes tools in Scheme, not in natural language
+2. **Power users** — the serial console is a REPL for direct access
+3. **Debugging** — when something goes wrong, the Scheme definitions are inspectable
+
+The natural language interface and the Scheme interface are the same system. The LLM translates between them. Users never need to see Scheme unless they want to.
+
 ## Summary
 
 zclaw proved that an AI agent fits on an ESP32 under 888 KiB. WispyScheme makes that agent into something new: a device where the LLM doesn't just call tools — it writes them, in the same Scheme that the user types at the serial console, that the scheduler executes, that the Telegram bot speaks. The shell is the agent. The agent is the shell.
