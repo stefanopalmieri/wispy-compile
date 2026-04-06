@@ -1,6 +1,6 @@
 # WispyScheme
 
-A 1KB Cayley table replaces branch-chain type dispatch with constant-time table indexing, encoding type validity, classification, and reflection in a single finite algebra while compiling to native Rust for `no_std` embedded targets.
+WispyScheme has two core ideas: **(1)** branchless type dispatch via a finite Cayley table — every dispatch decision is a single array index, not a branch chain; **(2)** reifying that table as queryable program data — the programmer (and the specializer) can inspect, fold through, and reason about the type system at runtime. The table is 1KB, compiles to native Rust, and runs on `no_std` embedded targets.
 
 Named after Wispy the guinea pig.
 
@@ -18,7 +18,7 @@ TABLE[TAU][T_SYM]  → T_SYM    (classify: it's a symbol)
 
 The table is `const`, lives in flash on embedded targets, and is transparent to the optimizer. It is a semantic kernel for dispatch and reflection — the programmer can inspect the type-validity matrix at runtime via `dot`, `tau`, and `type-valid?`. The full language semantics (evaluation order, scoping, closures, continuations) live in the evaluator and compiler; the table captures which operations are valid on which types, how to classify values, and the algebraic relationships between operations.
 
-The table's 12-element algebraic core was found by Z3 and is axiomatically equivalent to the [Kamea](https://github.com/stefanopalmieri/Kamea) project's Ψ₁₆ algebra (same axiom set satisfied, not isomorphic). The remaining 20 elements extend the core with R4RS type tags (pair, symbol, closure, string, vector, character, continuation, port) and special values (#t, eof, void).
+The table's 12-element algebraic core was found by Z3 and is axiomatically equivalent to the [Kamea](https://github.com/stefanopalmieri/Kamea) project's Ψ₁₆ algebra (same axiom set satisfied, not isomorphic). The core includes a reify/reflect pair (Q/E) that are exact inverses — `E(Q(x)) = x` for all core elements — giving the algebra a built-in encoding/decoding capability distinct from the runtime reflective tower. The remaining 20 elements extend the core with R4RS type tags (pair, symbol, closure, string, vector, character, continuation, port) and special values (#t, eof, void).
 
 Values are ribs (3-field structs: car, cdr, tag), following the [Ribbit](https://github.com/udem-dlteam/ribbit) model. Pairs, symbols, closures, strings, vectors, characters, continuations, and ports are all the same struct with a different tag byte.
 
@@ -32,7 +32,7 @@ Values are ribs (3-field structs: car, cdr, tag), following the [Ribbit](https:/
 | **Chez Scheme** (10.3.0) | 228 µs | 0.213 µs |
 | **SBCL** (native Common Lisp) | 440 µs | 0.187 µs |
 
-On this cons-heavy, branch-heavy workload, compiled WispyScheme is 1.7x faster than Chez Scheme, 1.5x faster than LuaJIT, and 3.2x faster than SBCL. Chez Scheme is a production-quality R6RS compiler with full continuations, threads, and a generational GC — the comparison shows the cost/benefit of WispyScheme's simpler rib model on allocation-heavy workloads. Results are workload-sensitive; LuaJIT's trace compiler can outperform on tight numeric loops. All benchmarks on Apple M-series, single-threaded.
+On this cons-heavy, branch-heavy workload, compiled WispyScheme is 1.7x faster than Chez Scheme, 1.5x faster than LuaJIT, and 3.2x faster than SBCL. The gains come primarily from branchless dispatch (table index vs. branch chain) and a uniform rib representation (no special cases for different heap object layouts). Chez Scheme is a production-quality R6RS compiler with full continuations, threads, and a generational GC — the comparison shows what branchless dispatch buys on allocation-heavy workloads. Results are workload-sensitive; LuaJIT's trace compiler can outperform on tight numeric loops. All benchmarks on Apple M-series, single-threaded.
 
 ## Quick Start
 
@@ -169,7 +169,7 @@ The core satisfies the same axiom set as [Kamea's Ψ₁₆](https://github.com/s
 
 ### Extensibility
 
-The table is frozen by default but extensible by design. The 32×32 grid uses 23 elements (12 core + 8 type tags + 3 specials); rows/columns 23-31 are unused. New types can be added by filling in those rows without touching the proven 12×12 core — the algebraic invariants (absorbers, retraction, classifier, Y) depend only on the core block. On embedded targets, the table can be flashed separately from firmware, giving different sensor configurations different algebra extensions without recompiling the evaluator. The Lean proofs cover the default table; a swapped or extended table operates correctly but without formal guarantees on the new entries.
+The table is frozen by default but extensible by design. The 32×32 grid uses 23 elements (12 core + 8 type tags + 3 specials); rows/columns 23-31 are unused. New types can be added by filling in those rows without touching the proven 12×12 core — the algebraic invariants (absorbers, retraction, classifier, Y) depend only on the core block. On embedded targets, the table can be flashed separately from firmware, giving different sensor configurations different algebra extensions without recompiling the evaluator. The Lean proofs cover the default table; a swapped or extended table operates correctly but without formal guarantees on the extended portion.
 
 ## Self-Hosted Tools
 
