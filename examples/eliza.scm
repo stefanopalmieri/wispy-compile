@@ -54,7 +54,7 @@
         (if (null? rest)
             result
             (loop (cdr rest)
-                  (string-append result " " (car rest)))))))
+                  (string-append (string-append result " ") (car rest)))))))
 
 ;; ── Reflection: swap pronouns ────────────────────────────────
 
@@ -67,10 +67,11 @@
 
 (define (reflect word)
   (let loop ((pairs *reflections*))
-    (cond
-      ((null? pairs) word)
-      ((equal? word (car (car pairs))) (car (cdr (car pairs))))
-      (else (loop (cdr pairs))))))
+    (if (null? pairs)
+        word
+        (if (string=? word (car (car pairs)))
+            (car (cdr (car pairs)))
+            (loop (cdr pairs))))))
 
 (define (reflect-words words)
   (map reflect words))
@@ -210,17 +211,21 @@
     (set-car! counter (+ idx 1))
     item))
 
-;; Fill in "*" with the reflected tail
+;; Fill in "*" with the reflected tail, or drop "* " if tail is empty
 (define (fill-response template tail-str)
   (let* ((chars (string->list template))
-         (len (length chars)))
+         (len (length chars))
+         (empty-tail (string=? tail-str "")))
     (let loop ((i 0) (result '()))
       (cond
         ((= i len)
          (list->string (reverse result)))
         ((char=? (list-ref chars i) #\*)
-         (loop (+ i 1)
-               (append (reverse (string->list tail-str)) result)))
+         (if empty-tail
+             ;; Skip the * and any trailing space before punctuation
+             (loop (+ i 1) result)
+             (loop (+ i 1)
+                   (append (reverse (string->list tail-str)) result))))
         (else
          (loop (+ i 1) (cons (list-ref chars i) result)))))))
 
@@ -269,6 +274,7 @@
   (newline)
   (let loop ()
     (display "YOU:   ")
+    (newline)
     (let ((input (get-line)))
       (cond
         ((eof-object? input)
