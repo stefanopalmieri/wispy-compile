@@ -42,11 +42,12 @@ Every layer is proved or provable:
 | Layer | Proved by | Property |
 |---|---|---|
 | Algebra | Lean (`native_decide`) | 14 theorems, zero `sorry` |
-| Kernel | Isabelle/HOL (seL4) | Functional correctness, isolation |
+| Kernel | Isabelle/HOL (seL4 via CantripOS) | Functional correctness, isolation |
+| Userspace | Rust (memory safety) | No use-after-free, no buffer overflows |
 | ISA | RISC-V formal spec | Instruction semantics |
 | Toolchain | Open source (Yosys + nextpnr) | Auditable synthesis |
 
-No trust required at any layer. No proprietary blobs. No "it works because we tested it." The algebra is correct because the axioms require it. The kernel is correct because the proof says so. The hardware is correct because the spec is formal and the tools are open.
+No trust required at any layer. No proprietary blobs. No "it works because we tested it." The algebra is correct because the axioms require it. The kernel is correct because the proof says so. The Rust userspace is memory-safe by construction. The hardware is correct because the spec is formal and the tools are open.
 
 ## The Hardware
 
@@ -71,19 +72,31 @@ WispyScheme (R4RS + algebra extension)
   Evaluator: 104 builtins + FFI to Rust/C
   Cayley table: 1KB, proved correct (Lean)
         │
-seL4 microkernel
-  Capability-based isolation, proved correct (Isabelle/HOL)
-  Rust userspace via sel4-microkit
+CantripOS (Google's Project Sparrow)
+  seL4 microkernel, proved correct (Isabelle/HOL)
+  Rust userspace, CAmkES component framework
+  Capability-based isolation
         │
-VexRiscv on Lattice ECP5
+RISC-V (OpenTitan or VexRiscv softcore)
   RV32IMA + Sv32 MMU + DOT custom instruction
-  Open source: Yosys + nextpnr, no proprietary tools
+  Open source: Yosys + nextpnr (FPGA) or fixed silicon
         │
-$70 FPGA board (ULX3S / OrangeCrab)
+$70 FPGA board (ULX3S / OrangeCrab) → production ASIC
   UART, SPI, I2C, GPIO, WiFi
 ```
 
 Every layer is open. Every critical layer is verified. The entire system fits on a board you can hold in your hand.
+
+### Why CantripOS
+
+Google's [Project Sparrow](https://github.com/AmbiML/sparrow-cantrip-full) built the hard part: a Rust userspace on seL4 targeting RISC-V for secure embedded ML. CantripOS provides:
+
+- **seL4 with Rust** — the verified microkernel with a memory-safe userspace, already integrated
+- **CAmkES components** — static capability configuration for system services
+- **Renode simulation** — software/hardware co-design before real silicon
+- **OpenTitan integration** — hardware root of trust
+
+What CantripOS doesn't have is a language runtime with algebraic dispatch. WispyScheme fills that gap: the Cayley table is the application-level type policy, seL4 capabilities are the kernel-level access policy, and the hardware MMU is the physical-level memory policy. Three layers, all verified, all static. Swapping the table swaps what the language can do. Swapping the capability set swaps what the process can access. No runtime flags.
 
 ## The Shell
 
@@ -121,7 +134,7 @@ The algebra extension makes WispyScheme a natural agent harness:
 
 A finite algebra with 32 elements can't express an operation the table doesn't contain. The decision space is enumerable. An agent running on this algebra can be audited exhaustively — not by reading logs, but by querying the table.
 
-On a ZeroClaw edge node: SOPs are Scheme scripts uploaded over MQTT. The Cayley table is the security policy — swap the table, swap the autonomy level. seL4 capabilities isolate the evaluator from the drivers. The agent can query its own capability matrix with `(dot op tag)`.
+On a ZeroClaw edge node: SOPs are Scheme scripts uploaded over MQTT. The Cayley table is the security policy — swap the table, swap the autonomy level. CantripOS capabilities isolate the evaluator from the drivers. The agent can query its own capability matrix with `(dot op tag)`.
 
 ## The Security Model
 
@@ -130,10 +143,10 @@ Three layers, all verified, all static:
 | Layer | Mechanism | Enforces |
 |---|---|---|
 | Language | Cayley table | "Can `car` operate on a string?" |
-| Kernel | seL4 capabilities | "Can this task access UART?" |
+| Kernel | CantripOS / seL4 capabilities | "Can this task access UART?" |
 | Hardware | MMU | "Can this address be read?" |
 
-Switching security policy is swapping a 1KB const array and an seL4 capability set. No runtime flags. No checks that could be bypassed. The algebra says no. The kernel says no. The hardware says no.
+Switching security policy is swapping a 1KB const array and a CantripOS capability set. No runtime flags. No checks that could be bypassed. The algebra says no. The kernel says no. The hardware says no.
 
 ## The Economics
 
@@ -141,14 +154,14 @@ Switching security policy is swapping a 1KB const array and an seL4 capability s
 |---|---|
 | ECP5 FPGA board | ~$70 |
 | VexRiscv softcore | Free (open source) |
-| seL4 microkernel | Free (open source, GPL) |
+| CantripOS (seL4 + Rust) | Free (open source, Apache 2.0) |
 | WispyScheme | Free (MIT) |
 | Yosys + nextpnr | Free (open source) |
 | Lean 4 | Free (open source) |
 
-A verified autonomous computing platform for under $100. No vendor lock-in. No license fees. No proprietary tools anywhere in the chain.
+A verified autonomous computing platform for under $100. No vendor lock-in. No license fees. No proprietary tools anywhere in the chain. Google built and open-sourced the OS layer; we bring the language and the algebra.
 
-For production deployment on fixed silicon (SiFive U74 or similar), the `DOT` instruction lives in L1 cache instead of a ROM — still fast, still correct, still verified. The FPGA is the development platform; ASIC is the endgame.
+For production deployment on fixed silicon (SiFive U74 or OpenTitan), the `DOT` instruction lives in L1 cache instead of a ROM — still fast, still correct, still verified. The FPGA is the development platform; ASIC is the endgame.
 
 ## What This Is
 
