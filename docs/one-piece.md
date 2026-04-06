@@ -134,7 +134,7 @@ The algebra extension makes WispyScheme a natural agent harness:
 
 A finite algebra with 32 elements can't express an operation the table doesn't contain. The decision space is enumerable. An agent running on this algebra can be audited exhaustively — not by reading logs, but by querying the table.
 
-On a ZeroClaw edge node: SOPs are Scheme scripts uploaded over MQTT. The Cayley table is the security policy — swap the table, swap the autonomy level. CantripOS capabilities isolate the evaluator from the drivers. The agent can query its own capability matrix with `(dot op tag)`.
+On a [ZClaw-like](https://zclaw.dev/) edge node — rewritten in Rust + WispyScheme with a Scheme shell — SOPs are Scheme scripts uploaded over MQTT. The Cayley table is the security policy — swap the table, swap the autonomy level. CantripOS capabilities isolate the evaluator from the drivers. The agent can query its own capability matrix with `(dot op tag)`.
 
 ## The Security Model
 
