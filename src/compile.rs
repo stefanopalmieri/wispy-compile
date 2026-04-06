@@ -898,6 +898,12 @@ impl Compiler {
             let cp = heap.rib_car(expr).as_fixnum().unwrap_or(0);
             return format!("make_char({cp})");
         }
+        if tag == table::TRUE {
+            return "TRUE_VAL".to_string();
+        }
+        if tag == table::BOT {
+            return "FALSE_VAL".to_string();
+        }
         if tag != table::T_PAIR {
             return "Val::NIL".to_string();
         }
@@ -1639,9 +1645,16 @@ struct Rib { car: Val, cdr: Val, tag: u8 }
 
 static mut HEAP: Vec<Rib> = Vec::new();
 
+// Rib 0 = nil/'(), rib 1 = #f (BOT), rib 2 = #t
+const FALSE_VAL: Val = Val(1 << 1); // rib index 1
+const TRUE_VAL: Val = Val(2 << 1);  // rib index 2
+
 fn heap_init() {
     unsafe { HEAP = Vec::with_capacity(65536);
-             HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: TAG_TOP }); }
+             HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: TAG_TOP });  // rib 0: nil
+             HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: TAG_BOT });  // rib 1: #f
+             HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: 20 });       // rib 2: #t
+    }
 }
 
 #[inline]
@@ -1667,12 +1680,13 @@ fn cdr(v: Val) -> Val {
 
 #[inline(always)]
 fn is_true(v: Val) -> bool {
-    v != Val::NIL && v.0 != 0
+    // R4RS: only #f is false. '() is truthy.
+    v != FALSE_VAL
 }
 
 #[inline(always)]
 fn bool_to_val(b: bool) -> Val {
-    if b { Val::fixnum(1) } else { Val::NIL }
+    if b { TRUE_VAL } else { FALSE_VAL }
 }
 
 fn set_car(v: Val, new_car: Val) {
@@ -1918,6 +1932,10 @@ fn display(v: Val) {
             } else if rib.tag == TAG_CHAR {
                 let cp = rib.car.as_fixnum().unwrap_or(0);
                 print!("{}", cp as u8 as char);
+            } else if rib.tag == TAG_BOT {
+                print!("{}{}", '\x23', 'f');
+            } else if rib.tag == 20 {
+                print!("{}{}", '\x23', 't');
             } else {
                 print!("<rib>");
             }
@@ -2030,10 +2048,10 @@ mod tests {
         let code = compile("
             (define (abs-diff a b) (if (> a b) (- a b) (- b a)))
             (define (safe? queen dist placed)
-              (if (null? placed) 42
+              (if (null? placed) #t
                 (let ((q (car placed)))
-                  (cond ((= queen q) '())
-                        ((= (abs-diff queen q) dist) '())
+                  (cond ((= queen q) #f)
+                        ((= (abs-diff queen q) dist) #f)
                         (else (safe? queen (+ dist 1) (cdr placed)))))))
             (define (nqueens-count n row placed)
               (if (= row n) 1

@@ -248,7 +248,11 @@ impl Eval {
         // Symbol: variable lookup
         if tag == table::T_SYM {
             return Trampoline::Done(
-                self.lookup(expr, env).unwrap_or(Val::NIL)
+                self.lookup(expr, env).unwrap_or_else(|| {
+                    let name = self.syms.symbol_name(expr)
+                        .unwrap_or("?");
+                    panic!("unbound variable: {}", name)
+                })
             );
         }
 
@@ -406,6 +410,23 @@ impl Eval {
         if proc.is_fixnum() && proc.as_fixnum() == Some(70) {
             let arg = self.eval(self.heap.car(rest), env);
             return Trampoline::Done(self.call_cc(arg, env));
+        }
+
+        // (apply proc args) — tail-call the target procedure
+        if proc.is_fixnum() && proc.as_fixnum() == Some(46) {
+            let args = self.eval_list(rest, env);
+            let target = self.heap.car(args);
+            let apply_args = self.heap.cdr(args);
+            let apply_args = if self.heap.is_pair(apply_args) {
+                self.heap.car(apply_args)
+            } else {
+                Val::NIL
+            };
+            if self.heap.is_closure(target) {
+                return Trampoline::TailCall { proc: target, args: apply_args };
+            } else {
+                return Trampoline::Done(self.apply(target, apply_args));
+            }
         }
 
         let args = self.eval_list(rest, env);
@@ -862,7 +883,7 @@ impl Eval {
     // ── Truthiness ───────────────────────────────────────────────
 
     pub fn is_true(&self, v: Val) -> bool {
-        if v == Val::NIL { return false; }
+        // R4RS: only #f is false. '() is truthy.
         if v.is_rib() && self.heap.tag(v) == table::BOT { return false; }
         true
     }
@@ -1069,7 +1090,17 @@ impl Eval {
             25 => self.scheme_bool(!self.is_true(a1)), // not
             26 => self.scheme_bool(a1 == a2),          // eq?
             27 => self.scheme_bool(self.equal(a1, a2)), // equal?
-            28 => self.scheme_bool(a1 == a2),          // eqv?
+            28 => { // eqv?
+                if a1 == a2 { self.scheme_bool(true) }
+                else if a1.is_rib() && a2.is_rib()
+                    && self.heap.tag(a1) == table::T_CHAR
+                    && self.heap.tag(a2) == table::T_CHAR
+                {
+                    self.scheme_bool(self.heap.rib_car(a1) == self.heap.rib_car(a2))
+                } else {
+                    self.scheme_bool(false)
+                }
+            }
 
             // List operations
             29 => args, // list — args is already a list!
@@ -1298,7 +1329,7 @@ impl Eval {
             // Division
             72 => { // /
                 let b = a2.as_fixnum().unwrap_or(1);
-                if b == 0 { Val::NIL } // division by zero
+                if b == 0 { panic!("division by zero") }
                 else { Val::fixnum(a1.as_fixnum().unwrap_or(0) / b) }
             }
             73 => { // lcm
@@ -1677,16 +1708,37 @@ impl Eval {
 
     fn equal(&self, a: Val, b: Val) -> bool {
         if a == b { return true; }
+        if a.is_fixnum() && b.is_fixnum() {
+            return a.as_fixnum() == b.as_fixnum();
+        }
         if a.is_fixnum() || b.is_fixnum() { return false; }
         if a == Val::NIL || b == Val::NIL { return false; }
         let ta = self.heap.tag(a);
         let tb = self.heap.tag(b);
         if ta != tb { return false; }
-        if ta == table::T_PAIR {
-            self.equal(self.heap.car(a), self.heap.car(b))
-                && self.equal(self.heap.cdr(a), self.heap.cdr(b))
-        } else {
-            false
+        match ta {
+            table::T_PAIR => {
+                self.equal(self.heap.car(a), self.heap.car(b))
+                    && self.equal(self.heap.cdr(a), self.heap.cdr(b))
+            }
+            table::T_STR | table::T_VEC => {
+                // Compare element/char lists structurally
+                if self.heap.rib_cdr(a) != self.heap.rib_cdr(b) { return false; } // length
+                let mut la = self.heap.rib_car(a);
+                let mut lb = self.heap.rib_car(b);
+                while self.heap.is_pair(la) && self.heap.is_pair(lb) {
+                    if !self.equal(self.heap.car(la), self.heap.car(lb)) {
+                        return false;
+                    }
+                    la = self.heap.cdr(la);
+                    lb = self.heap.cdr(lb);
+                }
+                la == lb // both should be NIL
+            }
+            table::T_CHAR => {
+                self.heap.rib_car(a) == self.heap.rib_car(b) // compare codepoints
+            }
+            _ => false,
         }
     }
 
@@ -1698,12 +1750,15 @@ impl Eval {
     }
 
     fn builtin_map(&mut self, proc: Val, lst: Val) -> Val {
-        if !self.heap.is_pair(lst) { return Val::NIL; }
-        let arg = self.heap.car(lst);
-        let arg_list = self.heap.cons(arg, Val::NIL);
-        let val = self.apply(proc, arg_list);
-        let rest = self.builtin_map(proc, self.heap.cdr(lst));
-        self.heap.cons(val, rest)
+        let mut results = Vec::new();
+        let mut cur = lst;
+        while self.heap.is_pair(cur) {
+            let arg = self.heap.car(cur);
+            let arg_list = self.heap.cons(arg, Val::NIL);
+            results.push(self.apply(proc, arg_list));
+            cur = self.heap.cdr(cur);
+        }
+        self.heap.list(&results)
     }
 
     fn builtin_for_each(&mut self, proc: Val, mut lst: Val) {

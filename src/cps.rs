@@ -184,7 +184,11 @@ impl CpsEval {
 
         // Symbol: variable lookup
         if tag == table::T_SYM {
-            let val = self.lookup(expr, env).unwrap_or(Val::NIL);
+            let val = self.lookup(expr, env).unwrap_or_else(|| {
+                let name = self.syms.symbol_name(expr)
+                    .unwrap_or("?");
+                panic!("unbound variable: {}", name)
+            });
             return State::ApplyCont { val, cont };
         }
 
@@ -761,7 +765,7 @@ impl CpsEval {
     }
 
     pub fn is_true(&self, v: Val) -> bool {
-        if v == Val::NIL { return false; }
+        // R4RS: only #f is false. '() is truthy.
         if v.is_rib() && self.heap.tag(v) == table::BOT { return false; }
         true
     }
