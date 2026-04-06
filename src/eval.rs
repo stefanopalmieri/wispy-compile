@@ -256,7 +256,13 @@ impl Eval {
             );
         }
 
-        // String, char, vector, etc.: self-evaluating
+        // Self-evaluating: canonicalize booleans, pass others through
+        if tag == table::TRUE {
+            return Trampoline::Done(self.true_val);
+        }
+        if tag == table::BOT {
+            return Trampoline::Done(self.false_val);
+        }
         if tag != table::T_PAIR {
             return Trampoline::Done(expr);
         }
@@ -1738,6 +1744,8 @@ impl Eval {
             table::T_CHAR => {
                 self.heap.rib_car(a) == self.heap.rib_car(b) // compare codepoints
             }
+            // Booleans, void, eof: same tag means equal (no payload)
+            table::TRUE | table::BOT | table::VOID | table::EOF => true,
             _ => false,
         }
     }
@@ -1956,6 +1964,8 @@ impl Eval {
                 s
             }
             t if t == table::T_PORT => "<port>".to_string(),
+            t if t == table::TRUE => "#t".to_string(),
+            t if t == table::BOT => "#f".to_string(),
             t if t == table::VOID => "<void>".to_string(),
             t if t == table::EOF => "<eof>".to_string(),
             _ => format!("<unknown:{tag}>"),
@@ -2048,6 +2058,8 @@ impl Eval {
                     }
                     print!(")");
                 }
+                t if t == table::TRUE => print!("#t"),
+                t if t == table::BOT => print!("#f"),
                 t if t == table::VOID => print!("<void>"),
                 t if t == table::EOF => print!("<eof>"),
                 _ => print!("<unknown:{tag}>"),

@@ -192,7 +192,13 @@ impl CpsEval {
             return State::ApplyCont { val, cont };
         }
 
-        // Non-pair: self-evaluating (string, char, vector, etc.)
+        // Self-evaluating: canonicalize booleans, pass others through
+        if tag == table::TRUE {
+            return State::ApplyCont { val: self.true_val, cont };
+        }
+        if tag == table::BOT {
+            return State::ApplyCont { val: self.false_val, cont };
+        }
         if tag != table::T_PAIR {
             return State::ApplyCont { val: expr, cont };
         }

@@ -44,6 +44,7 @@ cargo run -- --strict examples/fib.scm   # strict type checking
 cargo run -- --compile examples/nqueens.scm > nqueens.rs  # compile to Rust
 rustc -O -o nqueens nqueens.rs && ./nqueens   # native binary
 cd lean && lake build                        # verify table proofs (14 theorems, ~6s)
+cargo run -- examples/reflective-tower.scm   # run the self-hosted reflective tower
 ```
 
 As a library:
@@ -121,7 +122,13 @@ src/
 Three execution paths:
 - **Interpreter** (`eval.rs`): tail call optimization, 104 builtins, `(strict-mode)` / `(permissive-mode)` toggle
 - **CPS evaluator** (`cps.rs`): first-class continuations, `call/cc`, re-entrant
-- **Compiler** (`compile.rs`): Scheme → standalone Rust, 1.5x faster than LuaJIT on nqueens(8). Self-tail-call → loop optimization, closure conversion, strings, characters, 55+ inlined builtins, and the algebra extension.
+- **Compiler** (`compile.rs`): Scheme → standalone Rust, 1.7x faster than Chez Scheme on nqueens(8). Self-tail-call → loop optimization, closure conversion, strings, characters, 55+ inlined builtins, and the algebra extension.
+
+Self-hosted tools (all `.scm` files running on WispyScheme itself):
+- **Specializer** (`examples/specialize.scm`): partial evaluator over algebraic expressions
+- **Metacircular evaluator** (`examples/metacircular.scm`): defunctionalized CPS with inspectable continuations, reify/reflect
+- **Transpiler** (`examples/transpile.scm`): IR → Rust code generator
+- **Reflective tower** (`examples/reflective-tower.scm`): three-level Smith (1984) tower with continuation modification
 
 ## R4RS Coverage
 
@@ -160,6 +167,46 @@ The 32×32 table (1KB) is a finite algebra. All properties are Lean-proved (`lea
 
 The core satisfies the same axiom set as [Kamea's Ψ₁₆](https://github.com/stefanopalmieri/Kamea) (absorbers, retraction, classifier dichotomy, branch, composition, Y), making it axiomatically equivalent but not isomorphic (different carrier size, different table entries). The three independent capabilities carry over: self-representation (Q/E), self-description (τ), and self-execution (branch + composition).
 
+## Self-Hosted Tools
+
+Six Scheme programs that run on WispyScheme itself, ported from the [Kamea](https://github.com/stefanopalmieri/Kamea) project's Psi Lisp originals:
+
+| File | What it does |
+|---|---|
+| `examples/algebra-smoke.scm` | 83 assertions validating absorbers, retraction, classifier, composition, Y fixed point |
+| `examples/ir-lib.scm` | Shared 7-node tagged-pair IR (Atom, Var, Dot, If, Let, Lam, App) |
+| `examples/specialize.scm` | Partial evaluator: constant-folds `dot`, cancels QE pairs, eliminates dead branches, beta-reduces |
+| `examples/futamura.scm` | All three Futamura projections on the 32×32 algebra |
+| `examples/metacircular.scm` | Defunctionalized CPS evaluator with 14 inspectable continuation types |
+| `examples/transpile.scm` | IR → Rust code generator (emits standalone binaries with inlined Cayley table) |
+| `examples/reflective-tower.scm` | Three-level Smith (1984) reflective tower |
+
+**The reflective tower** demonstrates three levels grounded in the Cayley table:
+
+- **Level 0:** User programs (fib, fact) run through the meta-evaluator
+- **Level 1:** The meta-evaluator probes the 32×32 table to verify algebraic invariants (absorbers, retraction, composition, fixed points)
+- **Level 2:** `(reify)` captures the current continuation as walkable data; the program navigates the continuation chain, swaps the then/else branches of a pending `if`, and `(reflect)`s into the modified future — the `if` takes the *opposite* branch from what the source code says
+
+Every continuation is a tagged list, not a closure. The program can read, modify, and rewrite its own control flow.
+
+**The Futamura projections** demonstrate the specializer eliminating all interpretation overhead:
+
+```scheme
+;; Three paths to the same result:
+;;   Path A: direct table lookup          (dot Q (dot Q (dot Q CAR)))    → 8
+;;   Path B: specialize(interp, program)  fully fold interpreter+program → 8
+;;   Path C: compile then apply           specialize partial → dot chain → 8
+
+;; The compiled output has 3 dots, 0 lambdas, 0 applications.
+;; All interpretation overhead is gone.
+```
+
+```bash
+cargo run -- examples/reflective-tower.scm   # three-level tower with branch swap
+cargo run -- examples/algebra-smoke.scm      # 83 algebra assertions
+cargo run -- -e '(load "examples/ir-lib.scm") (load "examples/specialize.scm") (load "examples/futamura.scm")'
+```
+
 ## `no_std` Support
 
 WispyScheme compiles in three configurations:
@@ -184,6 +231,8 @@ cargo check --no-default-features --lib
 - **Compiler improvements.** Mutual tail recursion (currently only self-tail-calls are optimized), `call/cc` support in compiled output.
 
 - **Embedded demo.** Run WispyScheme on an RP2040 or ESP32-C3: read sensor values, apply user-defined Scheme rules, actuate outputs. Upload new `.scm` files over serial without reflashing.
+
+- **Self-hosted compiler.** The self-hosted transpiler (`examples/transpile.scm`) currently only handles the 7-node algebraic IR (Atom/Var/Dot/If/Let/Lam/App). Extending it to cover full R4RS Scheme — closures, tail calls, strings, builtins — would replace the Rust compiler (`compile.rs`) with a Scheme-in-Scheme compiler. It would still emit Rust (using `rustc` as a backend), but the compiler itself would be written in the language it compiles.
 
 ## Lineage
 
