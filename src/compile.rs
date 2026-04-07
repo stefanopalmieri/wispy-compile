@@ -1599,6 +1599,56 @@ impl Compiler {
                             rust_ident(vname)));
                         b = heap.cdr(b);
                     }
+                    // Third pass: patch closure envs so mutual references see final values.
+                    // For each lambda binding, rebuild the env cons chain with current
+                    // variable values and set_cdr the closure rib.
+                    b = bindings;
+                    while heap.is_pair(b) {
+                        let binding = heap.car(b);
+                        let var = heap.car(binding);
+                        let init = heap.car(heap.cdr(binding));
+                        let vname = syms.symbol_name(var).unwrap_or("_");
+                        if heap.is_pair(init) {
+                            let init_head = heap.car(init);
+                            if heap.is_symbol(init_head) {
+                                let iname = syms.symbol_name(init_head).unwrap_or("");
+                                if iname == "lambda" || iname == "case-lambda" {
+                                    // Find the free vars this lambda captures
+                                    let params_list = heap.car(heap.cdr(init));
+                                    let body_list = heap.cdr(heap.cdr(init));
+                                    let mut param_bound: HashSet<String> = HashSet::new();
+                                    if heap.is_symbol(params_list) {
+                                        if let Some(pn) = syms.symbol_name(params_list) {
+                                            param_bound.insert(pn.to_string());
+                                        }
+                                    } else {
+                                        let mut p = params_list;
+                                        while heap.is_pair(p) {
+                                            if let Some(pn) = syms.symbol_name(heap.car(p)) {
+                                                param_bound.insert(pn.to_string());
+                                            }
+                                            p = heap.cdr(p);
+                                        }
+                                        if heap.is_symbol(p) {
+                                            if let Some(pn) = syms.symbol_name(p) {
+                                                param_bound.insert(pn.to_string());
+                                            }
+                                        }
+                                    }
+                                    let fvs = self.collect_free_vars_list(body_list, heap, syms, &param_bound);
+                                    if !fvs.is_empty() {
+                                        let rv = rust_ident(vname);
+                                        let mut env = "Val::NIL".to_string();
+                                        for fv in fvs.iter().rev() {
+                                            env = format!("cons({}, {env})", rust_ident(fv));
+                                        }
+                                        out.push_str(&format!("{pad}    set_cdr({rv}, {env});\n"));
+                                    }
+                                }
+                            }
+                        }
+                        b = heap.cdr(b);
+                    }
                     out.push_str(&self.emit_begin(body, heap, syms, indent + 1));
                     out.push_str(&format!("{pad}}}\n"));
                     return out;
@@ -2500,6 +2550,53 @@ impl Compiler {
                         out.push_str(&format!("{} = {init_code}; ", rust_ident(vname)));
                         b = heap.cdr(b);
                     }
+                    // Patch closure envs so mutual references see final values
+                    b = bindings;
+                    while heap.is_pair(b) {
+                        let binding = heap.car(b);
+                        let var = heap.car(binding);
+                        let init = heap.car(heap.cdr(binding));
+                        let vname = syms.symbol_name(var).unwrap_or("_");
+                        if heap.is_pair(init) {
+                            let init_head = heap.car(init);
+                            if heap.is_symbol(init_head) {
+                                let iname = syms.symbol_name(init_head).unwrap_or("");
+                                if iname == "lambda" || iname == "case-lambda" {
+                                    let params_list = heap.car(heap.cdr(init));
+                                    let body_list = heap.cdr(heap.cdr(init));
+                                    let mut param_bound: HashSet<String> = HashSet::new();
+                                    if heap.is_symbol(params_list) {
+                                        if let Some(pn) = syms.symbol_name(params_list) {
+                                            param_bound.insert(pn.to_string());
+                                        }
+                                    } else {
+                                        let mut p = params_list;
+                                        while heap.is_pair(p) {
+                                            if let Some(pn) = syms.symbol_name(heap.car(p)) {
+                                                param_bound.insert(pn.to_string());
+                                            }
+                                            p = heap.cdr(p);
+                                        }
+                                        if heap.is_symbol(p) {
+                                            if let Some(pn) = syms.symbol_name(p) {
+                                                param_bound.insert(pn.to_string());
+                                            }
+                                        }
+                                    }
+                                    let fvs = self.collect_free_vars_list(body_list, heap, syms, &param_bound);
+                                    if !fvs.is_empty() {
+                                        let rv = rust_ident(vname);
+                                        let mut env = "Val::NIL".to_string();
+                                        for fv in fvs.iter().rev() {
+                                            env = format!("cons({}, {env})", rust_ident(fv));
+                                        }
+                                        out.push_str(&format!("set_cdr({rv}, {env}); "));
+                                    }
+                                }
+                            }
+                        }
+                        b = heap.cdr(b);
+                    }
                     let mut parts = Vec::new();
                     let mut r = body;
                     while heap.is_pair(r) {
@@ -2824,6 +2921,28 @@ fn rust_ident(name: &str) -> String {
         "else" => "else_".to_string(),
         "return" => "return_".to_string(),
         "mod" => "mod_".to_string(),
+        "do" => "do_".to_string(),
+        "while" => "while_".to_string(),
+        "for" => "for_".to_string(),
+        "in" => "in_".to_string(),
+        "ref" => "ref_".to_string(),
+        "mut" => "mut_".to_string(),
+        "move" => "move_".to_string(),
+        "self" => "self_".to_string(),
+        "super" => "super_".to_string(),
+        "crate" => "crate_".to_string(),
+        "struct" => "struct_".to_string(),
+        "enum" => "enum_".to_string(),
+        "trait" => "trait_".to_string(),
+        "impl" => "impl_".to_string(),
+        "use" => "use_".to_string(),
+        "where" => "where_".to_string(),
+        "async" => "async_".to_string(),
+        "await" => "await_".to_string(),
+        "break" => "break_".to_string(),
+        "continue" => "continue_".to_string(),
+        "true" => "true_".to_string(),
+        "false" => "false_".to_string(),
         _ => s,
     }
 }
