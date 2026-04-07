@@ -237,9 +237,11 @@
                 (set! *depth* (+ *depth* 1))
                 (let ((result (pe-eval body (pe-extend params args '()))))
                   (set! *depth* (- *depth* 1))
-                  ;; If body evaluated to unknown, residualize the call
-                  ;; instead of propagating unknown (enables P2)
-                  (if (unknown? result)
+                  ;; If body evaluated to generic *unknown* (not a named
+                  ;; unknown like (make-unknown 'x)), residualize the call.
+                  ;; Named unknowns are valid results (e.g., m-lookup
+                  ;; returning an unknown variable's value).
+                  (if (eq? result *unknown*)
                       (make-residual (cons fn-name (pe-lift-args args)))
                       result))))))))
 
