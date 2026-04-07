@@ -134,7 +134,9 @@ cargo check --no-default-features --lib
 - **Futamura P3.** Specialize the transpiler on a known program to produce a residual Rust-emitting program — a compiler generated from an interpreter.
 - **Mutual tail recursion.** Trampoline or CPS transform for mutually recursive tail calls.
 - **Full continuations.** CPS transform for reentrant `call/cc`.
-- **GC optimization.** The Cheney GC shadow stack instruments every function (gc_push/gc_load for all params). Fixnum-only functions don't need this — detecting and skipping shadow stack for non-allocating paths would close the 2-5× overhead gap on numeric benchmarks.
+- **Type inference / specialization.** `(+ (car x) 1)` currently emits `.as_fixnum().unwrap()` on the car result. Propagating type information through the call graph would eliminate runtime type checks on provably-fixnum paths — the same optimization that makes Chez 2-5× faster on list-heavy benchmarks.
+- **Cross-function inlining.** Lifted lambdas dispatch through `match code_id` in `dispatch_closure`. Inlining small closures at call sites would eliminate this indirect dispatch and enable further optimization by `rustc`.
+- **Flat vectors.** Vectors are currently encoded as cons chains (`vector-ref` walks N cdrs). A flat `Vec<Val>` or inline array representation would make vector-heavy benchmarks like triangl competitive — this alone accounts for the 10× gap vs Chez.
 - **Bare-metal RISC-V.** `--target no-std` with fixed-size heap arrays, no alloc crate, UART output.
 
 ## Lineage
