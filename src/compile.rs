@@ -555,6 +555,7 @@ impl Compiler {
             "string=?" | "string<?" | "string>?" | "string<=?" | "string>=?" |
             "string-set!" | "substring" |
             "call-with-current-continuation" | "call/cc" | "force" | "lcm" |
+            "read" |
             "open-input-file" | "open-output-file" | "close-port" |
             "read-char" | "peek-char" | "read-line" |
             "current-input-port" | "current-output-port" | "current-error-port" |
@@ -2269,6 +2270,9 @@ impl Compiler {
                     return out;
                 }
                 // ── Ports / I/O ──────────────────
+                "read" => {
+                    return "scheme_read()".to_string();
+                }
                 "current-input-port" => {
                     return "current_input_port()".to_string();
                 }
@@ -3593,6 +3597,243 @@ fn rust_string_to_val(s: &str) -> Val {
         chars = cons(Val::fixnum(b as i64), chars);
     }
     make_string(chars, Val::fixnum(len))
+}
+
+// ── Runtime read ────────────────────────────────────────────────
+
+fn scheme_read() -> Val {
+    scheme_read_port(&mut std::io::stdin().lock())
+}
+
+fn scheme_read_port(r: &mut dyn std::io::BufRead) -> Val {
+    // Skip whitespace
+    loop {
+        let buf = match r.fill_buf() {
+            Ok(b) if !b.is_empty() => b[0],
+            _ => return EOF_VAL,
+        };
+        if buf == b' ' || buf == b'\n' || buf == b'\r' || buf == b'\t' {
+            r.consume(1);
+        } else {
+            break;
+        }
+    }
+
+    let first = {
+        let buf = r.fill_buf().unwrap_or(&[]);
+        if buf.is_empty() { return EOF_VAL; }
+        buf[0]
+    };
+
+    match first {
+        // List
+        b'(' => {
+            r.consume(1);
+            read_list(r)
+        }
+        // String
+        b'"' => {
+            r.consume(1);
+            read_string_lit(r)
+        }
+        // Quote
+        b'\'' => {
+            r.consume(1);
+            let datum = scheme_read_port(r);
+            // Build (quote datum)
+            let q_chars = Val::NIL;
+            let q_str = rust_string_to_val("quote");
+            // Use a fixnum hash for the symbol (same as compiler's quoted symbols)
+            let hash = "quote".bytes().fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
+            let qsym = Val::fixnum(hash);
+            cons(qsym, cons(datum, Val::NIL))
+        }
+        // Hash: #t, #f, #\char
+        b'#' => {
+            r.consume(1);
+            let next = {
+                let buf = r.fill_buf().unwrap_or(&[]);
+                if buf.is_empty() { return EOF_VAL; }
+                buf[0]
+            };
+            match next {
+                b't' => { r.consume(1); skip_atom_tail(r); TRUE_VAL }
+                b'f' => { r.consume(1); skip_atom_tail(r); FALSE_VAL }
+                b'\\' => {
+                    r.consume(1);
+                    let ch = {
+                        let buf = r.fill_buf().unwrap_or(&[]);
+                        if buf.is_empty() { return EOF_VAL; }
+                        buf[0]
+                    };
+                    r.consume(1);
+                    // Check for named characters
+                    let cp = match ch {
+                        b's' | b'n' | b't' => {
+                            // Peek ahead for "space", "newline", "tab"
+                            let mut name = String::new();
+                            name.push(ch as char);
+                            loop {
+                                let buf = match r.fill_buf() { Ok(b) => b, _ => break };
+                                if buf.is_empty() { break; }
+                                let c = buf[0];
+                                if c.is_ascii_alphabetic() {
+                                    name.push(c as char);
+                                    r.consume(1);
+                                } else { break; }
+                            }
+                            match name.as_str() {
+                                "space" => 32,
+                                "newline" => 10,
+                                "tab" => 9,
+                                _ => name.bytes().next().unwrap_or(0) as i64,
+                            }
+                        }
+                        _ => ch as i64,
+                    };
+                    make_char(cp)
+                }
+                _ => EOF_VAL,
+            }
+        }
+        // Number (possibly negative)
+        b'0'..=b'9' => read_number(r, false),
+        b'-' => {
+            r.consume(1);
+            let buf = r.fill_buf().unwrap_or(&[]);
+            if !buf.is_empty() && buf[0].is_ascii_digit() {
+                read_number(r, true)
+            } else {
+                // Symbol starting with -
+                read_symbol_rest(r, "-")
+            }
+        }
+        b'+' => {
+            r.consume(1);
+            let buf = r.fill_buf().unwrap_or(&[]);
+            if !buf.is_empty() && buf[0].is_ascii_digit() {
+                read_number(r, false)
+            } else {
+                read_symbol_rest(r, "+")
+            }
+        }
+        // Symbol
+        _ => {
+            let mut s = String::new();
+            read_symbol_into(r, &mut s);
+            // Return as a fixnum hash (same encoding as compiler's quoted symbols)
+            let hash = s.bytes().fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
+            Val::fixnum(hash)
+        }
+    }
+}
+
+fn read_number(r: &mut dyn std::io::BufRead, neg: bool) -> Val {
+    use std::io::BufRead;
+    let mut n: i64 = 0;
+    loop {
+        let buf = match r.fill_buf() { Ok(b) => b, _ => break };
+        if buf.is_empty() { break; }
+        let c = buf[0];
+        if c.is_ascii_digit() {
+            n = n * 10 + (c - b'0') as i64;
+            r.consume(1);
+        } else {
+            break;
+        }
+    }
+    Val::fixnum(if neg { -n } else { n })
+}
+
+fn read_list(r: &mut dyn std::io::BufRead) -> Val {
+    use std::io::BufRead;
+    let mut items = Vec::new();
+    loop {
+        // Skip whitespace
+        loop {
+            let buf = match r.fill_buf() { Ok(b) => b, _ => return Val::NIL };
+            if buf.is_empty() { return Val::NIL; }
+            let c = buf[0];
+            if c == b' ' || c == b'\n' || c == b'\r' || c == b'\t' {
+                r.consume(1);
+            } else { break; }
+        }
+        let buf = r.fill_buf().unwrap_or(&[]);
+        if buf.is_empty() { break; }
+        if buf[0] == b')' {
+            r.consume(1);
+            break;
+        }
+        items.push(scheme_read_port(r));
+    }
+    let mut result = Val::NIL;
+    for v in items.iter().rev() {
+        result = cons(*v, result);
+    }
+    result
+}
+
+fn read_string_lit(r: &mut dyn std::io::BufRead) -> Val {
+    use std::io::BufRead;
+    let mut s = String::new();
+    loop {
+        let buf = match r.fill_buf() { Ok(b) => b, _ => break };
+        if buf.is_empty() { break; }
+        let c = buf[0];
+        r.consume(1);
+        if c == b'"' { break; }
+        if c == b'\\' {
+            let buf2 = match r.fill_buf() { Ok(b) => b, _ => break };
+            if !buf2.is_empty() {
+                let esc = buf2[0];
+                r.consume(1);
+                match esc {
+                    b'n' => s.push('\n'),
+                    b't' => s.push('\t'),
+                    b'\\' => s.push('\\'),
+                    b'"' => s.push('"'),
+                    _ => { s.push('\\'); s.push(esc as char); }
+                }
+            }
+        } else {
+            s.push(c as char);
+        }
+    }
+    rust_string_to_val(&s)
+}
+
+fn read_symbol_into(r: &mut dyn std::io::BufRead, s: &mut String) {
+    use std::io::BufRead;
+    loop {
+        let buf = match r.fill_buf() { Ok(b) => b, _ => break };
+        if buf.is_empty() { break; }
+        let c = buf[0];
+        if c == b' ' || c == b'\n' || c == b'\r' || c == b'\t'
+            || c == b'(' || c == b')' || c == b'"' || c == b';' {
+            break;
+        }
+        s.push(c as char);
+        r.consume(1);
+    }
+}
+
+fn read_symbol_rest(r: &mut dyn std::io::BufRead, prefix: &str) -> Val {
+    let mut s = prefix.to_string();
+    read_symbol_into(r, &mut s);
+    let hash = s.bytes().fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
+    Val::fixnum(hash)
+}
+
+fn skip_atom_tail(r: &mut dyn std::io::BufRead) {
+    use std::io::BufRead;
+    loop {
+        let buf = match r.fill_buf() { Ok(b) => b, _ => break };
+        if buf.is_empty() { break; }
+        let c = buf[0];
+        if c == b' ' || c == b'\n' || c == b'\r' || c == b'\t'
+            || c == b'(' || c == b')' { break; }
+        r.consume(1);
+    }
 }
 "#;
 
