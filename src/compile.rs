@@ -414,9 +414,10 @@ impl Compiler {
         match name {
             "if" => {
                 let conseq = heap.car(heap.cdr(rest));
-                let alt = heap.car(heap.cdr(heap.cdr(rest)));
+                let alt_list = heap.cdr(heap.cdr(rest));
+                let has_alt = heap.is_pair(alt_list);
                 self.has_self_tail_call(conseq, fn_name, heap, syms)
-                    || self.has_self_tail_call(alt, fn_name, heap, syms)
+                    || (has_alt && self.has_self_tail_call(heap.car(alt_list), fn_name, heap, syms))
             }
             "begin" => {
                 self.has_self_tail_call_in_begin(rest, fn_name, heap, syms)
@@ -1382,13 +1383,19 @@ impl Compiler {
                     let test = heap.car(rest);
                     let rest2 = heap.cdr(rest);
                     let conseq = heap.car(rest2);
-                    let alt = heap.car(heap.cdr(rest2));
+                    let alt_list = heap.cdr(rest2);
                     let test_code = self.emit_expr_inline(test, heap, syms);
                     let t_code = self.emit_expr(conseq, heap, syms, indent + 1);
-                    let f_code = self.emit_expr(alt, heap, syms, indent + 1);
-                    return format!(
-                        "{pad}if is_true({test_code}) {{\n{t_code}{pad}}} else {{\n{f_code}{pad}}}\n"
-                    );
+                    if heap.is_pair(alt_list) {
+                        let f_code = self.emit_expr(heap.car(alt_list), heap, syms, indent + 1);
+                        return format!(
+                            "{pad}if is_true({test_code}) {{\n{t_code}{pad}}} else {{\n{f_code}{pad}}}\n"
+                        );
+                    } else {
+                        return format!(
+                            "{pad}if is_true({test_code}) {{\n{t_code}{pad}}} else {{\n{pad}    Val::NIL\n{pad}}}\n"
+                        );
+                    }
                 }
 
                 "begin" => {
@@ -1669,7 +1676,12 @@ impl Compiler {
                     let test = self.emit_expr_inline(heap.car(rest), heap, syms);
                     let r2 = heap.cdr(rest);
                     let c = self.emit_expr_inline(heap.car(r2), heap, syms);
-                    let a = self.emit_expr_inline(heap.car(heap.cdr(r2)), heap, syms);
+                    let alt_list = heap.cdr(r2);
+                    let a = if heap.is_pair(alt_list) {
+                        self.emit_expr_inline(heap.car(alt_list), heap, syms)
+                    } else {
+                        "Val::NIL".to_string()
+                    };
                     return format!("if is_true({test}) {{ {c} }} else {{ {a} }}");
                 }
                 "null?" => {
