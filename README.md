@@ -87,6 +87,12 @@ The table, value representation, reader, heap, and symbol interning all compile 
 cargo check --no-default-features --lib
 ```
 
+## Limitations
+
+- **Mutual tail recursion** — only self-tail-calls are optimized to loops. Mutually recursive functions in tail position use regular calls and can overflow the stack.
+- **call/cc** — escape-only (non-reentrant). Full continuations would require a CPS transform.
+- **Symbols at runtime** — `symbol->string` / `string->symbol` are not yet supported (symbols exist only at compile time).
+
 ## Lineage
 
 WispyScheme descends from the [Kamea](https://github.com/stefanopalmieri/Kamea) project's algebraic framework. The independence theorems (93 Lean theorems, zero `sorry`) are in [finite-magma-independence](https://github.com/stefanopalmieri/finite-magma-independence). The VM is a fork of [Stak](https://github.com/raviqqe/stak), itself derived from [Ribbit](https://github.com/udem-dlteam/ribbit), with the Cayley table integrated into the VM.
