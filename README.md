@@ -1,6 +1,6 @@
 # WispyScheme
 
-Scheme → Rust AOT compiler with branchless Cayley table type dispatch. Compiles Scheme to standalone native binaries — 1.7× faster than Chez Scheme on nqueens(8).
+Scheme → Rust AOT compiler with branchless Cayley table type dispatch. Compiles R7RS Scheme to standalone native binaries — 1.7× faster than Chez Scheme on nqueens(8).
 
 Named after Wispy the guinea pig.
 
@@ -26,6 +26,18 @@ Type dispatch in the compiled output is branchless: instead of tag-bit branch ch
 
 For interpreted execution, REPL, and running the self-hosted tools (reflective tower, partial evaluator, Futamura projections), use [wispy-vm](https://github.com/stefanopalmieri/wispy-vm).
 
+## Language Support
+
+**R4RS core:** `define`, `lambda` (including rest args), `if`, `cond`, `case`, `let`/`let*`/`letrec`, named `let`, `begin`, `and`/`or`, `quote`, `quasiquote`, `set!`, `do`, `define-syntax`/`syntax-rules` (with ellipsis and dotted tail patterns).
+
+**R7RS extensions:** `case-lambda`, `define-record-type`, `values`/`call-with-values`, `guard`/`raise`/`error`/`with-exception-handler`, `define-library`/`import`, `call-with-current-continuation` (escape-only).
+
+**Builtins:** 70+ inlined operations — arithmetic, comparisons, list ops (`map`, `for-each`, `apply`, `append`, `reverse`), strings, characters, vectors, `equal?`, type predicates, I/O (`display`, `write`, `read-char`, `read-line`, ports/files), and the three algebra primitives (`dot`, `tau`, `type-valid?`).
+
+**First-class builtins:** Operators like `+`, `cons`, `car` can be passed as values (e.g., `(map + '(1 2) '(3 4))`).
+
+**Closures:** Full closure conversion with lambda lifting. Self-tail-call → loop optimization.
+
 ## Performance
 
 | Implementation | N-Queens(8) | Counter arithmetic |
@@ -49,27 +61,23 @@ src/
 ├── heap.rs         rib heap: uniform (car, cdr, tag) for all types
 ├── symbol.rs       symbol interning
 ├── reader.rs       S-expression parser
-├── macros.rs       syntax-rules: pattern matching, ellipsis, template instantiation
-└── compile.rs      Scheme → Rust compiler (2609 lines)
+├── macros.rs       syntax-rules: pattern matching, ellipsis, dotted tails, template instantiation
+└── compile.rs      Scheme → Rust compiler (~4200 lines)
 ```
-
-The compiler handles: `define`, `lambda` (closure conversion), `if`, `cond`, `let`/`let*`/`letrec`, `begin`, `and`/`or`, `quote`, `set!`, `do`, `delay`, `quasiquote`, `define-syntax`/`syntax-rules`, self-tail-call → loop optimization, 55+ inlined builtins, and the three algebra primitives (`dot`, `tau`, `type-valid?`).
-
-Does not yet handle: `call/cc`, mutual tail recursion, named `let` loops.
 
 ## The Cayley Table
 
 The 32×32 table (1KB) is a finite algebra shared across all wispy repos via [wispy-table](https://github.com/stefanopalmieri/wispy-table). 14 Lean-proved theorems (zero `sorry`):
 
-- **Absorbers:** ⊤ (nil) and ⊥ (#f) are left absorbers
+- **Absorbers:** top (nil) and bot (#f) are left absorbers
 - **Retraction pair:** Q and E are mutual inverses on the core (quote/eval)
-- **Classifier:** τ partitions the core into two boolean classes
-- **Branch/Composition:** ρ dispatches on τ; cdr = ρ ∘ cons
-- **Y fixed point:** Y(ρ) = ρ(Y(ρ)), non-absorber
+- **Classifier:** tau partitions the core into two boolean classes
+- **Branch/Composition:** rho dispatches on tau; cdr = rho . cons
+- **Y fixed point:** Y(rho) = rho(Y(rho)), non-absorber
 - **Extensionality:** all 32 rows are distinct
-- **Type dispatch:** CAR × T_PAIR → valid, CAR × T_STR → error
+- **Type dispatch:** CAR x T_PAIR → valid, CAR x T_STR → error
 
-12 core elements, 8 R4RS type tags, 3 special values, 9 unused slots for extension. The core is axiomatically equivalent to [Kamea's Ψ₁₆](https://github.com/stefanopalmieri/Kamea).
+12 core elements, 8 R4RS type tags, 3 special values, 5 R7RS type tags (record, values, error, bytevector, promise), 4 unused slots. The core is axiomatically equivalent to [Kamea's Psi-16](https://github.com/stefanopalmieri/Kamea).
 
 ## `no_std` Support
 
@@ -78,12 +86,6 @@ The table, value representation, reader, heap, and symbol interning all compile 
 ```bash
 cargo check --no-default-features --lib
 ```
-
-## Future Work
-
-- **P2 → compiled pipeline.** Pipe Futamura P2 residual CPS code through `--compile` for native binaries with call/cc preserved.
-- **Compiler improvements.** Mutual tail recursion, `call/cc` in compiled output, named `let`.
-- **Self-hosted compiler.** Extend the self-hosted transpiler to cover full R4RS Scheme, replacing `compile.rs` with Scheme-in-Scheme.
 
 ## Lineage
 
