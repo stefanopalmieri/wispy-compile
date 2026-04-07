@@ -1,16 +1,14 @@
 //! Scheme → Rust compiler.
 //!
-//! Compiles Scheme source into a standalone Rust program that links
-//! against wispy-scheme's table and heap. The compiled output is a
-//! single .rs file with inline table + heap, no external dependencies.
+//! Compiles Scheme source into a standalone Rust program with inline
+//! table + heap, no external dependencies.
 //!
-//! Handles: define (functions + values), lambda (closure conversion),
-//! if, cond, let, let*, letrec, begin, and/or, quote, set!,
-//! arithmetic, list ops, tail calls (via loop).
+//! Handles: R4RS core (define, lambda, if, cond, let/let*/letrec,
+//! begin, and/or, quote, set!, do, case), closures, TCO,
+//! define-syntax/syntax-rules, strings, chars, vectors.
 //!
-//! Does NOT handle (yet): call/cc, macros, eval, ports.
-//! These require a runtime evaluator — the compiler is for
-//! the "hot path" code that needs native speed.
+//! R7RS: case-lambda, define-record-type, values/call-with-values,
+//! guard/raise/error, with-exception-handler, define-library/import.
 
 use crate::heap::Heap;
 use crate::symbol::SymbolTable;
@@ -20,6 +18,13 @@ use crate::table;
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 
+/// A clause for case-lambda: (params, body_list).
+#[derive(Clone)]
+struct CaseClause {
+    params: Vec<String>,
+    body_list: Val,
+}
+
 /// A lambda that has been lifted to a top-level function.
 #[derive(Clone)]
 struct LiftedLambda {
@@ -27,6 +32,8 @@ struct LiftedLambda {
     params: Vec<String>,
     free_vars: Vec<String>,
     body_list: Val, // list of body expressions (use emit_begin)
+    /// If Some, this is a case-lambda with multiple dispatch clauses.
+    case_clauses: Option<Vec<CaseClause>>,
 }
 
 /// TCO context for the function currently being compiled.
@@ -34,6 +41,24 @@ struct LiftedLambda {
 struct TcoContext {
     fn_name: String,
     params: Vec<String>,
+}
+
+/// A user-defined library (compile-time resolution).
+struct Library {
+    /// Library name parts, e.g. ["mylib"] or ["my", "lib"]
+    name: Vec<String>,
+    /// Exported symbol names
+    exports: Vec<String>,
+}
+
+/// A record type defined via define-record-type.
+struct RecordType {
+    type_id: usize,
+    constructor_name: String,
+    constructor_fields: Vec<String>, // field names in constructor order
+    predicate_name: String,
+    accessors: Vec<(usize, String)>, // (field_index, accessor_name)
+    mutators: Vec<(usize, String)>,  // (field_index, mutator_name)
 }
 
 /// Compiler state.
@@ -52,6 +77,10 @@ pub struct Compiler {
     tco: RefCell<Option<TcoContext>>,
     /// Variables that are targets of set! (need let mut)
     set_targets: RefCell<HashSet<String>>,
+    /// Record types defined via define-record-type
+    record_types: Vec<RecordType>,
+    /// User-defined libraries
+    libraries: Vec<Library>,
 }
 
 impl Compiler {
@@ -64,6 +93,8 @@ impl Compiler {
             next_lambda_id: Cell::new(0),
             tco: RefCell::new(None),
             set_targets: RefCell::new(HashSet::new()),
+            record_types: Vec::new(),
+            libraries: Vec::new(),
         }
     }
 
@@ -122,6 +153,19 @@ impl Compiler {
                         if name == "define" {
                             let expanded = self.expand_all(expr, &macros, heap, syms);
                             self.process_define(expanded, heap, syms);
+                            continue;
+                        }
+                        if name == "define-record-type" {
+                            self.process_record_type(expr, heap, syms);
+                            continue;
+                        }
+                        if name == "define-library" {
+                            self.process_library(expr, heap, syms, &macros);
+                            continue;
+                        }
+                        if name == "import" {
+                            // (import (lib-name ...)) — built-in libs are no-ops,
+                            // user libs already processed in define-library
                             continue;
                         }
                     }
@@ -211,6 +255,134 @@ impl Compiler {
         }
     }
 
+    /// Parse a define-record-type form and register the record type.
+    fn process_record_type(&mut self, expr: Val, heap: &Heap, syms: &SymbolTable) {
+        let rest = heap.cdr(expr);
+        // (define-record-type <name> (constructor field...) predicate (field accessor [mutator])...)
+        let _type_name = heap.car(rest); // <name> — not used at runtime
+        let rest2 = heap.cdr(rest);
+        let constructor = heap.car(rest2);
+        let rest3 = heap.cdr(rest2);
+        let predicate_sym = heap.car(rest3);
+        let field_specs = heap.cdr(rest3);
+
+        let type_id = self.record_types.len();
+        let constructor_name = syms.symbol_name(heap.car(constructor)).unwrap_or("_").to_string();
+        let predicate_name = syms.symbol_name(predicate_sym).unwrap_or("_").to_string();
+
+        // Constructor field names (in order)
+        let mut constructor_fields = Vec::new();
+        let mut p = heap.cdr(constructor);
+        while heap.is_pair(p) {
+            if let Some(fname) = syms.symbol_name(heap.car(p)) {
+                constructor_fields.push(fname.to_string());
+            }
+            p = heap.cdr(p);
+        }
+
+        // Field specs: (field accessor [mutator])
+        let mut accessors = Vec::new();
+        let mut mutators = Vec::new();
+        let mut fs = field_specs;
+        while heap.is_pair(fs) {
+            let spec = heap.car(fs);
+            let field_name = syms.symbol_name(heap.car(spec)).unwrap_or("_").to_string();
+            let accessor_name = syms.symbol_name(heap.car(heap.cdr(spec))).unwrap_or("_").to_string();
+            // Find field index in constructor order
+            let idx = constructor_fields.iter().position(|f| f == &field_name).unwrap_or(0);
+            accessors.push((idx, accessor_name));
+            // Check for mutator
+            let mutator_rest = heap.cdr(heap.cdr(spec));
+            if heap.is_pair(mutator_rest) {
+                let mutator_name = syms.symbol_name(heap.car(mutator_rest)).unwrap_or("_").to_string();
+                mutators.push((idx, mutator_name));
+            }
+            fs = heap.cdr(fs);
+        }
+
+        self.record_types.push(RecordType {
+            type_id,
+            constructor_name,
+            constructor_fields,
+            predicate_name,
+            accessors,
+            mutators,
+        });
+    }
+
+    /// Parse a define-library form and process its body.
+    fn process_library(&mut self, expr: Val, heap: &mut Heap, syms: &mut SymbolTable,
+                       macros: &[(Val, crate::macros::Macro)]) {
+        let rest = heap.cdr(expr);
+        let name_list = heap.car(rest);
+        let decls = heap.cdr(rest);
+
+        // Extract library name: (name part1 part2 ...)
+        let mut lib_name = Vec::new();
+        let mut n = name_list;
+        while heap.is_pair(n) {
+            if let Some(s) = syms.symbol_name(heap.car(n)) {
+                lib_name.push(s.to_string());
+            }
+            n = heap.cdr(n);
+        }
+
+        // Process declarations: export, import (ignored), begin
+        let mut exports = Vec::new();
+        let mut d = decls;
+        while heap.is_pair(d) {
+            let decl = heap.car(d);
+            if heap.is_pair(decl) {
+                let dhead = heap.car(decl);
+                if let Some(dname) = syms.symbol_name(dhead) {
+                    match dname {
+                        "export" => {
+                            let mut e = heap.cdr(decl);
+                            while heap.is_pair(e) {
+                                if let Some(ename) = syms.symbol_name(heap.car(e)) {
+                                    exports.push(ename.to_string());
+                                }
+                                e = heap.cdr(e);
+                            }
+                        }
+                        "begin" => {
+                            // Process body definitions as top-level
+                            let mut body = heap.cdr(decl);
+                            while heap.is_pair(body) {
+                                let form = heap.car(body);
+                                let expanded = self.expand_all(form, macros, heap, syms);
+                                if heap.is_pair(expanded) {
+                                    let fhead = heap.car(expanded);
+                                    if heap.is_symbol(fhead) {
+                                        if let Some(fname) = syms.symbol_name(fhead) {
+                                            if fname == "define" {
+                                                self.process_define(expanded, heap, syms);
+                                                body = heap.cdr(body);
+                                                continue;
+                                            }
+                                            if fname == "define-record-type" {
+                                                self.process_record_type(expanded, heap, syms);
+                                                body = heap.cdr(body);
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                                // Non-define forms in library body (unusual but legal)
+                                self.main_exprs.push(expanded);
+                                body = heap.cdr(body);
+                            }
+                        }
+                        _ => {} // import, cond-expand, etc. — ignored
+                    }
+                }
+            }
+            d = heap.cdr(d);
+        }
+
+        self.libraries.push(Library { name: lib_name, exports });
+    }
+
     // ── TCO helpers ────────────────────────────────────────────────
 
     /// Check if an expression contains a self-tail-call to `fn_name`.
@@ -283,9 +455,15 @@ impl Compiler {
 
     // ── Closure support helpers ────────────────────────────────────
 
-    /// Check if a name is a known top-level function.
+    /// Check if a name is a known top-level function (including record type functions).
     fn is_known_function(&self, name: &str) -> bool {
         self.functions.iter().any(|(n, _, _)| n == name)
+            || self.record_types.iter().any(|rt| {
+                rt.constructor_name == name
+                    || rt.predicate_name == name
+                    || rt.accessors.iter().any(|(_, n)| n == name)
+                    || rt.mutators.iter().any(|(_, n)| n == name)
+            })
     }
 
     /// Get the closure ID for a known top-level function, if any.
@@ -305,7 +483,9 @@ impl Compiler {
             "list-ref" | "list-tail" | "list" | "map" | "for-each" |
             "display" | "newline" | "write" | "write-char" | "apply" | "error" |
             "if" | "let" | "let*" | "letrec" | "begin" | "cond" | "case" |
-            "and" | "or" | "do" | "define" | "set!" | "lambda" | "quote" |
+            "and" | "or" | "do" | "define" | "define-record-type" |
+            "define-library" | "import" | "export" | "set!" |
+            "lambda" | "case-lambda" | "quote" |
             "quasiquote" | "unquote" | "unquote-splicing" | "else" |
             "dot" | "tau" | "type-valid?" | "strict-mode" | "permissive-mode" |
             "exact?" | "inexact?" | "char?" | "string?" | "vector?" | "symbol?" |
@@ -321,6 +501,9 @@ impl Compiler {
             "string=?" | "string<?" | "string>?" | "string<=?" | "string>=?" |
             "string-set!" | "substring" |
             "call-with-current-continuation" | "force" | "lcm" |
+            "values" | "call-with-values" |
+            "raise" | "error-object?" | "error-object-message" | "error-object-irritants" |
+            "guard" | "with-exception-handler" |
             // Algebra constants (global Val consts in generated code)
             "TOP" | "BOT" | "Q" | "E" | "CAR" | "CDR" | "CONS" | "RHO" |
             "APPLY" | "CC" | "TAU" | "Y" |
@@ -367,6 +550,25 @@ impl Compiler {
                         p = heap.cdr(p);
                     }
                     self.walk_free_vars_list(body_exprs, heap, syms, &new_bound, fv, seen);
+                }
+                "case-lambda" => {
+                    // Walk free vars in each clause: ((params...) body...)
+                    let mut clauses = rest;
+                    while heap.is_pair(clauses) {
+                        let clause = heap.car(clauses);
+                        let params_list = heap.car(clause);
+                        let body_exprs = heap.cdr(clause);
+                        let mut new_bound = bound.clone();
+                        let mut p = params_list;
+                        while heap.is_pair(p) {
+                            if let Some(pname) = syms.symbol_name(heap.car(p)) {
+                                new_bound.insert(pname.to_string());
+                            }
+                            p = heap.cdr(p);
+                        }
+                        self.walk_free_vars_list(body_exprs, heap, syms, &new_bound, fv, seen);
+                        clauses = heap.cdr(clauses);
+                    }
                 }
                 "let" => {
                     let first = heap.car(rest);
@@ -514,6 +716,74 @@ impl Compiler {
             params,
             free_vars: fvs.clone(),
             body_list,
+            case_clauses: None,
+        });
+
+        // Emit closure creation
+        if fvs.is_empty() {
+            format!("make_closure({id}, Val::NIL)")
+        } else {
+            let mut env = "Val::NIL".to_string();
+            for fv in fvs.iter().rev() {
+                let rv = rust_ident(fv);
+                env = format!("cons({rv}, {env})");
+            }
+            format!("make_closure({id}, {env})")
+        }
+    }
+
+    /// Handle a case-lambda expression — lift it and return make_closure code.
+    fn compile_case_lambda(&self, rest: Val, heap: &Heap, syms: &SymbolTable) -> String {
+        // Collect all clauses: ((params...) body...)
+        let mut clauses = Vec::new();
+        let mut c = rest;
+        while heap.is_pair(c) {
+            let clause = heap.car(c);
+            let params_list = heap.car(clause);
+            let body_list = heap.cdr(clause);
+            let mut params = Vec::new();
+            let mut p = params_list;
+            while heap.is_pair(p) {
+                if let Some(pname) = syms.symbol_name(heap.car(p)) {
+                    params.push(pname.to_string());
+                }
+                p = heap.cdr(p);
+            }
+            clauses.push(CaseClause { params, body_list });
+            c = heap.cdr(c);
+        }
+
+        // Collect free vars across all clauses
+        let mut all_bound = HashSet::new();
+        for clause in &clauses {
+            for p in &clause.params {
+                all_bound.insert(p.clone());
+            }
+        }
+        // Collect free vars relative to each clause's params
+        let mut fv = Vec::new();
+        let mut seen = HashSet::new();
+        for clause in &clauses {
+            let clause_bound: HashSet<String> = clause.params.iter().cloned().collect();
+            self.walk_free_vars_list(clause.body_list, heap, syms, &clause_bound, &mut fv, &mut seen);
+        }
+        // Filter out builtins and known functions
+        let fvs: Vec<String> = fv.into_iter().collect();
+
+        // Assign ID
+        let id = self.next_lambda_id.get();
+        self.next_lambda_id.set(id + 1);
+
+        // Use first clause's params as the nominal params (for dispatch table arity)
+        let nominal_params = if clauses.is_empty() { vec![] } else { clauses[0].params.clone() };
+
+        // Store lifted lambda with case_clauses
+        self.lifted.borrow_mut().push(LiftedLambda {
+            id,
+            params: nominal_params,
+            free_vars: fvs.clone(),
+            body_list: Val::NIL, // not used for case-lambda
+            case_clauses: Some(clauses),
         });
 
         // Emit closure creation
@@ -537,19 +807,10 @@ impl Compiler {
         fv
     }
 
-    /// Emit a lifted lambda function definition.
-    fn emit_lifted_lambda(&self, lambda: &LiftedLambda, heap: &Heap, syms: &SymbolTable) -> String {
-        let lname = format!("__lambda_{}", lambda.id);
-        let mut rparams = vec!["__env: Val".to_string()];
-        for p in &lambda.params {
-            rparams.push(format!("{}: Val", rust_ident(p)));
-        }
-        let params_str = rparams.join(", ");
-
-        let mut out = format!("fn {lname}({params_str}) -> Val {{\n");
-
-        // Extract free vars from env
-        for (i, fv) in lambda.free_vars.iter().enumerate() {
+    /// Emit free variable extraction code from __env.
+    fn emit_env_extraction(free_vars: &[String]) -> String {
+        let mut out = String::new();
+        for (i, fv) in free_vars.iter().enumerate() {
             let rv = rust_ident(fv);
             let access = if i == 0 {
                 "car(__env)".to_string()
@@ -562,6 +823,42 @@ impl Compiler {
             };
             out.push_str(&format!("    let {rv} = {access};\n"));
         }
+        out
+    }
+
+    /// Emit a lifted lambda function definition.
+    fn emit_lifted_lambda(&self, lambda: &LiftedLambda, heap: &Heap, syms: &SymbolTable) -> String {
+        let lname = format!("__lambda_{}", lambda.id);
+
+        // Case-lambda: takes args as a slice, dispatches on count
+        if let Some(ref clauses) = lambda.case_clauses {
+            let mut out = format!("fn {lname}(__env: Val, args: &[Val]) -> Val {{\n");
+            out.push_str(&Self::emit_env_extraction(&lambda.free_vars));
+            out.push_str("    match args.len() {\n");
+            for clause in clauses {
+                let arity = clause.params.len();
+                out.push_str(&format!("        {arity} => {{\n"));
+                for (i, p) in clause.params.iter().enumerate() {
+                    out.push_str(&format!("            let {} = args[{i}];\n", rust_ident(p)));
+                }
+                out.push_str(&self.emit_begin(clause.body_list, heap, syms, 3));
+                out.push_str("        }\n");
+            }
+            out.push_str("        _ => Val::NIL,\n");
+            out.push_str("    }\n");
+            out.push_str("}\n\n");
+            return out;
+        }
+
+        // Regular lambda
+        let mut rparams = vec!["__env: Val".to_string()];
+        for p in &lambda.params {
+            rparams.push(format!("{}: Val", rust_ident(p)));
+        }
+        let params_str = rparams.join(", ");
+
+        let mut out = format!("fn {lname}({params_str}) -> Val {{\n");
+        out.push_str(&Self::emit_env_extraction(&lambda.free_vars));
 
         // Emit body
         out.push_str(&self.emit_begin(lambda.body_list, heap, syms, 1));
@@ -590,12 +887,17 @@ impl Compiler {
         // Lifted lambdas (IDs N..)
         for lambda in self.lifted.borrow().iter() {
             let lname = format!("__lambda_{}", lambda.id);
-            let mut args = vec!["__env".to_string()];
-            for j in 0..lambda.params.len() {
-                args.push(format!("args[{j}]"));
+            if lambda.case_clauses.is_some() {
+                // Case-lambda: pass args slice directly
+                out.push_str(&format!("        {} => {lname}(__env, args),\n", lambda.id));
+            } else {
+                let mut args = vec!["__env".to_string()];
+                for j in 0..lambda.params.len() {
+                    args.push(format!("args[{j}]"));
+                }
+                let args_str = args.join(", ");
+                out.push_str(&format!("        {} => {lname}({args_str}),\n", lambda.id));
             }
-            let args_str = args.join(", ");
-            out.push_str(&format!("        {} => {lname}({args_str}),\n", lambda.id));
         }
 
         out.push_str("        _ => Val::NIL,\n");
@@ -625,6 +927,9 @@ impl Compiler {
         out.push_str(&format!("const TAG_CLS: u8 = {};\n", table::T_CLS));
         out.push_str(&format!("const TAG_STR: u8 = {};\n", table::T_STR));
         out.push_str(&format!("const TAG_CHAR: u8 = {};\n", table::T_CHAR));
+        out.push_str(&format!("const TAG_VALUES: u8 = {};\n", table::T_VALUES));
+        out.push_str(&format!("const TAG_ERROR: u8 = {};\n", table::T_ERROR));
+        out.push_str(&format!("const TAG_RECORD: u8 = {};\n", table::T_RECORD));
         out.push_str("\n");
 
         // Inline the table data
@@ -696,6 +1001,46 @@ impl Compiler {
             }
         }
 
+        // Emit record type functions (constructors, predicates, accessors, mutators)
+        let mut record_code = String::new();
+        for rt in &self.record_types {
+            let _n_fields = rt.constructor_fields.len();
+            // Constructor
+            let cname = rust_ident(&rt.constructor_name);
+            let cparams: Vec<String> = rt.constructor_fields.iter()
+                .map(|f| format!("{}: Val", rust_ident(f)))
+                .collect();
+            record_code.push_str(&format!("fn {cname}({}) -> Val {{\n", cparams.join(", ")));
+            let mut fields = "Val::NIL".to_string();
+            for f in rt.constructor_fields.iter().rev() {
+                fields = format!("cons({}, {fields})", rust_ident(f));
+            }
+            record_code.push_str(&format!("    make_record({}, {fields})\n", rt.type_id));
+            record_code.push_str("}\n\n");
+
+            // Predicate
+            let pname = rust_ident(&rt.predicate_name);
+            record_code.push_str(&format!("fn {pname}(v: Val) -> Val {{\n"));
+            record_code.push_str(&format!("    bool_to_val(is_record_type(v, {}))\n", rt.type_id));
+            record_code.push_str("}\n\n");
+
+            // Accessors
+            for (idx, accessor_name) in &rt.accessors {
+                let aname = rust_ident(accessor_name);
+                record_code.push_str(&format!("fn {aname}(v: Val) -> Val {{\n"));
+                record_code.push_str(&format!("    record_ref(v, {idx})\n"));
+                record_code.push_str("}\n\n");
+            }
+
+            // Mutators
+            for (idx, mutator_name) in &rt.mutators {
+                let mname = rust_ident(mutator_name);
+                record_code.push_str(&format!("fn {mname}(v: Val, new_val: Val) -> Val {{\n"));
+                record_code.push_str(&format!("    record_set(v, {idx}, new_val); Val::NIL\n"));
+                record_code.push_str("}\n\n");
+            }
+        }
+
         // Collect global + main code (may also lift lambdas)
         let mut globals_code = String::new();
         for (name, init) in &self.globals {
@@ -729,6 +1074,9 @@ impl Compiler {
 
         // Top-level Scheme functions
         out.push_str(&func_code);
+
+        // Record type functions
+        out.push_str(&record_code);
 
         // Lifted lambda functions
         out.push_str(&lifted_code);
@@ -1413,14 +1761,232 @@ impl Compiler {
                     let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
                     return format!("bool_to_val(CAYLEY[{a}.as_fixnum().unwrap() as usize][{b}.as_fixnum().unwrap() as usize] != TAG_BOT)");
                 }
+                // ── R7RS: values / call-with-values ────
+                "values" => {
+                    let mut args = Vec::new();
+                    let mut r = rest;
+                    while heap.is_pair(r) {
+                        args.push(self.emit_expr_inline(heap.car(r), heap, syms));
+                        r = heap.cdr(r);
+                    }
+                    if args.len() == 1 {
+                        return args[0].clone(); // single value = just the value
+                    }
+                    let count = args.len();
+                    let mut list = "Val::NIL".to_string();
+                    for a in args.iter().rev() {
+                        list = format!("cons({a}, {list})");
+                    }
+                    return format!("make_values({list}, {count})");
+                }
+                "call-with-values" => {
+                    let producer = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let consumer = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("call_with_values({producer}, {consumer})");
+                }
+                // ── R7RS: error / raise ──────────────
+                "error" => {
+                    let msg = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let mut irritants = Vec::new();
+                    let mut r = heap.cdr(rest);
+                    while heap.is_pair(r) {
+                        irritants.push(self.emit_expr_inline(heap.car(r), heap, syms));
+                        r = heap.cdr(r);
+                    }
+                    let mut irr_list = "Val::NIL".to_string();
+                    for i in irritants.iter().rev() {
+                        irr_list = format!("cons({i}, {irr_list})");
+                    }
+                    return format!("scheme_raise(make_error({msg}, {irr_list}))");
+                }
+                "raise" => {
+                    let obj = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("scheme_raise({obj})");
+                }
+                "error-object?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val(is_error_object({a}))");
+                }
+                "error-object-message" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("car({a})");
+                }
+                "error-object-irritants" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("cdr({a})");
+                }
+                "with-exception-handler" => {
+                    let handler = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let thunk = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("with_exception_handler({handler}, {thunk})");
+                }
+                "guard" => {
+                    // (guard (var (test expr) ...) body ...)
+                    let var_clauses = heap.car(rest);
+                    let body = heap.cdr(rest);
+                    let var = heap.car(var_clauses);
+                    let clauses = heap.cdr(var_clauses);
+                    let vname = syms.symbol_name(var).unwrap_or("_");
+                    let rv = rust_ident(vname);
+
+                    // Emit: match scheme_guard(|| { body }) { Ok(v) => v, Err(e) => { cond... } }
+                    let mut body_parts = Vec::new();
+                    let mut b = body;
+                    while heap.is_pair(b) {
+                        body_parts.push(self.emit_expr_inline(heap.car(b), heap, syms));
+                        b = heap.cdr(b);
+                    }
+                    let body_code = if body_parts.len() == 1 {
+                        body_parts[0].clone()
+                    } else {
+                        let last = body_parts.pop().unwrap();
+                        let stmts = body_parts.iter().map(|p| format!("{p};")).collect::<Vec<_>>().join(" ");
+                        format!("{{ {stmts} {last} }}")
+                    };
+
+                    let mut out = format!("match scheme_guard(|| {{ {body_code} }}) {{ Ok(__v) => __v, Err({rv}) => {{ ");
+                    // Emit cond clauses
+                    let mut first = true;
+                    let mut c = clauses;
+                    while heap.is_pair(c) {
+                        let clause = heap.car(c);
+                        let test = heap.car(clause);
+                        let clause_body = heap.cdr(clause);
+                        if heap.is_symbol(test) && syms.sym_eq(test, "else") {
+                            if !first { out.push_str(" else { "); }
+                            let mut parts = Vec::new();
+                            let mut r = clause_body;
+                            while heap.is_pair(r) {
+                                parts.push(self.emit_expr_inline(heap.car(r), heap, syms));
+                                r = heap.cdr(r);
+                            }
+                            if let Some(last) = parts.pop() {
+                                for p in &parts { out.push_str(&format!("{p}; ")); }
+                                out.push_str(&last);
+                            }
+                            if !first { out.push_str(" }"); }
+                        } else {
+                            let test_code = self.emit_expr_inline(test, heap, syms);
+                            if first {
+                                out.push_str(&format!("if is_true({test_code}) {{ "));
+                            } else {
+                                out.push_str(&format!(" else if is_true({test_code}) {{ "));
+                            }
+                            let mut parts = Vec::new();
+                            let mut r = clause_body;
+                            while heap.is_pair(r) {
+                                parts.push(self.emit_expr_inline(heap.car(r), heap, syms));
+                                r = heap.cdr(r);
+                            }
+                            if let Some(last) = parts.pop() {
+                                for p in &parts { out.push_str(&format!("{p}; ")); }
+                                out.push_str(&last);
+                            }
+                            out.push_str(" }");
+                        }
+                        first = false;
+                        c = heap.cdr(c);
+                    }
+                    if !first {
+                        // Add else branch that re-raises if no clause matched
+                        out.push_str(&format!(" else {{ scheme_raise({rv}) }}"));
+                    }
+                    out.push_str(" } }");
+                    return out;
+                }
                 "strict-mode" => {
                     return "Val::NIL".to_string();
                 }
                 "permissive-mode" => {
                     return "Val::NIL".to_string();
                 }
+                "begin" => {
+                    let mut parts = Vec::new();
+                    let mut r = rest;
+                    while heap.is_pair(r) {
+                        parts.push(self.emit_expr_inline(heap.car(r), heap, syms));
+                        r = heap.cdr(r);
+                    }
+                    if parts.is_empty() { return "Val::NIL".to_string(); }
+                    if parts.len() == 1 { return parts[0].clone(); }
+                    let last = parts.pop().unwrap();
+                    let stmts = parts.iter().map(|p| format!("{p};")).collect::<Vec<_>>().join(" ");
+                    return format!("{{ {stmts} {last} }}");
+                }
+                "let" | "let*" => {
+                    let first = heap.car(rest);
+                    if name == "let" && heap.is_symbol(first) {
+                        // Named let — wrap emit_expr output as block
+                        let code = self.emit_expr(expr, heap, syms, 0);
+                        return format!("{{ {} }}", code.trim());
+                    }
+                    let bindings = first;
+                    let body = heap.cdr(rest);
+                    let mut out = "{ ".to_string();
+                    let mut b = bindings;
+                    while heap.is_pair(b) {
+                        let binding = heap.car(b);
+                        let var = heap.car(binding);
+                        let init = heap.car(heap.cdr(binding));
+                        let vname = syms.symbol_name(var).unwrap_or("_");
+                        let init_code = self.emit_expr_inline(init, heap, syms);
+                        let mutk = if self.is_set_target(vname) { "mut " } else { "" };
+                        out.push_str(&format!("let {mutk}{} = {init_code}; ", rust_ident(vname)));
+                        b = heap.cdr(b);
+                    }
+                    let mut parts = Vec::new();
+                    let mut r = body;
+                    while heap.is_pair(r) {
+                        parts.push(self.emit_expr_inline(heap.car(r), heap, syms));
+                        r = heap.cdr(r);
+                    }
+                    if let Some(last) = parts.pop() {
+                        for p in &parts { out.push_str(&format!("{p}; ")); }
+                        out.push_str(&last);
+                    }
+                    out.push_str(" }");
+                    return out;
+                }
+                "letrec" => {
+                    let bindings = heap.car(rest);
+                    let body = heap.cdr(rest);
+                    let mut out = "{ ".to_string();
+                    let mut b = bindings;
+                    while heap.is_pair(b) {
+                        let binding = heap.car(b);
+                        let var = heap.car(binding);
+                        let vname = syms.symbol_name(var).unwrap_or("_");
+                        out.push_str(&format!("let mut {} = Val::NIL; ", rust_ident(vname)));
+                        b = heap.cdr(b);
+                    }
+                    b = bindings;
+                    while heap.is_pair(b) {
+                        let binding = heap.car(b);
+                        let var = heap.car(binding);
+                        let init = heap.car(heap.cdr(binding));
+                        let vname = syms.symbol_name(var).unwrap_or("_");
+                        let init_code = self.emit_expr_inline(init, heap, syms);
+                        out.push_str(&format!("{} = {init_code}; ", rust_ident(vname)));
+                        b = heap.cdr(b);
+                    }
+                    let mut parts = Vec::new();
+                    let mut r = body;
+                    while heap.is_pair(r) {
+                        parts.push(self.emit_expr_inline(heap.car(r), heap, syms));
+                        r = heap.cdr(r);
+                    }
+                    if let Some(last) = parts.pop() {
+                        for p in &parts { out.push_str(&format!("{p}; ")); }
+                        out.push_str(&last);
+                    }
+                    out.push_str(" }");
+                    return out;
+                }
                 "lambda" => {
                     return self.compile_lambda(rest, heap, syms);
+                }
+                "case-lambda" => {
+                    return self.compile_case_lambda(rest, heap, syms);
                 }
                 _ => {
                     let fname = rust_ident(name);
@@ -2085,6 +2651,135 @@ fn apply_val(f: Val, args_list: Val) -> Val {
         l = cdr(l);
     }
     call_val(f, &args)
+}
+
+// ── Records ─────────────────────────────────────────────────────
+
+fn make_record(type_id: i64, fields: Val) -> Val {
+    unsafe {
+        let idx = HEAP.len();
+        HEAP.push(Rib { car: Val::fixnum(type_id), cdr: fields, tag: TAG_RECORD });
+        Val::rib(idx)
+    }
+}
+
+fn is_record_type(v: Val, type_id: i64) -> bool {
+    !v.is_fixnum() && v != Val::NIL &&
+    unsafe { HEAP[v.as_rib()].tag == TAG_RECORD && HEAP[v.as_rib()].car == Val::fixnum(type_id) }
+}
+
+fn record_ref(v: Val, idx: usize) -> Val {
+    let mut fields = cdr(v); // fields list
+    for _ in 0..idx { fields = cdr(fields); }
+    car(fields)
+}
+
+fn record_set(v: Val, idx: usize, new_val: Val) {
+    let mut fields = cdr(v);
+    for _ in 0..idx { fields = cdr(fields); }
+    set_car(fields, new_val);
+}
+
+// ── Multiple values ─────────────────────────────────────────────
+
+fn make_values(list: Val, count: i64) -> Val {
+    unsafe {
+        let idx = HEAP.len();
+        HEAP.push(Rib { car: list, cdr: Val::fixnum(count), tag: TAG_VALUES });
+        Val::rib(idx)
+    }
+}
+
+fn is_values(v: Val) -> bool {
+    !v.is_fixnum() && v != Val::NIL && unsafe { HEAP[v.as_rib()].tag == TAG_VALUES }
+}
+
+fn call_with_values(producer: Val, consumer: Val) -> Val {
+    let v = call_val(producer, &[]);
+    if is_values(v) {
+        apply_val(consumer, car(v))
+    } else {
+        call_val(consumer, &[v])
+    }
+}
+
+// ── Error objects ───────────────────────────────────────────────
+
+fn make_error(msg: Val, irritants: Val) -> Val {
+    unsafe {
+        let idx = HEAP.len();
+        HEAP.push(Rib { car: msg, cdr: irritants, tag: TAG_ERROR });
+        Val::rib(idx)
+    }
+}
+
+fn is_error_object(v: Val) -> bool {
+    !v.is_fixnum() && v != Val::NIL && unsafe { HEAP[v.as_rib()].tag == TAG_ERROR }
+}
+
+fn scheme_raise(v: Val) -> Val {
+    std::panic::resume_unwind(Box::new(v.0));
+}
+
+fn scheme_raise_default(v: Val) {
+    // Default handler: display and exit
+    if is_error_object(v) {
+        eprint!("Error: ");
+        display_to(car(v), &mut std::io::stderr().lock());
+        let mut irritants = cdr(v);
+        while irritants != Val::NIL && !irritants.is_fixnum() {
+            eprint!(" ");
+            display_to(car(irritants), &mut std::io::stderr().lock());
+            irritants = cdr(irritants);
+        }
+        eprintln!();
+    } else {
+        eprint!("Error: ");
+        display_to(v, &mut std::io::stderr().lock());
+        eprintln!();
+    }
+    std::process::exit(1);
+}
+
+fn scheme_guard<F: FnOnce() -> Val>(body: F) -> Result<Val, Val> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(v) => Ok(v),
+        Err(payload) => {
+            if let Some(&raw) = payload.downcast_ref::<i64>() {
+                Err(Val(raw))
+            } else {
+                // Not a Scheme exception — re-panic
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+}
+
+fn with_exception_handler(handler: Val, thunk: Val) -> Val {
+    match scheme_guard(|| call_val(thunk, &[])) {
+        Ok(v) => v,
+        Err(e) => call_val(handler, &[e]),
+    }
+}
+
+fn display_to(v: Val, w: &mut dyn std::io::Write) {
+    if v == Val::NIL { let _ = write!(w, "()"); }
+    else if let Some(n) = v.as_fixnum() { let _ = write!(w, "{n}"); }
+    else {
+        unsafe {
+            let rib = &HEAP[v.as_rib()];
+            if rib.tag == TAG_STR {
+                let mut chars = rib.car;
+                while chars != Val::NIL && !chars.is_fixnum() {
+                    let cp = HEAP[chars.as_rib()].car.as_fixnum().unwrap_or(0);
+                    let _ = write!(w, "{}", cp as u8 as char);
+                    chars = HEAP[chars.as_rib()].cdr;
+                }
+            } else {
+                let _ = write!(w, "<object>");
+            }
+        }
+    }
 }
 "#;
 
