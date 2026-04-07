@@ -95,6 +95,8 @@ pub struct Compiler {
     builtin_closures: RefCell<HashMap<String, usize>>,
     /// Parameters of the currently-emitting function (to avoid direct-call for shadowed names)
     current_params: RefCell<HashSet<String>>,
+    /// GC mode for the compiled output
+    gc_mode: GcMode,
 }
 
 impl Compiler {
@@ -111,6 +113,7 @@ impl Compiler {
             libraries: Vec::new(),
             builtin_closures: RefCell::new(HashMap::new()),
             current_params: RefCell::new(HashSet::new()),
+            gc_mode: GcMode::None,
         }
     }
 
@@ -1227,7 +1230,10 @@ impl Compiler {
         out.push_str(";\n\n");
 
         // Value type and heap
-        out.push_str(RUNTIME_PRELUDE);
+        match self.gc_mode {
+            GcMode::None => out.push_str(RUNTIME_PRELUDE),
+            GcMode::Cheney => out.push_str(RUNTIME_CHENEY),
+        }
         out.push_str("\n");
 
         // Algebra element constants (Val) — accessible from compiled Scheme code
@@ -3084,12 +3090,17 @@ fn heap_init() {
 }
 
 #[inline]
-fn cons(car: Val, cdr: Val) -> Val {
+fn alloc_rib(car: Val, cdr: Val, tag: u8) -> Val {
     unsafe {
         let idx = HEAP.len();
-        HEAP.push(Rib { car, cdr, tag: TAG_PAIR });
+        HEAP.push(Rib { car, cdr, tag });
         Val::rib(idx)
     }
+}
+
+#[inline]
+fn cons(car: Val, cdr: Val) -> Val {
+    alloc_rib(car, cdr, TAG_PAIR)
 }
 
 #[inline(always)]
@@ -3144,19 +3155,11 @@ fn tau(v: Val) -> Val {
 // ── String / char support ────────────────────────────────────────
 
 fn make_string(chars: Val, len: Val) -> Val {
-    unsafe {
-        let idx = HEAP.len();
-        HEAP.push(Rib { car: chars, cdr: len, tag: TAG_STR });
-        Val::rib(idx)
-    }
+    alloc_rib(chars, len, TAG_STR)
 }
 
 fn make_char(codepoint: i64) -> Val {
-    unsafe {
-        let idx = HEAP.len();
-        HEAP.push(Rib { car: Val::fixnum(codepoint), cdr: Val::NIL, tag: TAG_CHAR });
-        Val::rib(idx)
-    }
+    alloc_rib(Val::fixnum(codepoint), Val::NIL, TAG_CHAR)
 }
 
 fn is_string(v: Val) -> bool {
@@ -3372,11 +3375,7 @@ fn display(v: Val) {
 // ── Closure support ──────────────────────────────────────────────
 
 fn make_closure(code_id: i64, env: Val) -> Val {
-    unsafe {
-        let idx = HEAP.len();
-        HEAP.push(Rib { car: Val::fixnum(code_id), cdr: env, tag: TAG_CLS });
-        Val::rib(idx)
-    }
+    alloc_rib(Val::fixnum(code_id), env, TAG_CLS)
 }
 
 fn call_val(f: Val, args: &[Val]) -> Val {
@@ -3410,11 +3409,7 @@ fn apply_val(f: Val, args_list: Val) -> Val {
 // ── Records ─────────────────────────────────────────────────────
 
 fn make_record(type_id: i64, fields: Val) -> Val {
-    unsafe {
-        let idx = HEAP.len();
-        HEAP.push(Rib { car: Val::fixnum(type_id), cdr: fields, tag: TAG_RECORD });
-        Val::rib(idx)
-    }
+    alloc_rib(Val::fixnum(type_id), fields, TAG_RECORD)
 }
 
 fn is_record_type(v: Val, type_id: i64) -> bool {
@@ -3437,11 +3432,7 @@ fn record_set(v: Val, idx: usize, new_val: Val) {
 // ── Multiple values ─────────────────────────────────────────────
 
 fn make_values(list: Val, count: i64) -> Val {
-    unsafe {
-        let idx = HEAP.len();
-        HEAP.push(Rib { car: list, cdr: Val::fixnum(count), tag: TAG_VALUES });
-        Val::rib(idx)
-    }
+    alloc_rib(list, Val::fixnum(count), TAG_VALUES)
 }
 
 fn is_values(v: Val) -> bool {
@@ -3460,11 +3451,7 @@ fn call_with_values(producer: Val, consumer: Val) -> Val {
 // ── Error objects ───────────────────────────────────────────────
 
 fn make_error(msg: Val, irritants: Val) -> Val {
-    unsafe {
-        let idx = HEAP.len();
-        HEAP.push(Rib { car: msg, cdr: irritants, tag: TAG_ERROR });
-        Val::rib(idx)
-    }
+    alloc_rib(msg, irritants, TAG_ERROR)
 }
 
 fn is_error_object(v: Val) -> bool {
@@ -3526,11 +3513,7 @@ struct ContinuationPayload {
 static mut NEXT_CONT_ID: u64 = 0;
 
 fn make_continuation(cont_id: u64) -> Val {
-    unsafe {
-        let idx = HEAP.len();
-        HEAP.push(Rib { car: Val::fixnum(cont_id as i64), cdr: Val::NIL, tag: TAG_CONT });
-        Val::rib(idx)
-    }
+    alloc_rib(Val::fixnum(cont_id as i64), Val::NIL, TAG_CONT)
 }
 
 fn call_with_current_continuation(proc: Val) -> Val {
@@ -3700,11 +3683,7 @@ fn scheme_write(v: Val) {
 fn make_vector_fill(n: i64, fill: Val) -> Val {
     let mut elems = Val::NIL;
     for _ in 0..n { elems = cons(fill, elems); }
-    unsafe {
-        let idx = HEAP.len();
-        HEAP.push(Rib { car: elems, cdr: Val::fixnum(n), tag: TAG_VEC });
-        Val::rib(idx)
-    }
+    alloc_rib(elems, Val::fixnum(n), TAG_VEC)
 }
 
 fn is_vector(v: Val) -> bool {
@@ -3741,11 +3720,7 @@ enum PortInner {
 static mut PORTS: Vec<PortInner> = Vec::new();
 
 fn make_port(port_id: i64, direction: i64) -> Val {
-    unsafe {
-        let idx = HEAP.len();
-        HEAP.push(Rib { car: Val::fixnum(port_id), cdr: Val::fixnum(direction), tag: TAG_PORT });
-        Val::rib(idx)
-    }
+    alloc_rib(Val::fixnum(port_id), Val::fixnum(direction), TAG_PORT)
 }
 
 fn is_port(v: Val) -> bool {
@@ -4127,13 +4102,31 @@ fn skip_atom_tail(r: &mut dyn std::io::BufRead) {
 }
 "#;
 
-/// Compile a Scheme source string to a Rust program string.
+/// Cheney semi-space GC runtime (TODO: implement).
+const RUNTIME_CHENEY: &str = RUNTIME_PRELUDE; // placeholder — same as no-GC for now
+
+/// GC mode for compiled output.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GcMode {
+    /// Grow-only heap, no garbage collection (default).
+    None,
+    /// Semi-space Cheney copying collector.
+    Cheney,
+}
+
+/// Compile a Scheme source string to a Rust program string (no GC).
 pub fn compile(src: &str) -> String {
+    compile_with_options(src, GcMode::None)
+}
+
+/// Compile with explicit GC mode.
+pub fn compile_with_options(src: &str, gc: GcMode) -> String {
     let mut heap = Heap::new();
     let mut syms = SymbolTable::new();
     let exprs = crate::reader::read_all(src, &mut heap, &mut syms)
         .unwrap_or_default();
     let mut compiler = Compiler::new();
+    compiler.gc_mode = gc;
     compiler.process(exprs.as_slice(), &mut heap, &mut syms);
     compiler.emit_rust(&heap, &syms)
 }
