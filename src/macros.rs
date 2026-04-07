@@ -1,7 +1,8 @@
 //! syntax-rules macro expansion.
 //!
-//! Implements R4RS pattern-based hygienic macros (unhygienic first pass).
-//! Used by eval.rs, cps.rs, and compile.rs.
+//! Implements R5RS/R7RS pattern-based macros (unhygienic).
+//! Supports: pattern variables, ellipsis (`...`), literals,
+//! wildcards (`_`), dotted tail patterns (`(a b . rest)`).
 
 use crate::heap::Heap;
 use crate::symbol::SymbolTable;
@@ -218,6 +219,15 @@ fn match_pattern_list(
         form = heap.cdr(form);
     }
 
+    // Dotted tail pattern: (a b . rest) — bind rest to remaining form
+    if heap.is_symbol(pattern) {
+        let name = syms.symbol_name(pattern).unwrap_or("");
+        if name != "_" && !is_ellipsis(pattern, ellipsis) && !is_literal(pattern, literals) {
+            bindings.push((pattern, Binding::One(form)));
+        }
+        return true;
+    }
+
     // Both should be exhausted (or pattern is NIL)
     pattern == Val::NIL && (form == Val::NIL || !heap.is_pair(form))
 }
@@ -246,6 +256,15 @@ fn collect_pattern_vars(
                 collect_pattern_vars(elem, literals, ellipsis, heap, syms, vars);
             }
             p = heap.cdr(p);
+        }
+        // Dotted tail: (a b . rest) — rest is a pattern variable
+        if heap.is_symbol(p) {
+            let name = syms.symbol_name(p).unwrap_or("");
+            if name != "_" && !is_ellipsis(p, ellipsis) && !is_literal(p, literals) {
+                if !vars.contains(&p) {
+                    vars.push(p);
+                }
+            }
         }
     }
 }
@@ -386,6 +405,10 @@ fn collect_template_vars(
             let elem = heap.car(p);
             collect_template_vars(elem, ellipsis, heap, syms, vars);
             p = heap.cdr(p);
+        }
+        // Dotted tail
+        if heap.is_symbol(p) && !is_ellipsis(p, ellipsis) && !vars.contains(&p) {
+            vars.push(p);
         }
     }
 }
