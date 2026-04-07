@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "wispy-scheme"
 version = "0.1.0"
+dependencies = [
+ "wispy-table",
+]
+
+[[package]]
+name = "wispy-table"
+version = "0.1.0"

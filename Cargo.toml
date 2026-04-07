@@ -2,9 +2,12 @@
 name = "wispy-scheme"
 version = "0.1.0"
 edition = "2021"
-description = "R4RS Scheme in 1KB. Rib-based, table-driven, no_std."
+description = "Scheme → Rust AOT compiler with Cayley table type dispatch."
 license = "MIT"
 repository = "https://github.com/stefanopalmieri/WispyScheme"
+
+[dependencies]
+wispy-table = { path = "../wispy-table" }
 
 [features]
 default = ["std"]
