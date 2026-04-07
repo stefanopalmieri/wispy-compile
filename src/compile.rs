@@ -233,7 +233,15 @@ impl Compiler {
                 self.has_self_tail_call_in_begin(rest, fn_name, heap, syms)
             }
             "let" | "let*" | "letrec" => {
-                let body = heap.cdr(rest);
+                // Named let: (let name ((v i) ...) body...)
+                // The body is after the bindings, which is after the name.
+                let first = heap.car(rest);
+                let body = if name == "let" && heap.is_symbol(first) {
+                    // named let — skip name and bindings
+                    heap.cdr(heap.cdr(rest))
+                } else {
+                    heap.cdr(rest)
+                };
                 self.has_self_tail_call_in_begin(body, fn_name, heap, syms)
             }
             "cond" => {
@@ -791,7 +799,55 @@ impl Compiler {
                 }
 
                 "let" => {
-                    let bindings = heap.car(rest);
+                    let first = heap.car(rest);
+                    // Named let: (let loop-name ((var init) ...) body ...)
+                    if heap.is_symbol(first) {
+                        let loop_name = syms.symbol_name(first).unwrap_or("_").to_string();
+                        let bindings = heap.car(heap.cdr(rest));
+                        let body = heap.cdr(heap.cdr(rest));
+
+                        // Collect parameter names and init expressions
+                        let mut param_names: Vec<String> = Vec::new();
+                        let mut init_codes: Vec<String> = Vec::new();
+                        let mut b = bindings;
+                        while heap.is_pair(b) {
+                            let binding = heap.car(b);
+                            let var = heap.car(binding);
+                            let init = heap.car(heap.cdr(binding));
+                            let vname = syms.symbol_name(var).unwrap_or("_").to_string();
+                            init_codes.push(self.emit_expr_inline(init, heap, syms));
+                            param_names.push(vname);
+                            b = heap.cdr(b);
+                        }
+
+                        let mut out = String::new();
+                        out.push_str(&format!("{pad}{{\n"));
+                        // Emit mutable variable declarations
+                        for (i, pname) in param_names.iter().enumerate() {
+                            out.push_str(&format!("{pad}    let mut {} = {};\n",
+                                rust_ident(pname), init_codes[i]));
+                        }
+                        out.push_str(&format!("{pad}    loop {{\n"));
+
+                        // Save previous TCO context and install named-let context
+                        let prev_tco = self.tco.borrow().clone();
+                        *self.tco.borrow_mut() = Some(TcoContext {
+                            fn_name: loop_name,
+                            params: param_names,
+                        });
+
+                        out.push_str(&self.emit_begin(body, heap, syms, indent + 2));
+
+                        // Restore previous TCO context
+                        *self.tco.borrow_mut() = prev_tco;
+
+                        out.push_str(&format!("{pad}    }}\n"));
+                        out.push_str(&format!("{pad}}}\n"));
+                        return out;
+                    }
+
+                    // Regular let: (let ((var init) ...) body ...)
+                    let bindings = first;
                     let body = heap.cdr(rest);
                     let mut out = String::new();
                     out.push_str(&format!("{pad}{{\n"));
