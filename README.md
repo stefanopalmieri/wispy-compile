@@ -99,6 +99,7 @@ cargo check --no-default-features --lib
 - **Futamura P3.** Specialize the transpiler on a known program to produce a residual Rust-emitting program — a compiler generated from an interpreter.
 - **Mutual tail recursion.** Trampoline or CPS transform for mutually recursive tail calls.
 - **Full continuations.** CPS transform for reentrant `call/cc`.
+- **Garbage collection.** Compiled output uses a grow-only heap (no GC). Fine for short-running programs; long-running or allocation-heavy programs will need a collector. wispy-vm already has Stak's semi-space copying GC as a reference.
 
 ## Lineage
 
