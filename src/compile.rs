@@ -238,8 +238,31 @@ impl Compiler {
                 self.body_might_alloc_list(rest, heap, syms)
             }
             // Control flow: recurse
-            "if" | "begin" | "and" | "or" | "cond" | "case" | "set!" => {
+            "if" | "begin" | "and" | "or" | "set!" => {
                 self.body_might_alloc_list(rest, heap, syms)
+            }
+            "cond" => {
+                // Each clause is (test body...). Walk test and body of each.
+                let mut clauses = rest;
+                while heap.is_pair(clauses) {
+                    let clause = heap.car(clauses);
+                    // Check each sub-expression in the clause (test + body exprs)
+                    if self.body_might_alloc_list(clause, heap, syms) { return true; }
+                    clauses = heap.cdr(clauses);
+                }
+                false
+            }
+            "case" => {
+                // (case key ((datum ...) body ...) ...)
+                if self.body_might_alloc(heap.car(rest), heap, syms) { return true; }
+                let mut clauses = heap.cdr(rest);
+                while heap.is_pair(clauses) {
+                    let clause = heap.car(clauses);
+                    // Skip datum list (car), check body expressions (cdr)
+                    if self.body_might_alloc_list(heap.cdr(clause), heap, syms) { return true; }
+                    clauses = heap.cdr(clauses);
+                }
+                false
             }
             "let" | "let*" => {
                 let first = heap.car(rest);
@@ -2037,9 +2060,19 @@ impl Compiler {
                             b = heap.cdr(b);
                         }
 
+                        // Check if the loop body allocates (for GC root elision).
+                        // Register the loop name so self-calls are recognized as non-allocating.
+                        let use_gc_stack = if self.is_cheney() {
+                            self.analysis_loop_names.borrow_mut().insert(loop_name.clone());
+                            let result = self.needs_gc_root_list(
+                                &param_names[0], body, heap, syms);
+                            self.analysis_loop_names.borrow_mut().remove(&loop_name);
+                            result
+                        } else { false };
+
                         let mut out = String::new();
                         out.push_str(&format!("{pad}{{\n"));
-                        if self.is_cheney() {
+                        if use_gc_stack {
                             // Push loop variables onto shadow stack
                             for (i, pname) in param_names.iter().enumerate() {
                                 let slot = self.gc_register(pname);
