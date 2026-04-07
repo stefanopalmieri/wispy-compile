@@ -7,8 +7,10 @@
 ;;;   Projection 2: specialize(interpreter, partial_program) = compiled code
 ;;;   Three-path verification: direct / projection 1 / projection 2 agree
 ;;;
-;;; Requires: ir-lib.scm, specialize.scm (loaded first)
-;;; Run: cargo run -- -e '(load "examples/ir-lib.scm") (load "examples/specialize.scm") (load "examples/futamura.scm")'
+;;; Run: cargo run -- examples/futamura.scm
+
+(load "examples/ir-lib.scm")
+(load "examples/specialize.scm")
 
 (define pass 0)
 (define fail 0)
