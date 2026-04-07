@@ -97,6 +97,11 @@ pub struct Compiler {
     current_params: RefCell<HashSet<String>>,
     /// GC mode for the compiled output
     gc_mode: GcMode,
+    /// In Cheney mode: maps variable names to their GC slot variable names.
+    /// e.g., "x" → "__gs0" means x lives at gc_load(__gs0).
+    gc_slots: RefCell<HashMap<String, String>>,
+    /// Counter for unique GC slot names (reset per function).
+    gc_slot_counter: Cell<usize>,
 }
 
 impl Compiler {
@@ -114,7 +119,80 @@ impl Compiler {
             builtin_closures: RefCell::new(HashMap::new()),
             current_params: RefCell::new(HashSet::new()),
             gc_mode: GcMode::None,
+            gc_slots: RefCell::new(HashMap::new()),
+            gc_slot_counter: Cell::new(0),
         }
+    }
+
+    // ── GC slot helpers (Cheney mode) ───────────────────────────────
+
+    /// Allocate a fresh GC slot variable name like "__gs0", "__gs1", ...
+    fn next_gc_slot(&self) -> String {
+        let n = self.gc_slot_counter.get();
+        self.gc_slot_counter.set(n + 1);
+        format!("__gs{n}")
+    }
+
+    /// In Cheney mode: register a variable → gc slot mapping and return the slot name.
+    fn gc_register(&self, var_name: &str) -> String {
+        let slot = self.next_gc_slot();
+        self.gc_slots.borrow_mut().insert(var_name.to_string(), slot.clone());
+        slot
+    }
+
+    /// In Cheney mode: look up the gc slot for a variable.
+    fn gc_slot_for(&self, var_name: &str) -> Option<String> {
+        self.gc_slots.borrow().get(var_name).cloned()
+    }
+
+    /// Reset gc_slots and counter for a new function scope.
+    fn gc_reset_scope(&self) {
+        self.gc_slots.borrow_mut().clear();
+        self.gc_slot_counter.set(0);
+    }
+
+    /// Check if we're in Cheney GC mode.
+    fn is_cheney(&self) -> bool {
+        self.gc_mode == GcMode::Cheney
+    }
+
+    /// Check if an expression might allocate (conservatively).
+    fn expr_might_alloc(&self, expr: Val, heap: &Heap, syms: &SymbolTable) -> bool {
+        if expr.is_fixnum() || expr == Val::NIL { return false; }
+        if !expr.is_rib() { return false; }
+        let tag = heap.tag(expr);
+        if tag == table::T_SYM { return false; } // variable reference
+        if tag != table::T_PAIR { return false; }
+        let head = heap.car(expr);
+        if !heap.is_symbol(head) { return true; } // generic call
+        let name = syms.symbol_name(head).unwrap_or("");
+        match name {
+            // Non-allocating: arithmetic, comparisons, predicates, accessors
+            "+" | "-" | "*" | "/" | "quotient" | "remainder" | "modulo" |
+            "=" | "<" | ">" | "<=" | ">=" |
+            "zero?" | "positive?" | "negative?" | "even?" | "odd?" |
+            "not" | "eq?" | "eqv?" | "null?" | "pair?" | "number?" | "integer?" |
+            "abs" | "max" | "min" | "expt" | "gcd" | "boolean?" |
+            "exact?" | "inexact?" | "char?" | "string?" | "vector?" |
+            "car" | "cdr" | "char->integer" | "string-length" | "vector-length" |
+            "eof-object?" | "port?" | "input-port?" | "output-port?" |
+            "procedure?" => false,
+            // if/and/or: might, depends on branches (conservatively say yes)
+            _ => true,
+        }
+    }
+
+    /// Emit a variable reference — uses gc_load in Cheney mode when the var is on the shadow stack.
+    fn emit_var_ref(&self, name: &str) -> String {
+        if self.is_cheney() {
+            if let Some(slot) = self.gc_slot_for(name) {
+                return format!("gc_load({slot})");
+            }
+        }
+        if self.is_global(name) {
+            return format!("unsafe {{ {} }}", rust_ident(name));
+        }
+        rust_ident(name)
     }
 
     /// Scan an expression tree and collect all variables that are targets of set!.
@@ -881,8 +959,7 @@ impl Compiler {
         } else {
             let mut env = "Val::NIL".to_string();
             for fv in fvs.iter().rev() {
-                let rv = rust_ident(fv);
-                env = format!("cons({rv}, {env})");
+                env = format!("cons({}, {env})", self.emit_var_ref(fv));
             }
             format!("make_closure({id}, {env})")
         }
@@ -954,8 +1031,7 @@ impl Compiler {
         } else {
             let mut env = "Val::NIL".to_string();
             for fv in fvs.iter().rev() {
-                let rv = rust_ident(fv);
-                env = format!("cons({rv}, {env})");
+                env = format!("cons({}, {env})", self.emit_var_ref(fv));
             }
             format!("make_closure({id}, {env})")
         }
@@ -991,11 +1067,19 @@ impl Compiler {
     /// Emit a lifted lambda function definition.
     fn emit_lifted_lambda(&self, lambda: &LiftedLambda, heap: &Heap, syms: &SymbolTable) -> String {
         let lname = format!("__lambda_{}", lambda.id);
+        // Reset GC scope for this lambda
+        self.gc_reset_scope();
 
         // Case-lambda: takes args as a slice, dispatches on count
         if let Some(ref clauses) = lambda.case_clauses {
             let mut out = format!("fn {lname}(__env: Val, args: &[Val]) -> Val {{\n");
-            out.push_str(&Self::emit_env_extraction(&lambda.free_vars));
+            if self.is_cheney() {
+                out.push_str("    let _gcg = GcGuard(gc_frame());\n");
+                // Push free vars extracted from env
+                self.emit_env_gc_push(&lambda.free_vars, &mut out);
+            } else {
+                out.push_str(&Self::emit_env_extraction(&lambda.free_vars));
+            }
             out.push_str("    match args.len() {\n");
             for clause in clauses {
                 let arity = clause.params.len();
@@ -1004,12 +1088,23 @@ impl Compiler {
                 } else {
                     out.push_str(&format!("        {arity} => {{\n"));
                 }
-                for (i, p) in clause.params.iter().enumerate() {
-                    out.push_str(&format!("            let {} = args[{i}];\n", rust_ident(p)));
-                }
-                if let Some(ref rp) = clause.rest_param {
-                    let rn = rust_ident(rp);
-                    out.push_str(&format!("            let {rn} = {{ let mut __r = Val::NIL; let mut __i = args.len(); while __i > {arity} {{ __i -= 1; __r = cons(args[__i], __r); }} __r }};\n"));
+                if self.is_cheney() {
+                    for (i, p) in clause.params.iter().enumerate() {
+                        let slot = self.gc_register(p);
+                        out.push_str(&format!("            let {slot} = gc_push(args[{i}]);\n"));
+                    }
+                    if let Some(ref rp) = clause.rest_param {
+                        let slot = self.gc_register(rp);
+                        out.push_str(&format!("            let {slot} = gc_push({{ let mut __r = Val::NIL; let mut __i = args.len(); while __i > {arity} {{ __i -= 1; __r = cons(args[__i], __r); }} __r }});\n"));
+                    }
+                } else {
+                    for (i, p) in clause.params.iter().enumerate() {
+                        out.push_str(&format!("            let {} = args[{i}];\n", rust_ident(p)));
+                    }
+                    if let Some(ref rp) = clause.rest_param {
+                        let rn = rust_ident(rp);
+                        out.push_str(&format!("            let {rn} = {{ let mut __r = Val::NIL; let mut __i = args.len(); while __i > {arity} {{ __i -= 1; __r = cons(args[__i], __r); }} __r }};\n"));
+                    }
                 }
                 out.push_str(&self.emit_begin(clause.body_list, heap, syms, 3));
                 out.push_str("        }\n");
@@ -1023,13 +1118,26 @@ impl Compiler {
         // Variadic lambda: takes args as a slice
         if lambda.rest_param.is_some() {
             let mut out = format!("fn {lname}(__env: Val, args: &[Val]) -> Val {{\n");
-            out.push_str(&Self::emit_env_extraction(&lambda.free_vars));
-            for (i, p) in lambda.params.iter().enumerate() {
-                out.push_str(&format!("    let {} = args[{i}];\n", rust_ident(p)));
+            if self.is_cheney() {
+                out.push_str("    let _gcg = GcGuard(gc_frame());\n");
+                self.emit_env_gc_push(&lambda.free_vars, &mut out);
+                for (i, p) in lambda.params.iter().enumerate() {
+                    let slot = self.gc_register(p);
+                    out.push_str(&format!("    let {slot} = gc_push(args[{i}]);\n"));
+                }
+                let rp_name = lambda.rest_param.as_ref().unwrap();
+                let n_fixed = lambda.params.len();
+                let slot = self.gc_register(rp_name);
+                out.push_str(&format!("    let {slot} = gc_push({{ let mut __r = Val::NIL; let mut __i = args.len(); while __i > {n_fixed} {{ __i -= 1; __r = cons(args[__i], __r); }} __r }});\n"));
+            } else {
+                out.push_str(&Self::emit_env_extraction(&lambda.free_vars));
+                for (i, p) in lambda.params.iter().enumerate() {
+                    out.push_str(&format!("    let {} = args[{i}];\n", rust_ident(p)));
+                }
+                let rest_name = rust_ident(lambda.rest_param.as_ref().unwrap());
+                let n_fixed = lambda.params.len();
+                out.push_str(&format!("    let {rest_name} = {{ let mut __r = Val::NIL; let mut __i = args.len(); while __i > {n_fixed} {{ __i -= 1; __r = cons(args[__i], __r); }} __r }};\n"));
             }
-            let rest_name = rust_ident(lambda.rest_param.as_ref().unwrap());
-            let n_fixed = lambda.params.len();
-            out.push_str(&format!("    let {rest_name} = {{ let mut __r = Val::NIL; let mut __i = args.len(); while __i > {n_fixed} {{ __i -= 1; __r = cons(args[__i], __r); }} __r }};\n"));
             out.push_str(&self.emit_begin(lambda.body_list, heap, syms, 1));
             out.push_str("}\n\n");
             return out;
@@ -1043,12 +1151,38 @@ impl Compiler {
         let params_str = rparams.join(", ");
 
         let mut out = format!("fn {lname}({params_str}) -> Val {{\n");
-        out.push_str(&Self::emit_env_extraction(&lambda.free_vars));
+        if self.is_cheney() {
+            out.push_str("    let _gcg = GcGuard(gc_frame());\n");
+            self.emit_env_gc_push(&lambda.free_vars, &mut out);
+            for p in &lambda.params {
+                let slot = self.gc_register(p);
+                out.push_str(&format!("    let {slot} = gc_push({});\n", rust_ident(p)));
+            }
+        } else {
+            out.push_str(&Self::emit_env_extraction(&lambda.free_vars));
+        }
 
         // Emit body
         out.push_str(&self.emit_begin(lambda.body_list, heap, syms, 1));
         out.push_str("}\n\n");
         out
+    }
+
+    /// In Cheney mode: extract free vars from __env and push them onto GC shadow stack.
+    fn emit_env_gc_push(&self, free_vars: &[String], out: &mut String) {
+        for (i, fv) in free_vars.iter().enumerate() {
+            let access = if i == 0 {
+                "car(__env)".to_string()
+            } else {
+                let mut s = "__env".to_string();
+                for _ in 0..i {
+                    s = format!("cdr({s})");
+                }
+                format!("car({s})")
+            };
+            let slot = self.gc_register(fv);
+            out.push_str(&format!("    let {slot} = gc_push({access});\n"));
+        }
     }
 
     /// Generate the dispatch_closure function.
@@ -1270,21 +1404,36 @@ impl Compiler {
                 cp.extend(func.params.iter().cloned());
                 if let Some(ref rp) = func.rest_param { cp.insert(rp.clone()); }
             }
+            // Reset GC scope for this function
+            self.gc_reset_scope();
 
             if func.rest_param.is_some() {
                 // Variadic function: takes args slice
                 func_code.push_str(&format!("fn {rname}(args: &[Val]) -> Val {{\n"));
-                // Extract fixed params
-                for (i, p) in func.params.iter().enumerate() {
-                    let rp = rust_ident(p);
-                    let mutk = if self.is_set_target(p) { "mut " } else { "" };
-                    func_code.push_str(&format!("    let {mutk}{rp} = args[{i}];\n"));
+                if self.is_cheney() {
+                    func_code.push_str("    let _gcg = GcGuard(gc_frame());\n");
+                    for (i, p) in func.params.iter().enumerate() {
+                        let slot = self.gc_register(p);
+                        func_code.push_str(&format!("    let {slot} = gc_push(args[{i}]);\n"));
+                    }
+                    // Build rest list, then push
+                    let rp_name = func.rest_param.as_ref().unwrap();
+                    let n_fixed = func.params.len();
+                    let slot = self.gc_register(rp_name);
+                    func_code.push_str(&format!("    let {slot} = gc_push({{ let mut __r = Val::NIL; let mut __i = args.len(); while __i > {n_fixed} {{ __i -= 1; __r = cons(args[__i], __r); }} __r }});\n"));
+                } else {
+                    // Extract fixed params
+                    for (i, p) in func.params.iter().enumerate() {
+                        let rp = rust_ident(p);
+                        let mutk = if self.is_set_target(p) { "mut " } else { "" };
+                        func_code.push_str(&format!("    let {mutk}{rp} = args[{i}];\n"));
+                    }
+                    // Collect rest args into a list
+                    let rest_name = rust_ident(func.rest_param.as_ref().unwrap());
+                    let n_fixed = func.params.len();
+                    let mutk = if self.is_set_target(func.rest_param.as_ref().unwrap()) { "mut " } else { "" };
+                    func_code.push_str(&format!("    let {mutk}{rest_name} = {{ let mut __r = Val::NIL; let mut __i = args.len(); while __i > {n_fixed} {{ __i -= 1; __r = cons(args[__i], __r); }} __r }};\n"));
                 }
-                // Collect rest args into a list
-                let rest_name = rust_ident(func.rest_param.as_ref().unwrap());
-                let n_fixed = func.params.len();
-                let mutk = if self.is_set_target(func.rest_param.as_ref().unwrap()) { "mut " } else { "" };
-                func_code.push_str(&format!("    let {mutk}{rest_name} = {{ let mut __r = Val::NIL; let mut __i = args.len(); while __i > {n_fixed} {{ __i -= 1; __r = cons(args[__i], __r); }} __r }};\n"));
                 let body_code = self.emit_expr(func.body, heap, syms, 1);
                 func_code.push_str(&body_code);
                 func_code.push_str("}\n\n");
@@ -1292,35 +1441,77 @@ impl Compiler {
             let needs_tco = self.has_self_tail_call(func.body, &func.name, heap, syms);
 
             if needs_tco {
-                // Emit with mut params and loop wrapper
-                let rparams: Vec<String> = func.params.iter()
-                    .map(|p| format!("mut {}: Val", rust_ident(p)))
-                    .collect();
-                let params_str = rparams.join(", ");
-                func_code.push_str(&format!("fn {rname}({params_str}) -> Val {{\n"));
-                func_code.push_str("    loop {\n");
-                // Set TCO context
-                *self.tco.borrow_mut() = Some(TcoContext {
-                    fn_name: func.name.clone(),
-                    params: func.params.clone(),
-                });
-                let body_code = self.emit_expr(func.body, heap, syms, 2);
-                func_code.push_str(&body_code);
-                *self.tco.borrow_mut() = None;
-                func_code.push_str("    }\n");
-                func_code.push_str("}\n\n");
+                if self.is_cheney() {
+                    // TCO with shadow stack: params on GC_STACK, gc_store on continue
+                    let rparams: Vec<String> = func.params.iter()
+                        .map(|p| format!("{}: Val", rust_ident(p)))
+                        .collect();
+                    let params_str = rparams.join(", ");
+                    func_code.push_str(&format!("fn {rname}({params_str}) -> Val {{\n"));
+                    func_code.push_str("    let _gcg = GcGuard(gc_frame());\n");
+                    for p in &func.params {
+                        let slot = self.gc_register(p);
+                        func_code.push_str(&format!("    let {slot} = gc_push({});\n", rust_ident(p)));
+                    }
+                    func_code.push_str("    let __loop_base = gc_frame();\n");
+                    func_code.push_str("    loop {\n");
+                    func_code.push_str("        gc_unwind(__loop_base);\n");
+                    *self.tco.borrow_mut() = Some(TcoContext {
+                        fn_name: func.name.clone(),
+                        params: func.params.clone(),
+                    });
+                    let body_code = self.emit_expr(func.body, heap, syms, 2);
+                    func_code.push_str(&body_code);
+                    *self.tco.borrow_mut() = None;
+                    func_code.push_str("    }\n");
+                    func_code.push_str("}\n\n");
+                } else {
+                    // Emit with mut params and loop wrapper
+                    let rparams: Vec<String> = func.params.iter()
+                        .map(|p| format!("mut {}: Val", rust_ident(p)))
+                        .collect();
+                    let params_str = rparams.join(", ");
+                    func_code.push_str(&format!("fn {rname}({params_str}) -> Val {{\n"));
+                    func_code.push_str("    loop {\n");
+                    *self.tco.borrow_mut() = Some(TcoContext {
+                        fn_name: func.name.clone(),
+                        params: func.params.clone(),
+                    });
+                    let body_code = self.emit_expr(func.body, heap, syms, 2);
+                    func_code.push_str(&body_code);
+                    *self.tco.borrow_mut() = None;
+                    func_code.push_str("    }\n");
+                    func_code.push_str("}\n\n");
+                }
             } else {
-                let rparams: Vec<String> = func.params.iter()
-                    .map(|p| {
-                        let mutk = if self.is_set_target(p) { "mut " } else { "" };
-                        format!("{mutk}{}: Val", rust_ident(p))
-                    })
-                    .collect();
-                let params_str = rparams.join(", ");
-                func_code.push_str(&format!("fn {rname}({params_str}) -> Val {{\n"));
-                let body_code = self.emit_expr(func.body, heap, syms, 1);
-                func_code.push_str(&body_code);
-                func_code.push_str("}\n\n");
+                if self.is_cheney() {
+                    // Non-TCO with shadow stack
+                    let rparams: Vec<String> = func.params.iter()
+                        .map(|p| format!("{}: Val", rust_ident(p)))
+                        .collect();
+                    let params_str = rparams.join(", ");
+                    func_code.push_str(&format!("fn {rname}({params_str}) -> Val {{\n"));
+                    func_code.push_str("    let _gcg = GcGuard(gc_frame());\n");
+                    for p in &func.params {
+                        let slot = self.gc_register(p);
+                        func_code.push_str(&format!("    let {slot} = gc_push({});\n", rust_ident(p)));
+                    }
+                    let body_code = self.emit_expr(func.body, heap, syms, 1);
+                    func_code.push_str(&body_code);
+                    func_code.push_str("}\n\n");
+                } else {
+                    let rparams: Vec<String> = func.params.iter()
+                        .map(|p| {
+                            let mutk = if self.is_set_target(p) { "mut " } else { "" };
+                            format!("{mutk}{}: Val", rust_ident(p))
+                        })
+                        .collect();
+                    let params_str = rparams.join(", ");
+                    func_code.push_str(&format!("fn {rname}({params_str}) -> Val {{\n"));
+                    let body_code = self.emit_expr(func.body, heap, syms, 1);
+                    func_code.push_str(&body_code);
+                    func_code.push_str("}\n\n");
+                }
             }
             } // end if rest_param else
         }
@@ -1515,12 +1706,22 @@ impl Compiler {
 
                         let mut out = String::new();
                         out.push_str(&format!("{pad}{{\n"));
-                        // Emit mutable variable declarations
-                        for (i, pname) in param_names.iter().enumerate() {
-                            out.push_str(&format!("{pad}    let mut {} = {};\n",
-                                rust_ident(pname), init_codes[i]));
+                        if self.is_cheney() {
+                            // Push loop variables onto shadow stack
+                            for (i, pname) in param_names.iter().enumerate() {
+                                let slot = self.gc_register(pname);
+                                out.push_str(&format!("{pad}    let {slot} = gc_push({});\n", init_codes[i]));
+                            }
+                            out.push_str(&format!("{pad}    let __loop_base = gc_frame();\n"));
+                            out.push_str(&format!("{pad}    loop {{\n"));
+                            out.push_str(&format!("{pad}        gc_unwind(__loop_base);\n"));
+                        } else {
+                            for (i, pname) in param_names.iter().enumerate() {
+                                out.push_str(&format!("{pad}    let mut {} = {};\n",
+                                    rust_ident(pname), init_codes[i]));
+                            }
+                            out.push_str(&format!("{pad}    loop {{\n"));
                         }
-                        out.push_str(&format!("{pad}    loop {{\n"));
 
                         // Save previous TCO context and install named-let context
                         let prev_tco = self.tco.borrow().clone();
@@ -1551,9 +1752,14 @@ impl Compiler {
                         let init = heap.car(heap.cdr(binding));
                         let vname = syms.symbol_name(var).unwrap_or("_");
                         let init_code = self.emit_expr_inline(init, heap, syms);
-                        let mutk = if self.is_set_target(vname) { "mut " } else { "" };
-                        out.push_str(&format!("{pad}    let {mutk}{} = {};\n",
-                            rust_ident(vname), init_code));
+                        if self.is_cheney() {
+                            let slot = self.gc_register(vname);
+                            out.push_str(&format!("{pad}    let {slot} = gc_push({init_code});\n"));
+                        } else {
+                            let mutk = if self.is_set_target(vname) { "mut " } else { "" };
+                            out.push_str(&format!("{pad}    let {mutk}{} = {};\n",
+                                rust_ident(vname), init_code));
+                        }
                         b = heap.cdr(b);
                     }
                     out.push_str(&self.emit_begin(body, heap, syms, indent + 1));
@@ -1573,9 +1779,14 @@ impl Compiler {
                         let init = heap.car(heap.cdr(binding));
                         let vname = syms.symbol_name(var).unwrap_or("_");
                         let init_code = self.emit_expr_inline(init, heap, syms);
-                        let mutk = if self.is_set_target(vname) { "mut " } else { "" };
-                        out.push_str(&format!("{pad}    let {mutk}{vn} = {init_code};\n",
-                            vn = rust_ident(vname)));
+                        if self.is_cheney() {
+                            let slot = self.gc_register(vname);
+                            out.push_str(&format!("{pad}    let {slot} = gc_push({init_code});\n"));
+                        } else {
+                            let mutk = if self.is_set_target(vname) { "mut " } else { "" };
+                            out.push_str(&format!("{pad}    let {mutk}{vn} = {init_code};\n",
+                                vn = rust_ident(vname)));
+                        }
                         b = heap.cdr(b);
                     }
                     out.push_str(&self.emit_begin(body, heap, syms, indent + 1));
@@ -1588,77 +1799,155 @@ impl Compiler {
                     let body = heap.cdr(rest);
                     let mut out = String::new();
                     out.push_str(&format!("{pad}{{\n"));
-                    // First pass: declare all as mut NIL
-                    let mut b = bindings;
-                    while heap.is_pair(b) {
-                        let binding = heap.car(b);
-                        let var = heap.car(binding);
-                        let vname = syms.symbol_name(var).unwrap_or("_");
-                        out.push_str(&format!("{pad}    let mut {} = Val::NIL;\n",
-                            rust_ident(vname)));
-                        b = heap.cdr(b);
-                    }
-                    // Second pass: assign
-                    b = bindings;
-                    while heap.is_pair(b) {
-                        let binding = heap.car(b);
-                        let var = heap.car(binding);
-                        let init = heap.car(heap.cdr(binding));
-                        let vname = syms.symbol_name(var).unwrap_or("_");
-                        let init_code = self.emit_expr_inline(init, heap, syms);
-                        out.push_str(&format!("{pad}    {} = {init_code};\n",
-                            rust_ident(vname)));
-                        b = heap.cdr(b);
-                    }
-                    // Third pass: patch closure envs so mutual references see final values.
-                    // For each lambda binding, rebuild the env cons chain with current
-                    // variable values and set_cdr the closure rib.
-                    b = bindings;
-                    while heap.is_pair(b) {
-                        let binding = heap.car(b);
-                        let var = heap.car(binding);
-                        let init = heap.car(heap.cdr(binding));
-                        let vname = syms.symbol_name(var).unwrap_or("_");
-                        if heap.is_pair(init) {
-                            let init_head = heap.car(init);
-                            if heap.is_symbol(init_head) {
-                                let iname = syms.symbol_name(init_head).unwrap_or("");
-                                if iname == "lambda" || iname == "case-lambda" {
-                                    // Find the free vars this lambda captures
-                                    let params_list = heap.car(heap.cdr(init));
-                                    let body_list = heap.cdr(heap.cdr(init));
-                                    let mut param_bound: HashSet<String> = HashSet::new();
-                                    if heap.is_symbol(params_list) {
-                                        if let Some(pn) = syms.symbol_name(params_list) {
-                                            param_bound.insert(pn.to_string());
-                                        }
-                                    } else {
-                                        let mut p = params_list;
-                                        while heap.is_pair(p) {
-                                            if let Some(pn) = syms.symbol_name(heap.car(p)) {
+                    if self.is_cheney() {
+                        // First pass: push all as NIL onto shadow stack
+                        let mut b = bindings;
+                        while heap.is_pair(b) {
+                            let binding = heap.car(b);
+                            let var = heap.car(binding);
+                            let vname = syms.symbol_name(var).unwrap_or("_");
+                            let slot = self.gc_register(vname);
+                            out.push_str(&format!("{pad}    let {slot} = gc_push(Val::NIL);\n"));
+                            b = heap.cdr(b);
+                        }
+                        // Second pass: assign via gc_store
+                        b = bindings;
+                        while heap.is_pair(b) {
+                            let binding = heap.car(b);
+                            let var = heap.car(binding);
+                            let init = heap.car(heap.cdr(binding));
+                            let vname = syms.symbol_name(var).unwrap_or("_");
+                            let init_code = self.emit_expr_inline(init, heap, syms);
+                            let slot = self.gc_slot_for(vname).unwrap();
+                            out.push_str(&format!("{pad}    gc_store({slot}, {init_code});\n"));
+                            b = heap.cdr(b);
+                        }
+                        // Third pass: patch closure envs (use gc_load for variable refs)
+                        b = bindings;
+                        while heap.is_pair(b) {
+                            let binding = heap.car(b);
+                            let var = heap.car(binding);
+                            let init = heap.car(heap.cdr(binding));
+                            let vname = syms.symbol_name(var).unwrap_or("_");
+                            if heap.is_pair(init) {
+                                let init_head = heap.car(init);
+                                if heap.is_symbol(init_head) {
+                                    let iname = syms.symbol_name(init_head).unwrap_or("");
+                                    if iname == "lambda" || iname == "case-lambda" {
+                                        let params_list = heap.car(heap.cdr(init));
+                                        let body_list = heap.cdr(heap.cdr(init));
+                                        let mut param_bound: HashSet<String> = HashSet::new();
+                                        if heap.is_symbol(params_list) {
+                                            if let Some(pn) = syms.symbol_name(params_list) {
                                                 param_bound.insert(pn.to_string());
                                             }
-                                            p = heap.cdr(p);
-                                        }
-                                        if heap.is_symbol(p) {
-                                            if let Some(pn) = syms.symbol_name(p) {
-                                                param_bound.insert(pn.to_string());
+                                        } else {
+                                            let mut p = params_list;
+                                            while heap.is_pair(p) {
+                                                if let Some(pn) = syms.symbol_name(heap.car(p)) {
+                                                    param_bound.insert(pn.to_string());
+                                                }
+                                                p = heap.cdr(p);
+                                            }
+                                            if heap.is_symbol(p) {
+                                                if let Some(pn) = syms.symbol_name(p) {
+                                                    param_bound.insert(pn.to_string());
+                                                }
                                             }
                                         }
-                                    }
-                                    let fvs = self.collect_free_vars_list(body_list, heap, syms, &param_bound);
-                                    if !fvs.is_empty() {
-                                        let rv = rust_ident(vname);
-                                        let mut env = "Val::NIL".to_string();
-                                        for fv in fvs.iter().rev() {
-                                            env = format!("cons({}, {env})", rust_ident(fv));
+                                        let fvs = self.collect_free_vars_list(body_list, heap, syms, &param_bound);
+                                        if !fvs.is_empty() {
+                                            // Variable refs go through gc_load in Cheney mode
+                                            // (emit_expr_inline handles this via gc_slots)
+                                            let rv = self.gc_slot_for(vname).unwrap();
+                                            let mut env = "Val::NIL".to_string();
+                                            for fv in fvs.iter().rev() {
+                                                let fv_code = if let Some(s) = self.gc_slot_for(fv) {
+                                                    format!("gc_load({s})")
+                                                } else if self.is_global(fv) {
+                                                    format!("unsafe {{ {} }}", rust_ident(fv))
+                                                } else {
+                                                    rust_ident(fv)
+                                                };
+                                                env = format!("cons({fv_code}, {env})");
+                                            }
+                                            out.push_str(&format!("{pad}    set_cdr(gc_load({rv}), {env});\n"));
                                         }
-                                        out.push_str(&format!("{pad}    set_cdr({rv}, {env});\n"));
                                     }
                                 }
                             }
+                            b = heap.cdr(b);
                         }
-                        b = heap.cdr(b);
+                    } else {
+                        // First pass: declare all as mut NIL
+                        let mut b = bindings;
+                        while heap.is_pair(b) {
+                            let binding = heap.car(b);
+                            let var = heap.car(binding);
+                            let vname = syms.symbol_name(var).unwrap_or("_");
+                            out.push_str(&format!("{pad}    let mut {} = Val::NIL;\n",
+                                rust_ident(vname)));
+                            b = heap.cdr(b);
+                        }
+                        // Second pass: assign
+                        b = bindings;
+                        while heap.is_pair(b) {
+                            let binding = heap.car(b);
+                            let var = heap.car(binding);
+                            let init = heap.car(heap.cdr(binding));
+                            let vname = syms.symbol_name(var).unwrap_or("_");
+                            let init_code = self.emit_expr_inline(init, heap, syms);
+                            out.push_str(&format!("{pad}    {} = {init_code};\n",
+                                rust_ident(vname)));
+                            b = heap.cdr(b);
+                        }
+                        // Third pass: patch closure envs
+                        b = bindings;
+                        while heap.is_pair(b) {
+                            let binding = heap.car(b);
+                            let var = heap.car(binding);
+                            let init = heap.car(heap.cdr(binding));
+                            let vname = syms.symbol_name(var).unwrap_or("_");
+                            if heap.is_pair(init) {
+                                let init_head = heap.car(init);
+                                if heap.is_symbol(init_head) {
+                                    let iname = syms.symbol_name(init_head).unwrap_or("");
+                                    if iname == "lambda" || iname == "case-lambda" {
+                                        let params_list = heap.car(heap.cdr(init));
+                                        let body_list = heap.cdr(heap.cdr(init));
+                                        let mut param_bound: HashSet<String> = HashSet::new();
+                                        if heap.is_symbol(params_list) {
+                                            if let Some(pn) = syms.symbol_name(params_list) {
+                                                param_bound.insert(pn.to_string());
+                                            }
+                                        } else {
+                                            let mut p = params_list;
+                                            while heap.is_pair(p) {
+                                                if let Some(pn) = syms.symbol_name(heap.car(p)) {
+                                                    param_bound.insert(pn.to_string());
+                                                }
+                                                p = heap.cdr(p);
+                                            }
+                                            if heap.is_symbol(p) {
+                                                if let Some(pn) = syms.symbol_name(p) {
+                                                    param_bound.insert(pn.to_string());
+                                                }
+                                            }
+                                        }
+                                        let fvs = self.collect_free_vars_list(body_list, heap, syms, &param_bound);
+                                        if !fvs.is_empty() {
+                                            let rv = rust_ident(vname);
+                                            let mut env = "Val::NIL".to_string();
+                                            for fv in fvs.iter().rev() {
+                                                env = format!("cons({}, {env})", rust_ident(fv));
+                                            }
+                                            out.push_str(&format!("{pad}    set_cdr({rv}, {env});\n"));
+                                        }
+                                    }
+                                }
+                            }
+                            b = heap.cdr(b);
+                        }
                     }
                     out.push_str(&self.emit_begin(body, heap, syms, indent + 1));
                     out.push_str(&format!("{pad}}}\n"));
@@ -1697,11 +1986,37 @@ impl Compiler {
                             a = heap.cdr(a);
                         }
                         let mut out = String::new();
-                        for (i, arg) in args.iter().enumerate() {
-                            out.push_str(&format!("{pad}let __t{i} = {arg};\n"));
-                        }
-                        for (i, p) in params.iter().enumerate() {
-                            out.push_str(&format!("{pad}{} = __t{i};\n", rust_ident(p)));
+                        if self.is_cheney() && args.len() > 1 {
+                            // Protect TCO temporaries: gc_push each, then gc_load back
+                            for (i, arg) in args.iter().enumerate() {
+                                out.push_str(&format!("{pad}let __ts{i} = gc_push({arg});\n"));
+                            }
+                            for (i, p) in params.iter().enumerate() {
+                                if let Some(slot) = self.gc_slot_for(p) {
+                                    out.push_str(&format!("{pad}gc_store({slot}, gc_load(__ts{i}));\n"));
+                                } else {
+                                    out.push_str(&format!("{pad}{} = gc_load(__ts{i});\n", rust_ident(p)));
+                                }
+                            }
+                            // Pop the temporaries (they're above __loop_base, gc_unwind will clean them)
+                        } else if self.is_cheney() {
+                            for (i, arg) in args.iter().enumerate() {
+                                out.push_str(&format!("{pad}let __t{i} = {arg};\n"));
+                            }
+                            for (i, p) in params.iter().enumerate() {
+                                if let Some(slot) = self.gc_slot_for(p) {
+                                    out.push_str(&format!("{pad}gc_store({slot}, __t{i});\n"));
+                                } else {
+                                    out.push_str(&format!("{pad}{} = __t{i};\n", rust_ident(p)));
+                                }
+                            }
+                        } else {
+                            for (i, arg) in args.iter().enumerate() {
+                                out.push_str(&format!("{pad}let __t{i} = {arg};\n"));
+                            }
+                            for (i, p) in params.iter().enumerate() {
+                                out.push_str(&format!("{pad}{} = __t{i};\n", rust_ident(p)));
+                            }
                         }
                         out.push_str(&format!("{pad}continue;\n"));
                         return out;
@@ -1744,6 +2059,12 @@ impl Compiler {
             }
             if self.is_global(name) {
                 return format!("unsafe {{ {} }}", rust_ident(name));
+            }
+            // In Cheney mode: read from shadow stack if variable has a gc slot
+            if self.is_cheney() {
+                if let Some(slot) = self.gc_slot_for(name) {
+                    return format!("gc_load({slot})");
+                }
             }
             return rust_ident(name);
         }
@@ -1802,8 +2123,24 @@ impl Compiler {
                     return format!("bool_to_val({a}.as_fixnum().unwrap() {op} {b}.as_fixnum().unwrap())");
                 }
                 "cons" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    let car_expr = heap.car(rest);
+                    let cdr_expr = heap.car(heap.cdr(rest));
+                    let a = self.emit_expr_inline(car_expr, heap, syms);
+                    let b = self.emit_expr_inline(cdr_expr, heap, syms);
+                    // In Cheney mode: if both args might allocate, sequentialize
+                    // to avoid stale Val in Rust register across GC
+                    if self.is_cheney() {
+                        let a_allocs = self.expr_might_alloc(car_expr, heap, syms);
+                        let b_allocs = self.expr_might_alloc(cdr_expr, heap, syms);
+                        if a_allocs && b_allocs {
+                            // Both allocate: push first result onto shadow stack
+                            let slot = self.next_gc_slot();
+                            return format!("{{ let {slot} = gc_push({a}); let __cdr = {b}; cons(gc_load({slot}), __cdr) }}");
+                        } else if b_allocs {
+                            // Only cdr allocates: evaluate cdr first, then read car fresh
+                            return format!("{{ let __cdr = {b}; cons({a}, __cdr) }}");
+                        }
+                    }
                     return format!("cons({a}, {b})");
                 }
                 "car" => {
@@ -1946,6 +2283,12 @@ impl Compiler {
                     let val_code = self.emit_expr_inline(val_expr, heap, syms);
                     if self.is_global(vname) {
                         return format!("{{ unsafe {{ {} = {val_code}; }} Val::NIL }}", rust_ident(vname));
+                    }
+                    // In Cheney mode: use gc_store for shadow stack variables
+                    if self.is_cheney() {
+                        if let Some(slot) = self.gc_slot_for(vname) {
+                            return format!("{{ gc_store({slot}, {val_code}); Val::NIL }}");
+                        }
                     }
                     return format!("{{ {} = {val_code}; Val::NIL }}", rust_ident(vname));
                 }
@@ -2522,8 +2865,13 @@ impl Compiler {
                         let init = heap.car(heap.cdr(binding));
                         let vname = syms.symbol_name(var).unwrap_or("_");
                         let init_code = self.emit_expr_inline(init, heap, syms);
-                        let mutk = if self.is_set_target(vname) { "mut " } else { "" };
-                        out.push_str(&format!("let {mutk}{} = {init_code}; ", rust_ident(vname)));
+                        if self.is_cheney() {
+                            let slot = self.gc_register(vname);
+                            out.push_str(&format!("let {slot} = gc_push({init_code}); "));
+                        } else {
+                            let mutk = if self.is_set_target(vname) { "mut " } else { "" };
+                            out.push_str(&format!("let {mutk}{} = {init_code}; ", rust_ident(vname)));
+                        }
                         b = heap.cdr(b);
                     }
                     let mut parts = Vec::new();
@@ -2540,6 +2888,11 @@ impl Compiler {
                     return out;
                 }
                 "letrec" => {
+                    // In Cheney mode, delegate to block-level emit_expr which handles gc_push
+                    if self.is_cheney() {
+                        let code = self.emit_expr(expr, heap, syms, 0);
+                        return format!("{{ {} }}", code.trim());
+                    }
                     let bindings = heap.car(rest);
                     let body = heap.cdr(rest);
                     let mut out = "{ ".to_string();
@@ -2632,6 +2985,11 @@ impl Compiler {
                     return format!("{{ {} }}", code.trim());
                 }
                 "do" => {
+                    // In Cheney mode, delegate to block-level emit_do which handles gc_push
+                    if self.is_cheney() {
+                        let code = self.emit_do(rest, heap, syms, 0);
+                        return format!("{{ {} }}", code.trim());
+                    }
                     // Inline version of emit_do — produces a block expression
                     let var_specs = heap.car(rest);
                     let test_clause = heap.car(heap.cdr(rest));
@@ -2711,7 +3069,6 @@ impl Compiler {
                     return self.compile_case_lambda(rest, heap, syms);
                 }
                 _ => {
-                    let fname = rust_ident(name);
                     let mut args = Vec::new();
                     let mut a = rest;
                     while heap.is_pair(a) {
@@ -2722,14 +3079,15 @@ impl Compiler {
                     // shadowed by a local parameter in the current function.
                     let shadowed = self.current_params.borrow().contains(name);
                     if self.is_known_function(name) && !shadowed {
+                        let fname = rust_ident(name);
                         if self.is_variadic_function(name) {
                             return format!("{fname}(&[{}])", args.join(", "));
                         }
                         return format!("{fname}({})", args.join(", "));
-                    } else if self.is_global(name) {
-                        return format!("call_val(unsafe {{ {fname} }}, &[{}])", args.join(", "));
                     } else {
-                        return format!("call_val({fname}, &[{}])", args.join(", "));
+                        // Use emit_var_ref for GC-aware variable lookup
+                        let fref = self.emit_var_ref(name);
+                        return format!("call_val({fref}, &[{}])", args.join(", "));
                     }
                 }
             }
@@ -2894,7 +3252,12 @@ impl Compiler {
 
             let vname = syms.symbol_name(var).unwrap_or("_").to_string();
             let init_code = self.emit_expr_inline(init, heap, syms);
-            out.push_str(&format!("{pad}    let mut {} = {init_code};\n", rust_ident(&vname)));
+            if self.is_cheney() {
+                let slot = self.gc_register(&vname);
+                out.push_str(&format!("{pad}    let {slot} = gc_push({init_code});\n"));
+            } else {
+                out.push_str(&format!("{pad}    let mut {} = {init_code};\n", rust_ident(&vname)));
+            }
             vars.push((vname, step));
             vs = heap.cdr(vs);
         }
@@ -2902,7 +3265,13 @@ impl Compiler {
         let test_expr = heap.car(test_clause);
         let result_exprs = heap.cdr(test_clause);
 
+        if self.is_cheney() {
+            out.push_str(&format!("{pad}    let __loop_base = gc_frame();\n"));
+        }
         out.push_str(&format!("{pad}    loop {{\n"));
+        if self.is_cheney() {
+            out.push_str(&format!("{pad}        gc_unwind(__loop_base);\n"));
+        }
 
         // Test
         let test_code = self.emit_expr_inline(test_expr, heap, syms);
@@ -2925,11 +3294,22 @@ impl Compiler {
                 step_codes.push((vname.clone(), self.emit_expr_inline(*step_expr, heap, syms)));
             }
         }
-        for (vname, code) in &step_codes {
-            out.push_str(&format!("{pad}        let _next_{vn} = {code};\n", vn = rust_ident(vname)));
-        }
-        for (vname, _) in &step_codes {
-            out.push_str(&format!("{pad}        {vn} = _next_{vn};\n", vn = rust_ident(vname)));
+        if self.is_cheney() {
+            for (vname, code) in &step_codes {
+                out.push_str(&format!("{pad}        let _next_{vn} = {code};\n", vn = rust_ident(vname)));
+            }
+            for (vname, _) in &step_codes {
+                if let Some(slot) = self.gc_slot_for(vname) {
+                    out.push_str(&format!("{pad}        gc_store({slot}, _next_{vn});\n", vn = rust_ident(vname)));
+                }
+            }
+        } else {
+            for (vname, code) in &step_codes {
+                out.push_str(&format!("{pad}        let _next_{vn} = {code};\n", vn = rust_ident(vname)));
+            }
+            for (vname, _) in &step_codes {
+                out.push_str(&format!("{pad}        {vn} = _next_{vn};\n", vn = rust_ident(vname)));
+            }
         }
 
         out.push_str(&format!("{pad}    }}\n"));
@@ -4157,12 +4537,36 @@ static mut HEAP_ALT: Vec<Rib> = Vec::new();  // inactive space
 static mut ALLOC_PTR: usize = RESERVED;      // next free index in active space
 
 // ── GC root tracking ────────────────────────────────────────────
-// Global roots registered via gc_register_global().
-// All globals are updated during GC.
 
 static mut GC_GLOBALS: Vec<*mut Val> = Vec::new();
 
 fn gc_register_global(p: *mut Val) { unsafe { GC_GLOBALS.push(p); } }
+
+// ── Shadow stack ────────────────────────────────────────────────
+// All live Val variables are stored here so GC can find and update them.
+
+static mut GC_STACK: Vec<Val> = Vec::new();
+
+#[inline(always)]
+fn gc_push(v: Val) -> usize { unsafe { let i = GC_STACK.len(); GC_STACK.push(v); i } }
+
+#[inline(always)]
+fn gc_load(i: usize) -> Val { unsafe { GC_STACK[i] } }
+
+#[inline(always)]
+fn gc_store(i: usize, v: Val) { unsafe { GC_STACK[i] = v; } }
+
+#[inline(always)]
+fn gc_frame() -> usize { unsafe { GC_STACK.len() } }
+
+#[inline(always)]
+fn gc_unwind(base: usize) { unsafe { GC_STACK.truncate(base); } }
+
+/// RAII guard: calls gc_unwind on drop, so all exit paths clean up.
+struct GcGuard(usize);
+impl Drop for GcGuard {
+    fn drop(&mut self) { gc_unwind(self.0); }
+}
 
 // Rib 0 = nil/'(), rib 1 = #f (BOT), rib 2 = #t, rib 3 = eof
 const FALSE_VAL: Val = Val(1 << 1);
@@ -4179,6 +4583,7 @@ fn heap_init() {
         HEAP[2] = Rib { car: Val::NIL, cdr: Val::NIL, tag: 20 };       // #t
         HEAP[3] = Rib { car: Val::NIL, cdr: Val::NIL, tag: TAG_EOF };  // eof
         GC_GLOBALS = Vec::with_capacity(64);
+        GC_STACK = Vec::with_capacity(4096);
         PORTS = Vec::with_capacity(16);
         PORTS.push(PortInner::Stdin(std::io::BufReader::new(std::io::stdin())));
         PORTS.push(PortInner::Stdout);
@@ -4192,12 +4597,22 @@ fn heap_init() {
 fn alloc_rib(car: Val, cdr: Val, tag: u8) -> Val {
     unsafe {
         if ALLOC_PTR >= SEMI_SIZE {
+            // Protect car/cdr across GC — they may be Rust stack locals
+            let base = GC_STACK.len();
+            GC_STACK.push(car);
+            GC_STACK.push(cdr);
             gc_collect();
+            let car = GC_STACK[base];
+            let cdr = GC_STACK[base + 1];
+            GC_STACK.truncate(base);
             if ALLOC_PTR >= SEMI_SIZE - (SEMI_SIZE / 8) {
-                // Less than 12.5% free after GC — out of memory
                 eprintln!("Out of memory after GC ({} live ribs)", ALLOC_PTR);
                 std::process::exit(1);
             }
+            let idx = ALLOC_PTR;
+            ALLOC_PTR += 1;
+            HEAP[idx] = Rib { car, cdr, tag };
+            return Val::rib(idx);
         }
         let idx = ALLOC_PTR;
         ALLOC_PTR += 1;
@@ -4221,6 +4636,11 @@ fn gc_collect() {
         // Copy roots: registered globals
         for gp in &GC_GLOBALS {
             **gp = gc_copy_val(**gp);
+        }
+
+        // Copy roots: shadow stack
+        for i in 0..GC_STACK.len() {
+            GC_STACK[i] = gc_copy_val(GC_STACK[i]);
         }
 
         // Cheney scan: breadth-first copy of reachable objects

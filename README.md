@@ -1,6 +1,6 @@
 # WispyScheme
 
-Scheme → Rust AOT compiler with branchless Cayley table type dispatch. Compiles R7RS Scheme to standalone native binaries — 1.7× faster than Chez Scheme on nqueens(8).
+Scheme → Rust AOT compiler with branchless Cayley table type dispatch and optional semi-space Cheney GC. Compiles R7RS Scheme to standalone native binaries — 1.7× faster than Chez Scheme on nqueens(8).
 
 Named after Wispy the guinea pig.
 
@@ -12,6 +12,9 @@ Takes Scheme source and produces a standalone `.rs` file with inlined Cayley tab
 cargo run -- --compile bench/nqueens.scm > nqueens.rs
 rustc -O -o nqueens nqueens.rs
 ./nqueens   # 92
+
+# With semi-space Cheney GC (bounded memory):
+cargo run -- --gc cheney --compile bench/nqueens.scm > nqueens.rs
 ```
 
 Type dispatch in the compiled output is branchless: instead of tag-bit branch chains, every dispatch decision is a single index into the 32×32 [Cayley table](https://github.com/stefanopalmieri/wispy-table) (`wispy-table` crate).
@@ -40,29 +43,61 @@ For interpreted execution, REPL, and running the self-hosted tools (reflective t
 
 ## Performance
 
-| Implementation | N-Queens(8) | Counter arithmetic |
-|---|---|---|
-| **C** (gcc -O2, bump alloc) | 96 µs | 0.017 µs |
-| **WispyScheme → Rust** (rustc -O) | **136 µs** | **0.105 µs** |
-| **LuaJIT** | 212 µs | 0.170 µs |
-| **Chez Scheme** (10.3.0) | 228 µs | 0.213 µs |
-| **SBCL** (native Common Lisp) | 440 µs | 0.187 µs |
+### R7RS benchmarks (Apple M-series, single-threaded)
 
-Gains come from branchless dispatch (table index vs. branch chain) and uniform rib representation. Results are workload-sensitive; LuaJIT's trace compiler can outperform on tight numeric loops. All benchmarks on Apple M-series, single-threaded.
+| Benchmark | Wispy (no GC) | Wispy (Cheney) | Chez | Winner |
+|-----------|:------------:|:--------------:|:----:|--------|
+| fib | 1.97s | 4.05s | 3.24s | **Wispy** 1.64x |
+| tak | 0.86s | 4.37s | 1.38s | **Wispy** 1.60x |
+| sum | 0.78s | 7.23s | 2.37s | **Wispy** 3.04x |
+| ack | 4.76s | 8.67s | 2.23s | **Chez** 2.13x |
+| deriv | 2.51s | 2.13s | 0.86s | **Chez** 2.92x |
+| diviter | 4.07s | 3.91s | 1.08s | **Chez** 3.77x |
+| divrec | 7.47s | 8.04s | 1.36s | **Chez** 5.49x |
+| nqueens | 8.21s | — | 4.11s | **Chez** 2.00x |
+| destruc | 2.67s | 3.23s | 1.26s | **Chez** 2.12x |
+| triangl | 20.96s | 22.35s | 1.79s | **Chez** 11.71x |
+| takl | 3.79s | 9.56s | 3.30s | **Chez** 1.15x |
+| primes | 2.13s | 2.57s | 0.65s | **Chez** 3.28x |
+
+Benchmarks from [r7rs-benchmarks](https://github.com/ecraven/r7rs-benchmarks) with standard parameters. Wispy wins 3/12 (fixnum-heavy), Chez wins 9/12 (allocation/list-heavy).
+
+**No-GC mode** (grow-only heap) wins on pure fixnum recursion: 3× faster than Chez on sum, 1.6× on fib/tak. The gap on allocation-heavy benchmarks (triangl 11.7×, divrec 5.5×) is due to unbounded heap growth causing poor cache locality.
+
+**Cheney GC mode** adds a shadow stack for precise root tracking. On deriv, Cheney GC is actually *faster* than no-GC (2.13s vs 2.51s) — semi-space copying compacts live data. On fixnum benchmarks, the shadow stack overhead (gc_push/gc_load on every variable) costs 2–9× vs no-GC. The nqueens benchmark currently crashes in Cheney mode due to a codegen bug with nested named let scopes.
+
+## Garbage Collection
+
+The compiler supports two heap modes selected via `--gc`:
+
+```bash
+cargo run -- --compile file.scm              # grow-only heap (no GC, default)
+cargo run -- --gc cheney --compile file.scm  # semi-space Cheney copying GC
+```
+
+**No GC** (`--gc none`): grow-only `Vec<Rib>` heap. Zero overhead, zero pauses, but memory is never reclaimed. Best for short-running programs and benchmarks where allocation pressure is low.
+
+**Cheney GC** (`--gc cheney`): semi-space copying collector with 512K rib capacity per space. Uses a **shadow stack** for precise root tracking — all live `Val` variables (function parameters, let bindings, loop variables) are stored in a GC-visible `Vec<Val>` and read via `gc_load`/`gc_store`. The collector:
+
+- Copies live objects breadth-first (Cheney scan pointer)
+- Uses forwarding pointers (tag 255) for shared structure
+- Protects `alloc_rib` arguments across GC via shadow stack push/pop
+- Cleans up per-function via RAII `GcGuard` (Rust Drop trait)
+- Truncates shadow stack at loop tops to prevent unbounded growth
 
 ## Architecture
 
 ```
 src/
 ├── lib.rs          crate root (re-exports table, val, heap, symbol, reader, macros, compile)
-├── bin/wispy.rs    compiler CLI
+├── bin/wispy.rs    compiler CLI (--gc none|cheney flag)
 ├── table.rs        re-export of wispy-table (32×32 Cayley table)
 ├── val.rs          Val = tagged pointer (fixnum | rib index)
 ├── heap.rs         rib heap: uniform (car, cdr, tag) for all types
 ├── symbol.rs       symbol interning
 ├── reader.rs       S-expression parser
 ├── macros.rs       syntax-rules: pattern matching, ellipsis, dotted tails, template instantiation
-└── compile.rs      Scheme → Rust compiler (~4200 lines)
+└── compile.rs      Scheme → Rust compiler (~5300 lines, includes both runtimes)
 ```
 
 ## The Cayley Table
@@ -99,7 +134,8 @@ cargo check --no-default-features --lib
 - **Futamura P3.** Specialize the transpiler on a known program to produce a residual Rust-emitting program — a compiler generated from an interpreter.
 - **Mutual tail recursion.** Trampoline or CPS transform for mutually recursive tail calls.
 - **Full continuations.** CPS transform for reentrant `call/cc`.
-- **Garbage collection.** Compiled output uses a grow-only heap (no GC). Fine for short-running programs; long-running or allocation-heavy programs will need a collector. wispy-vm already has Stak's semi-space copying GC as a reference.
+- **GC optimization.** The Cheney GC shadow stack instruments every function (gc_push/gc_load for all params). Fixnum-only functions don't need this — detecting and skipping shadow stack for non-allocating paths would close the 2-5× overhead gap on numeric benchmarks.
+- **Bare-metal RISC-V.** `--target no-std` with fixed-size heap arrays, no alloc crate, UART output.
 
 ## Lineage
 
