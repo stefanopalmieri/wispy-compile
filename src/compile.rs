@@ -1994,13 +1994,17 @@ impl Compiler {
                     let conseq = heap.car(rest2);
                     let alt_list = heap.cdr(rest2);
                     let test_code = self.emit_expr_inline(test, heap, syms);
+                    let saved_slots = self.gc_slots.borrow().clone();
                     let t_code = self.emit_expr(conseq, heap, syms, indent + 1);
+                    *self.gc_slots.borrow_mut() = saved_slots.clone();
                     if heap.is_pair(alt_list) {
                         let f_code = self.emit_expr(heap.car(alt_list), heap, syms, indent + 1);
+                        *self.gc_slots.borrow_mut() = saved_slots;
                         return format!(
                             "{pad}if is_true({test_code}) {{\n{t_code}{pad}}} else {{\n{f_code}{pad}}}\n"
                         );
                     } else {
+                        *self.gc_slots.borrow_mut() = saved_slots;
                         return format!(
                             "{pad}if is_true({test_code}) {{\n{t_code}{pad}}} else {{\n{pad}    Val::NIL\n{pad}}}\n"
                         );
@@ -2487,13 +2491,16 @@ impl Compiler {
                 "if" => {
                     let test = self.emit_expr_inline(heap.car(rest), heap, syms);
                     let r2 = heap.cdr(rest);
+                    let saved_slots = self.gc_slots.borrow().clone();
                     let c = self.emit_expr_inline(heap.car(r2), heap, syms);
+                    *self.gc_slots.borrow_mut() = saved_slots.clone();
                     let alt_list = heap.cdr(r2);
                     let a = if heap.is_pair(alt_list) {
                         self.emit_expr_inline(heap.car(alt_list), heap, syms)
                     } else {
                         "Val::NIL".to_string()
                     };
+                    *self.gc_slots.borrow_mut() = saved_slots;
                     return format!("if is_true({test}) {{ {c} }} else {{ {a} }}");
                 }
                 "null?" => {
@@ -2931,6 +2938,13 @@ impl Compiler {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
                     let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
                     let c = self.emit_expr_inline(heap.car(heap.cdr(heap.cdr(rest))), heap, syms);
+                    // In Cheney mode, always protect vector — the value expr
+                    // may allocate even when analysis says otherwise (e.g.
+                    // first-class builtins compile to make_closure).
+                    if self.is_cheney() {
+                        let slot = self.next_gc_slot();
+                        return format!("{{ let {slot} = gc_push({a}); let __val = {c}; vector_set(gc_load({slot}), {b}.as_fixnum().unwrap(), __val); Val::NIL }}");
+                    }
                     return format!("{{ vector_set({a}, {b}.as_fixnum().unwrap(), {c}); Val::NIL }}");
                 }
                 "vector?" => {
@@ -2972,6 +2986,17 @@ impl Compiler {
                         return args[0].clone(); // single value = just the value
                     }
                     let count = args.len();
+                    if self.is_cheney() {
+                        // Build values list without nested cons to avoid
+                        // stale Val references across GC-triggering allocations.
+                        let acc = self.next_gc_slot();
+                        let mut out = format!("{{ let {acc} = gc_push(Val::NIL); ");
+                        for a in args.iter().rev() {
+                            out.push_str(&format!("gc_store({acc}, cons({a}, gc_load({acc}))); "));
+                        }
+                        out.push_str(&format!("make_values(gc_load({acc}), {count}) }}"));
+                        return out;
+                    }
                     let mut list = "Val::NIL".to_string();
                     for a in args.iter().rev() {
                         list = format!("cons({a}, {list})");
@@ -2979,8 +3004,18 @@ impl Compiler {
                     return format!("make_values({list}, {count})");
                 }
                 "call-with-values" => {
-                    let producer = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let consumer = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    let prod_expr = heap.car(rest);
+                    let cons_expr = heap.car(heap.cdr(rest));
+                    let producer = self.emit_expr_inline(prod_expr, heap, syms);
+                    let consumer = self.emit_expr_inline(cons_expr, heap, syms);
+                    if self.is_cheney() &&
+                       self.expr_might_alloc(prod_expr, heap, syms) &&
+                       self.expr_might_alloc(cons_expr, heap, syms) {
+                        let slot = self.next_gc_slot();
+                        // Evaluate consumer BEFORE gc_load(producer) to avoid
+                        // reading a stale producer if the consumer allocs + GCs.
+                        return format!("{{ let {slot} = gc_push({producer}); let __cwv_c = {consumer}; call_with_values(gc_load({slot}), __cwv_c) }}");
+                    }
                     return format!("call_with_values({producer}, {consumer})");
                 }
                 // ── R7RS: error / raise ──────────────
@@ -3470,6 +3505,9 @@ impl Compiler {
         let pad = "    ".repeat(indent);
         let mut out = String::new();
         let mut first = true;
+        // Save gc_slots before branches so slots defined in one branch
+        // don't leak into the next (they'd be out of scope in Rust).
+        let saved_slots = self.gc_slots.borrow().clone();
 
         while heap.is_pair(clauses) {
             let clause = heap.car(clauses);
@@ -3477,12 +3515,15 @@ impl Compiler {
             let body = heap.cdr(clause);
 
             if heap.is_symbol(test) && syms.sym_eq(test, "else") {
+                *self.gc_slots.borrow_mut() = saved_slots.clone();
                 out.push_str(&format!("{pad}}} else {{\n"));
                 out.push_str(&self.emit_begin(body, heap, syms, indent + 1));
                 out.push_str(&format!("{pad}}}\n"));
+                *self.gc_slots.borrow_mut() = saved_slots;
                 return out;
             }
 
+            *self.gc_slots.borrow_mut() = saved_slots.clone();
             let test_code = self.emit_expr_inline(test, heap, syms);
             if first {
                 out.push_str(&format!("{pad}if is_true({test_code}) {{\n"));
@@ -3495,6 +3536,7 @@ impl Compiler {
         }
 
         if !first {
+            *self.gc_slots.borrow_mut() = saved_slots;
             out.push_str(&format!("{pad}}} else {{\n{pad}    Val::NIL\n{pad}}}\n"));
         }
         out
@@ -3852,6 +3894,15 @@ fn cdr(v: Val) -> Val {
     unsafe { HEAP[v.as_rib()].cdr }
 }
 
+fn call_with_values(producer: Val, consumer: Val) -> Val {
+    let v = call_val(producer, &[]);
+    if is_values(v) {
+        apply_val(consumer, car(v))
+    } else {
+        call_val(consumer, &[v])
+    }
+}
+
 "#;
 
 /// Shared runtime code used by both no-GC and Cheney runtimes.
@@ -4188,15 +4239,6 @@ fn make_values(list: Val, count: i64) -> Val {
 
 fn is_values(v: Val) -> bool {
     !v.is_fixnum() && v != Val::NIL && unsafe { HEAP[v.as_rib()].tag == TAG_VALUES }
-}
-
-fn call_with_values(producer: Val, consumer: Val) -> Val {
-    let v = call_val(producer, &[]);
-    if is_values(v) {
-        apply_val(consumer, car(v))
-    } else {
-        call_val(consumer, &[v])
-    }
 }
 
 // ── Error objects ───────────────────────────────────────────────
@@ -5145,6 +5187,19 @@ fn car(v: Val) -> Val {
 fn cdr(v: Val) -> Val {
     if v.is_fixnum() || v == Val::NIL { return Val::NIL; }
     unsafe { HEAP[v.as_rib()].cdr }
+}
+
+fn call_with_values(producer: Val, consumer: Val) -> Val {
+    let _gcg = GcGuard(gc_frame());
+    let __consumer = gc_push(consumer);
+    let v = call_val(producer, &[]);
+    let __v = gc_push(v);
+    let vv = gc_load(__v);
+    if is_values(vv) {
+        apply_val(gc_load(__consumer), car(vv))
+    } else {
+        call_val(gc_load(__consumer), &[gc_load(__v)])
+    }
 }
 "#;
 
