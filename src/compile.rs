@@ -50,6 +50,8 @@ pub struct Compiler {
     next_lambda_id: Cell<usize>,
     /// Current function's TCO context (set during function body emission)
     tco: RefCell<Option<TcoContext>>,
+    /// Variables that are targets of set! (need let mut)
+    set_targets: RefCell<HashSet<String>>,
 }
 
 impl Compiler {
@@ -61,7 +63,41 @@ impl Compiler {
             lifted: RefCell::new(Vec::new()),
             next_lambda_id: Cell::new(0),
             tco: RefCell::new(None),
+            set_targets: RefCell::new(HashSet::new()),
         }
+    }
+
+    /// Scan an expression tree and collect all variables that are targets of set!.
+    fn collect_set_targets(&self, expr: Val, heap: &Heap, syms: &SymbolTable) {
+        if !heap.is_pair(expr) || heap.tag(expr) != table::T_PAIR {
+            return;
+        }
+        let head = heap.car(expr);
+        let rest = heap.cdr(expr);
+        if heap.is_symbol(head) {
+            let name = syms.symbol_name(head).unwrap_or("");
+            if name == "set!" {
+                let var = heap.car(rest);
+                if heap.is_symbol(var) {
+                    if let Some(vname) = syms.symbol_name(var) {
+                        self.set_targets.borrow_mut().insert(vname.to_string());
+                    }
+                }
+                self.collect_set_targets(heap.car(heap.cdr(rest)), heap, syms);
+                return;
+            }
+        }
+        // Recurse into all sub-expressions
+        let mut r = expr;
+        while heap.is_pair(r) {
+            self.collect_set_targets(heap.car(r), heap, syms);
+            r = heap.cdr(r);
+        }
+    }
+
+    /// Check if a variable is a set! target (needs let mut).
+    fn is_set_target(&self, name: &str) -> bool {
+        self.set_targets.borrow().contains(name)
     }
 
     /// Parse and collect top-level forms, expanding macros.
@@ -93,6 +129,13 @@ impl Compiler {
             }
             let expanded = self.expand_all(expr, &macros, heap, syms);
             self.main_exprs.push(expanded);
+        }
+        // Pre-scan for set! targets so we can emit let mut where needed
+        for &expr in &self.main_exprs {
+            self.collect_set_targets(expr, heap, syms);
+        }
+        for &(_, _, body) in &self.functions {
+            self.collect_set_targets(body, heap, syms);
         }
     }
 
@@ -160,8 +203,9 @@ impl Compiler {
             let body = if heap.cdr(body_list) == Val::NIL {
                 heap.car(body_list)
             } else {
-                // Wrap in begin — we'll handle this in code gen
-                body_list
+                // Wrap in (begin body1 body2 ...)
+                let begin_sym = syms.intern("begin", heap);
+                heap.cons(begin_sym, body_list)
             };
             self.functions.push((name, params, body));
         }
@@ -631,7 +675,10 @@ impl Compiler {
                 func_code.push_str("}\n\n");
             } else {
                 let rparams: Vec<String> = params.iter()
-                    .map(|p| format!("{}: Val", rust_ident(p)))
+                    .map(|p| {
+                        let mutk = if self.is_set_target(p) { "mut " } else { "" };
+                        format!("{mutk}{}: Val", rust_ident(p))
+                    })
                     .collect();
                 let params_str = rparams.join(", ");
                 func_code.push_str(&format!("fn {rname}({params_str}) -> Val {{\n"));
@@ -755,7 +802,8 @@ impl Compiler {
                         let init = heap.car(heap.cdr(binding));
                         let vname = syms.symbol_name(var).unwrap_or("_");
                         let init_code = self.emit_expr_inline(init, heap, syms);
-                        out.push_str(&format!("{pad}    let {} = {};\n",
+                        let mutk = if self.is_set_target(vname) { "mut " } else { "" };
+                        out.push_str(&format!("{pad}    let {mutk}{} = {};\n",
                             rust_ident(vname), init_code));
                         b = heap.cdr(b);
                     }
@@ -776,7 +824,8 @@ impl Compiler {
                         let init = heap.car(heap.cdr(binding));
                         let vname = syms.symbol_name(var).unwrap_or("_");
                         let init_code = self.emit_expr_inline(init, heap, syms);
-                        out.push_str(&format!("{pad}    let {vn} = {init_code};\n",
+                        let mutk = if self.is_set_target(vname) { "mut " } else { "" };
+                        out.push_str(&format!("{pad}    let {mutk}{vn} = {init_code};\n",
                             vn = rust_ident(vname)));
                         b = heap.cdr(b);
                     }
@@ -1077,6 +1126,13 @@ impl Compiler {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
                     let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
                     return format!("{{ let (mut a, mut b) = ({a}.as_fixnum().unwrap().abs(), {b}.as_fixnum().unwrap().abs()); while b != 0 {{ let t = b; b = a % b; a = t; }} Val::fixnum(a) }}");
+                }
+                "set!" => {
+                    let var = heap.car(rest);
+                    let val_expr = heap.car(heap.cdr(rest));
+                    let vname = syms.symbol_name(var).unwrap_or("_");
+                    let val_code = self.emit_expr_inline(val_expr, heap, syms);
+                    return format!("{{ {} = {val_code}; Val::NIL }}", rust_ident(vname));
                 }
                 "set-car!" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
