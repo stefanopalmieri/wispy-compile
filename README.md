@@ -24,6 +24,8 @@ Values are ribs (3-field structs: car, cdr, tag), following the [Ribbit](https:/
 
 ## Performance
 
+### Compiled output vs. other languages
+
 | Implementation | N-Queens(8) | Counter arithmetic |
 |---|---|---|
 | **C** (gcc -O2, bump alloc) | 96 µs | 0.017 µs |
@@ -32,7 +34,19 @@ Values are ribs (3-field structs: car, cdr, tag), following the [Ribbit](https:/
 | **Chez Scheme** (10.3.0) | 228 µs | 0.213 µs |
 | **SBCL** (native Common Lisp) | 440 µs | 0.187 µs |
 
-On this cons-heavy, branch-heavy workload, compiled WispyScheme is 1.7x faster than Chez Scheme, 1.5x faster than LuaJIT, and 3.2x faster than SBCL. The gains come primarily from branchless dispatch (table index vs. branch chain) and a uniform rib representation (no special cases for different heap object layouts). Chez Scheme is a production-quality R6RS compiler with full continuations, threads, and a generational GC — the comparison shows what branchless dispatch buys on allocation-heavy workloads. Results are workload-sensitive; LuaJIT's trace compiler can outperform on tight numeric loops. All benchmarks on Apple M-series, single-threaded.
+On this cons-heavy, branch-heavy workload, compiled WispyScheme is 1.7x faster than Chez Scheme, 1.5x faster than LuaJIT, and 3.2x faster than SBCL. The gains come primarily from branchless dispatch (table index vs. branch chain) and a uniform rib representation (no special cases for different heap object layouts). Results are workload-sensitive; LuaJIT's trace compiler can outperform on tight numeric loops. All benchmarks on Apple M-series, single-threaded.
+
+### Cross-runtime: fib(30)
+
+| Runtime | Mode | Time | vs. compiled |
+|---|---|---|---|
+| **WispyScheme → Rust** | AOT native | **5.3ms** | 1× |
+| **LuaJIT** | JIT | 9.6ms | 1.8× |
+| **WispyScheme → Lua** | transpiled | **71ms** | 13× |
+| **Lua 5.5** | bytecode VM | 69ms | 13× |
+| **MicroPython** | bytecode VM | 197ms | 37× |
+
+The Lua backend (`--compile-lua`) matches handwritten Lua performance — transpiled Scheme runs at the same speed as hand-written Lua. On ESP32 (where LuaJIT is unavailable), this means WispyScheme compiled to Lua is the fastest scriptable option.
 
 ## Quick Start
 
@@ -43,8 +57,9 @@ cargo run -- -e '(+ 1 2)'           # evaluate expression
 cargo run -- --permissive examples/fib.scm   # permissive mode (type errors return BOT)
 cargo run -- --compile examples/nqueens.scm > nqueens.rs  # compile to Rust
 rustc -O -o nqueens nqueens.rs && ./nqueens   # native binary
-cd lean && lake build                        # verify table proofs (14 theorems, ~6s)
+cargo run -- --compile-lua examples/fib.scm | lua -       # compile to Lua, run immediately
 cargo run -- examples/reflective-tower.scm   # run the self-hosted reflective tower
+cd lean && lake build                        # verify table proofs (14 theorems, ~6s)
 ```
 
 As a library:
@@ -109,7 +124,7 @@ The evaluator layer (`car`, `cdr`, etc. on actual values) is strict by default: 
 ```
 src/
 ├── lib.rs          crate root
-├── bin/wispy.rs    REPL, file runner, -e flag, --compile, --strict
+├── bin/wispy.rs    REPL, file runner, -e flag, --compile, --compile-lua
 ├── table.rs        32×32 Cayley table (1KB const array), algebraic axiom tests
 ├── val.rs          Val = tagged pointer (fixnum | rib index)
 ├── heap.rs         Rib heap: uniform (car, cdr, tag) for all types
@@ -118,13 +133,15 @@ src/
 ├── macros.rs       syntax-rules: pattern matching, ellipsis, template instantiation
 ├── eval.rs         Tree-walking evaluator, 104 builtins, tail call trampoline
 ├── cps.rs          CPS evaluator with first-class continuations (call/cc)
-└── compile.rs      Scheme → Rust compiler (standalone native binaries)
+├── compile.rs      Scheme → Rust compiler (standalone native binaries)
+└── compile_lua.rs  Scheme → Lua compiler (runs on Lua VM, GC'd)
 ```
 
-Three execution paths:
+Four execution paths:
 - **Interpreter** (`eval.rs`): tail call optimization, 104 builtins, strict by default (`--permissive` for embedded fault tolerance)
 - **CPS evaluator** (`cps.rs`): first-class continuations, `call/cc`, re-entrant
-- **Compiler** (`compile.rs`): Scheme → standalone Rust, 1.7x faster than Chez Scheme on nqueens(8). Self-tail-call → loop optimization, closure conversion, strings, characters, 55+ inlined builtins, and the algebra extension.
+- **Rust compiler** (`compile.rs`): Scheme → standalone Rust, 1.7x faster than Chez Scheme on nqueens(8). Self-tail-call → loop optimization, closure conversion, 55+ inlined builtins.
+- **Lua compiler** (`compile_lua.rs`): Scheme → standalone Lua. Matches handwritten Lua performance. Includes compile-time `load`, symbol/string distinction, cons cells with GC, Cayley table as Lua array. The entire reflective tower (metacircular evaluator + reify/reflect + branch swap) compiles and runs on Lua — 12.6x faster than the interpreter.
 
 Self-hosted tools (all `.scm` files running on WispyScheme itself):
 - **Online PE** (`examples/pe.scm`): partial evaluator for Scheme — Futamura Projection 1 on a real interpreter
@@ -185,7 +202,8 @@ Scheme programs that run on WispyScheme itself, ported from the [Kamea](https://
 | `examples/specialize.scm` | Partial evaluator for algebraic IR: constant-folds `dot`, cancels QE pairs, eliminates dead branches |
 | `examples/futamura.scm` | All three Futamura projections on the 32×32 algebra (three-path verification) |
 | `examples/pe.scm` | Online partial evaluator for Scheme: folds arithmetic, branches, list ops, function calls |
-| `examples/futamura-real.scm` | **Futamura Projection 1 on a real Scheme evaluator** (four-path verification) |
+| `examples/futamura-real.scm` | **Futamura Projection 1** on a real Scheme evaluator (four-path verification) |
+| `examples/futamura-cps.scm` | **Futamura Projection 2** on the CPS evaluator — eliminates interpreter dispatch, preserves continuations |
 | `examples/metacircular.scm` | Defunctionalized CPS evaluator with 14 inspectable continuation types |
 | `examples/transpile.scm` | IR → Rust code generator (emits standalone binaries with inlined Cayley table) |
 | `examples/reflective-tower.scm` | Three-level Smith (1984) reflective tower |
@@ -199,12 +217,30 @@ specialize(interpreter, program) = compiled program
 A direct-style Scheme evaluator (`deval`) is specialized with respect to a known fib program by the online partial evaluator (`pe.scm`). The PE unfolds all of deval's dispatch — the cond branches, car/cdr traversal of the AST, symbol lookup, environment extension — and folds everything to the bare result. Four paths to the same answer:
 
 ```
-Path A  (direct Scheme):    (fib 8)                       → 21
+Path A  (direct Scheme):     (fib 8)                       → 21
 Path B  (deval interpreter): (deval '(fib 8) env fns)      → 21
 Path C  (PE specialized):    (pe deval {program=fib, n=8})  → 21
 ```
 
 The classic PE benchmark also works: `power(base, 3)` with unknown base produces `(* base (* base (* base 1)))` — a straight-line multiplication chain with no recursion, no conditionals.
+
+**Futamura Projection 2** — the CPS compiler:
+
+```
+specialize(PE, CPS-evaluator, program) = CPS compiler
+```
+
+All 16 functions of the CPS metacircular evaluator are registered in the PE. Specializing `meval` with a known program and unknown continuation produces residual CPS code where all interpreter dispatch has been eliminated:
+
+```scheme
+42                       → (apply-k k 42)      ;; constant folded
+(+ (* 3 4) (- 10 5))    → (apply-k k 17)      ;; all dispatch eliminated
+(if #t x y)             → (apply-k k x)        ;; dead branch eliminated
+(if (< x 0) (- 0 x) x)  → (if val (apply-k k (- a1 a2)) (apply-k k x))
+                          ;; CPS structure survives — call/cc still works
+```
+
+The CPS evaluator's 14 continuation types, mutual recursion (`meval`/`apply-k`/`mapply`), environment lookup, and builtin dispatch — all folded away. What remains is the bare computation plus the continuation plumbing that makes call/cc possible. See [`docs/futamura-projections.md`](docs/futamura-projections.md) for the full walkthrough.
 
 **The reflective tower** demonstrates three levels grounded in the Cayley table:
 
@@ -214,11 +250,15 @@ The classic PE benchmark also works: `power(base, 3)` with unknown base produces
 
 Every continuation is a tagged list, not a closure. The program can read, modify, and rewrite its own control flow.
 
+**The reflective tower on Lua** — the entire tower (CPS evaluator + reify/reflect + branch swap) compiles to Lua via `--compile-lua` and runs 12.6x faster than the interpreter (16.7ms vs 210ms). All 45 tests pass, including the branch swap. Smith's 3-Lisp on a Lua VM with garbage collection.
+
 ```bash
-cargo run -- examples/futamura-real.scm          # Futamura P1: the interpreter vanishes
-cargo run -- examples/reflective-tower.scm       # three-level tower with branch swap
-cargo run -- examples/pe.scm                     # PE tests (power residualization, etc.)
-cargo run -- examples/algebra-smoke.scm          # 83 algebra assertions
+cargo run -- examples/reflective-tower.scm                             # interpreted
+cargo run -- --compile-lua examples/reflective-tower.scm | lua -       # compiled to Lua (12.6x faster)
+cargo run -- examples/futamura-real.scm                                # Futamura P1
+cargo run -- examples/futamura-cps.scm                                 # Futamura P2
+cargo run -- examples/pe.scm                                           # PE tests
+cargo run -- examples/algebra-smoke.scm                                # 83 algebra assertions
 ```
 
 ## `no_std` Support
@@ -240,13 +280,17 @@ cargo check --no-default-features --lib
 
 ## Future Work
 
-- **MMTk Immix GC** as an optional feature (`features = ["gc"]`). The bump allocator is the default for `no_std` embedded targets. Long-running applications can opt into garbage collection via [MMTk](https://www.mmtk.io/). The Kamea project already has a working MMTk Immix binding that achieves 184 µs on N-Queens(8).
+- **GC for the interpreter.** The tree-walking interpreter's heap grows without bound (400MB on fib(30)). A mark-and-sweep over the rib heap would fix this. The Lua backend sidesteps the problem entirely — Lua's GC manages cons cells.
 
-- **Compiler improvements.** Mutual tail recursion (currently only self-tail-calls are optimized), `call/cc` support in compiled output.
+- **P2 → Lua pipeline.** The Futamura P2 demo produces residual CPS code for partially-known programs. Piping that residual through `--compile-lua` would complete the compiler pipeline: Scheme → PE specializes CPS evaluator → residual CPS → fast Lua with call/cc preserved.
 
-- **Embedded demo.** Run WispyScheme on an RP2040 or ESP32-C3: read sensor values, apply user-defined Scheme rules, actuate outputs. Upload new `.scm` files over serial without reflashing.
+- **Bytecode VM.** The interpreter is 100x slower than Lua because it tree-walks. A bytecode compiler and register-based VM would close this gap. The Lua backend is the practical workaround.
 
-- **Self-hosted compiler.** The self-hosted transpiler (`examples/transpile.scm`) currently only handles the 7-node algebraic IR (Atom/Var/Dot/If/Let/Lam/App). Extending it to cover full R4RS Scheme — closures, tail calls, strings, builtins — would replace the Rust compiler (`compile.rs`) with a Scheme-in-Scheme compiler. It would still emit Rust (using `rustc` as a backend), but the compiler itself would be written in the language it compiles.
+- **ESP32 deployment.** The Lua backend targets [NodeMCU](https://nodemcu.readthedocs.io/) (Lua on ESP32). Compile Scheme to Lua on the workstation, upload `.lua` files over serial or MQTT. The Cayley table is a Lua array. No cross-compilation needed.
+
+- **Compiler improvements.** Mutual tail recursion (currently only self-tail-calls are optimized), `call/cc` support in compiled Rust output, named `let` in both compiler backends.
+
+- **Self-hosted compiler.** The self-hosted transpiler (`examples/transpile.scm`) currently only handles the 7-node algebraic IR. Extending it to cover full R4RS Scheme would replace `compile.rs` with a Scheme-in-Scheme compiler.
 
 ## Lineage
 
