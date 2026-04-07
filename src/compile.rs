@@ -896,6 +896,7 @@ impl Compiler {
             "char->integer" | "integer->char" | "number->string" | "string->number" |
             "string-length" | "string-ref" | "string-append" |
             "make-vector" | "vector-length" | "vector-ref" | "vector-set!" |
+            "list->vector" | "vector->list" |
             "lcm" | "raise" | "values" | "call-with-values" |
             "error-object?" | "error-object-message" | "error-object-irritants"
         )
@@ -1549,6 +1550,8 @@ impl Compiler {
                     "vector-ref" => "    vector_ref(args[0], args[1].as_fixnum().unwrap())\n",
                     "vector-set!" => "    { vector_set(args[0], args[1].as_fixnum().unwrap(), args[2]); Val::NIL }\n",
                     "vector?" => "    bool_to_val(is_vector(args[0]))\n",
+                    "list->vector" => "    list_to_vector(args[0])\n",
+                    "vector->list" => "    vector_to_list(args[0])\n",
                     "char?" => "    bool_to_val(is_char(args[0]))\n",
                     "string?" => "    bool_to_val(is_string(args[0]))\n",
                     "exact?" => "    bool_to_val(args[0].is_fixnum())\n",
@@ -1648,6 +1651,7 @@ impl Compiler {
         out.push_str(&format!("const TAG_ERROR: u8 = {};\n", table::T_ERROR));
         out.push_str(&format!("const TAG_RECORD: u8 = {};\n", table::T_RECORD));
         out.push_str(&format!("const TAG_VEC: u8 = {};\n", table::T_VEC));
+        out.push_str("const TAG_VEC_ELEM: u8 = 253;\n");
         out.push_str(&format!("const TAG_CONT: u8 = {};\n", table::T_CONT));
         out.push_str(&format!("const TAG_PORT: u8 = {};\n", table::T_PORT));
         out.push_str(&format!("const TAG_EOF: u8 = {};\n", table::EOF));
@@ -2933,6 +2937,14 @@ impl Compiler {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
                     return format!("bool_to_val(is_vector({a}))");
                 }
+                "list->vector" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("list_to_vector({a})");
+                }
+                "vector->list" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("vector_to_list({a})");
+                }
                 // ── Algebra extension ────────────
                 "dot" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
@@ -3814,6 +3826,15 @@ fn alloc_rib(car: Val, cdr: Val, tag: u8) -> Val {
     }
 }
 
+fn alloc_vector(n: i64, fill: Val) -> Val {
+    unsafe {
+        let idx = HEAP.len();
+        HEAP.push(Rib { car: Val::NIL, cdr: Val::fixnum(n), tag: TAG_VEC });
+        for _ in 0..n { HEAP.push(Rib { car: fill, cdr: Val::NIL, tag: TAG_VEC_ELEM }); }
+        Val::rib(idx)
+    }
+}
+
 #[inline]
 fn cons(car: Val, cdr: Val) -> Val {
     alloc_rib(car, cdr, TAG_PAIR)
@@ -4082,6 +4103,15 @@ fn display(v: Val) {
             } else if rib.tag == TAG_CHAR {
                 let cp = rib.car.as_fixnum().unwrap_or(0);
                 print!("{}", cp as u8 as char);
+            } else if rib.tag == TAG_VEC {
+                print!("{}{}", '\x23', '(');
+                let len = rib.cdr.as_fixnum().unwrap_or(0) as usize;
+                let base = v.as_rib();
+                for i in 0..len {
+                    if i > 0 { print!(" "); }
+                    display(HEAP[base + 1 + i].car);
+                }
+                print!(")");
             } else if rib.tag == TAG_BOT {
                 print!("{}{}", '\x23', 'f');
             } else if rib.tag == 20 {
@@ -4293,6 +4323,19 @@ fn scheme_equal(a: Val, b: Val) -> bool {
         }
         if ra.tag == TAG_STR { return string_eq(a, b); }
         if ra.tag == TAG_CHAR { return ra.car == rb.car; }
+        if ra.tag == TAG_VEC {
+            let len_a = ra.cdr.as_fixnum().unwrap_or(-1);
+            let len_b = rb.cdr.as_fixnum().unwrap_or(-2);
+            if len_a != len_b { return false; }
+            let base_a = a.as_rib();
+            let base_b = b.as_rib();
+            for i in 0..len_a as usize {
+                if !scheme_equal(HEAP[base_a + 1 + i].car, HEAP[base_b + 1 + i].car) {
+                    return false;
+                }
+            }
+            return true;
+        }
         false
     }
 }
@@ -4390,6 +4433,15 @@ fn scheme_write(v: Val) {
                 print!("{}{}", '\x23', 'f');
             } else if rib.tag == 20 {
                 print!("{}{}", '\x23', 't');
+            } else if rib.tag == TAG_VEC {
+                print!("{}{}", '\x23', '(');
+                let len = rib.cdr.as_fixnum().unwrap_or(0) as usize;
+                let base = v.as_rib();
+                for i in 0..len {
+                    if i > 0 { print!(" "); }
+                    scheme_write(HEAP[base + 1 + i].car);
+                }
+                print!(")");
             } else if rib.tag == TAG_CLS {
                 print!("<procedure>");
             } else {
@@ -4399,12 +4451,10 @@ fn scheme_write(v: Val) {
     }
 }
 
-// ── Vector support ──────────────────────────────────────────────
+// ── Vector support (flat layout: header + N consecutive element ribs) ──
 
 fn make_vector_fill(n: i64, fill: Val) -> Val {
-    let mut elems = Val::NIL;
-    for _ in 0..n { elems = cons(fill, elems); }
-    alloc_rib(elems, Val::fixnum(n), TAG_VEC)
+    alloc_vector(n, fill)
 }
 
 fn is_vector(v: Val) -> bool {
@@ -4412,19 +4462,39 @@ fn is_vector(v: Val) -> bool {
 }
 
 fn vector_length(v: Val) -> Val {
-    if is_vector(v) { cdr(v) } else { Val::fixnum(0) }
+    if is_vector(v) { unsafe { HEAP[v.as_rib()].cdr } } else { Val::fixnum(0) }
 }
 
+#[inline(always)]
 fn vector_ref(v: Val, idx: i64) -> Val {
-    let mut elems = car(v);
-    for _ in 0..idx { elems = cdr(elems); }
-    car(elems)
+    unsafe { HEAP[v.as_rib() + 1 + idx as usize].car }
 }
 
+#[inline(always)]
 fn vector_set(v: Val, idx: i64, val: Val) {
-    let mut elems = car(v);
-    for _ in 0..idx { elems = cdr(elems); }
-    set_car(elems, val);
+    unsafe { HEAP[v.as_rib() + 1 + idx as usize].car = val; }
+}
+
+fn list_to_vector(lst: Val) -> Val {
+    let mut len = 0i64;
+    let mut l = lst;
+    while l != Val::NIL && !l.is_fixnum() { len += 1; l = cdr(l); }
+    let v = alloc_vector(len, Val::NIL);
+    l = lst;
+    for i in 0..len as usize {
+        unsafe { HEAP[v.as_rib() + 1 + i].car = car(l); }
+        l = cdr(l);
+    }
+    v
+}
+
+fn vector_to_list(v: Val) -> Val {
+    let len = unsafe { HEAP[v.as_rib()].cdr.as_fixnum().unwrap_or(0) } as usize;
+    let mut lst = Val::NIL;
+    for i in (0..len).rev() {
+        lst = cons(unsafe { HEAP[v.as_rib() + 1 + i].car }, lst);
+    }
+    lst
 }
 
 // ── Ports / I/O ─────────────────────────────────────────────────
@@ -4952,6 +5022,30 @@ fn alloc_rib(car: Val, cdr: Val, tag: u8) -> Val {
     }
 }
 
+fn alloc_vector(n: i64, fill: Val) -> Val {
+    unsafe {
+        let need = 1 + n as usize;
+        if ALLOC_PTR + need > SEMI_SIZE {
+            let base = GC_STACK.len();
+            GC_STACK.push(fill);
+            gc_collect();
+            let fill = GC_STACK[base];
+            GC_STACK.truncate(base);
+            if ALLOC_PTR + need > SEMI_SIZE - (SEMI_SIZE / 8) {
+                eprintln!("Out of memory for vector of {n} elements");
+                std::process::exit(1);
+            }
+        }
+        let idx = ALLOC_PTR;
+        ALLOC_PTR += need;
+        HEAP[idx] = Rib { car: Val::NIL, cdr: Val::fixnum(n), tag: TAG_VEC };
+        for i in 0..n as usize {
+            HEAP[idx + 1 + i] = Rib { car: fill, cdr: Val::NIL, tag: TAG_VEC_ELEM };
+        }
+        Val::rib(idx)
+    }
+}
+
 // ── Cheney semi-space copying GC ────────────────────────────────
 
 fn gc_collect() {
@@ -5007,7 +5101,23 @@ unsafe fn gc_copy_rib(old_idx: usize) -> Val {
         return HEAP[old_idx].car; // forwarding pointer to new location
     }
 
-    // Copy rib to to-space at ALLOC_PTR
+    // Flat vector: bulk-copy header + N element ribs
+    if HEAP[old_idx].tag == TAG_VEC {
+        let len = HEAP[old_idx].cdr.as_fixnum().unwrap_or(0) as usize;
+        let total = 1 + len;
+        let new_idx = ALLOC_PTR;
+        ALLOC_PTR += total;
+        for i in 0..total {
+            HEAP_ALT[new_idx + i] = HEAP[old_idx + i];
+        }
+        // Install forwarding pointers for header + all element ribs
+        for i in 0..total {
+            HEAP[old_idx + i] = Rib { car: Val::rib(new_idx + i), cdr: Val::NIL, tag: FORWARDED };
+        }
+        return Val::rib(new_idx);
+    }
+
+    // Normal single-rib copy
     let new_idx = ALLOC_PTR;
     ALLOC_PTR += 1;
     HEAP_ALT[new_idx] = HEAP[old_idx];

@@ -47,24 +47,24 @@ For interpreted execution, REPL, and running the self-hosted tools (reflective t
 
 | Benchmark | Wispy (no GC) | Wispy (Cheney) | Chez | Winner |
 |-----------|:------------:|:--------------:|:----:|--------|
-| fib | 2.15s | 2.17s | 3.31s | **Wispy** 1.5x |
-| tak | 1.03s | 1.04s | 1.39s | **Wispy** 1.3x |
-| sum | 0.93s | 4.29s | 2.35s | **Wispy** 2.5x |
-| ack | 4.92s | 8.90s | 2.33s | **Chez** 2.1x |
-| deriv | 2.97s | 2.14s | 0.97s | **Chez** 3.1x |
-| diviter | 4.65s | 3.84s | 1.06s | **Chez** 4.4x |
-| divrec | 7.56s | 7.54s | 1.40s | **Chez** 5.4x |
-| nqueens | 8.53s | 10.86s | 3.83s | **Chez** 2.2x |
-| destruc | 2.83s | 3.28s | 1.26s | **Chez** 2.2x |
-| triangl | 21.49s | 22.24s | 2.07s | **Chez** 10.4x |
-| takl | 3.95s | 3.95s | 3.31s | **Chez** 1.2x |
-| primes | 2.30s | 2.58s | 0.66s | **Chez** 3.5x |
+| fib | 2.16s | 2.18s | 3.28s | **Wispy** 1.5x |
+| tak | 1.02s | 1.04s | 1.38s | **Wispy** 1.4x |
+| sum | 0.45s | — | 2.36s | **Wispy** 5.2x |
+| ack | 4.88s | 8.75s | 2.24s | **Chez** 2.2x |
+| deriv | 3.67s | 2.77s | 0.91s | **Chez** 4.0x |
+| diviter | 4.65s | 4.25s | 1.26s | **Chez** 3.7x |
+| divrec | 7.61s | 7.95s | 1.40s | **Chez** 5.4x |
+| nqueens | 8.71s | 11.92s | 3.79s | **Chez** 2.3x |
+| destruc | 2.85s | — | 1.27s | **Chez** 2.2x |
+| triangl | 1.34s | 3.19s | 1.85s | **Wispy** 1.4x |
+| takl | 4.06s | 4.01s | 3.39s | **Chez** 1.2x |
+| primes | 2.32s | 2.57s | 0.65s | **Chez** 3.6x |
 
-Benchmarks from [r7rs-benchmarks](https://github.com/ecraven/r7rs-benchmarks) with standard parameters. Wispy wins 3/12 (fixnum-heavy), Chez wins 9/12 (allocation/list-heavy).
+Benchmarks from [r7rs-benchmarks](https://github.com/ecraven/r7rs-benchmarks) with standard parameters. Wispy wins 4/12 (fixnum-heavy + vector), Chez wins 8/12 (allocation/list-heavy). "—" marks GC codegen bugs not yet fixed.
 
-**No-GC mode** (grow-only heap) wins on pure fixnum recursion: 2.5× faster than Chez on sum, 1.5× on fib, 1.3× on tak. The gap on allocation-heavy benchmarks (triangl 10×, divrec 5.4×) is due to unbounded heap growth and no compaction.
+**No-GC mode** (grow-only heap) wins on pure fixnum recursion: 5.2× faster than Chez on sum, 1.5× on fib, 1.4× on tak, 1.4× on triangl. The gap on allocation-heavy benchmarks (divrec 5.4×, deriv 4.0×) is due to unbounded heap growth, no compaction, and unoptimized codegen (no type inference, no inlining).
 
-**Cheney GC mode** uses liveness-based root elision: functions whose bodies (transitively) never allocate emit zero GC overhead. On fib/tak/takl/divrec, Cheney matches no-GC exactly. On deriv/diviter, Cheney *beats* no-GC (compaction improves cache locality). The remaining overhead on sum/ack/nqueens is from the benchmark harness calling closures via `call_val`, which the analysis conservatively treats as allocating.
+**Cheney GC mode** uses liveness-based root elision: functions whose bodies (transitively) never allocate emit zero GC overhead. On fib/tak/takl, Cheney matches no-GC exactly. On deriv/diviter, Cheney *beats* no-GC (compaction improves cache locality). The remaining overhead on ack/nqueens is from the benchmark harness calling closures via `call_val`, which the analysis conservatively treats as allocating.
 
 ## Garbage Collection
 
@@ -132,7 +132,6 @@ cargo check --no-default-features --lib
 
 Runtime changes (survive self-hosting):
 
-- **Flat vectors.** Vectors are currently encoded as cons chains (`vector-ref` walks N cdrs). A flat `Vec<Val>` or inline array representation would make vector-heavy benchmarks like triangl competitive — this alone accounts for the 10× gap vs Chez.
 - **Bare-metal RISC-V.** `--target no-std` with fixed-size heap arrays, no alloc crate, UART output.
 
 Self-hosting:
