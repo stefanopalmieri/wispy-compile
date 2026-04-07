@@ -93,6 +93,13 @@ cargo check --no-default-features --lib
 - **call/cc** — escape-only (non-reentrant). Full continuations would require a CPS transform.
 - **Symbols at runtime** — `symbol->string` / `string->symbol` are not yet supported (symbols exist only at compile time).
 
+## Future Work
+
+- **Self-hosted compiler.** `examples/transpile.scm` is a self-hosted IR → Rust code generator ported from Kamea. The goal is to extend it to cover full Scheme, replacing `compile.rs` with Scheme-in-Scheme compiled by its own output.
+- **Futamura P3.** Specialize the transpiler on a known program to produce a residual Rust-emitting program — a compiler generated from an interpreter.
+- **Mutual tail recursion.** Trampoline or CPS transform for mutually recursive tail calls.
+- **Full continuations.** CPS transform for reentrant `call/cc`.
+
 ## Lineage
 
 WispyScheme descends from the [Kamea](https://github.com/stefanopalmieri/Kamea) project's algebraic framework. The independence theorems (93 Lean theorems, zero `sorry`) are in [finite-magma-independence](https://github.com/stefanopalmieri/finite-magma-independence). The VM is a fork of [Stak](https://github.com/raviqqe/stak), itself derived from [Ribbit](https://github.com/udem-dlteam/ribbit), with the Cayley table integrated into the VM.
