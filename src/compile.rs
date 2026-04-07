@@ -2610,6 +2610,89 @@ impl Compiler {
                     out.push_str(" }");
                     return out;
                 }
+                "cond" => {
+                    // Inline version of emit_cond — produces a block expression
+                    let code = self.emit_cond(rest, heap, syms, 0);
+                    return format!("{{ {} }}", code.trim());
+                }
+                "case" => {
+                    // Inline version of emit_case — produces a block expression
+                    let code = self.emit_case(rest, heap, syms, 0);
+                    return format!("{{ {} }}", code.trim());
+                }
+                "do" => {
+                    // Inline version of emit_do — produces a block expression
+                    let var_specs = heap.car(rest);
+                    let test_clause = heap.car(heap.cdr(rest));
+                    let commands = heap.cdr(heap.cdr(rest));
+
+                    let mut out = "{ ".to_string();
+
+                    // Initialize vars
+                    let mut vars = Vec::new();
+                    let mut vs = var_specs;
+                    while heap.is_pair(vs) {
+                        let spec = heap.car(vs);
+                        let var = heap.car(spec);
+                        let init = heap.car(heap.cdr(spec));
+                        let step_rest = heap.cdr(heap.cdr(spec));
+                        let step = if heap.is_pair(step_rest) { Some(heap.car(step_rest)) } else { None };
+
+                        let vname = syms.symbol_name(var).unwrap_or("_").to_string();
+                        let init_code = self.emit_expr_inline(init, heap, syms);
+                        out.push_str(&format!("let mut {} = {init_code}; ", rust_ident(&vname)));
+                        vars.push((vname, step));
+                        vs = heap.cdr(vs);
+                    }
+
+                    let test_expr = heap.car(test_clause);
+                    let result_exprs = heap.cdr(test_clause);
+
+                    out.push_str("loop { ");
+
+                    // Test
+                    let test_code = self.emit_expr_inline(test_expr, heap, syms);
+                    out.push_str(&format!("if is_true({test_code}) {{ break "));
+                    // Result expressions
+                    let mut rparts = Vec::new();
+                    let mut r = result_exprs;
+                    while heap.is_pair(r) {
+                        rparts.push(self.emit_expr_inline(heap.car(r), heap, syms));
+                        r = heap.cdr(r);
+                    }
+                    if let Some(last) = rparts.pop() {
+                        for p in &rparts { out.push_str(&format!("{p}; ")); }
+                        out.push_str(&last);
+                    } else {
+                        out.push_str("Val::NIL");
+                    }
+                    out.push_str(" } ");
+
+                    // Commands
+                    let mut cmd = commands;
+                    while heap.is_pair(cmd) {
+                        let code = self.emit_expr_inline(heap.car(cmd), heap, syms);
+                        out.push_str(&format!("{code}; "));
+                        cmd = heap.cdr(cmd);
+                    }
+
+                    // Step vars (compute all first, then assign)
+                    let mut step_codes = Vec::new();
+                    for (vname, step) in &vars {
+                        if let Some(step_expr) = step {
+                            step_codes.push((vname.clone(), self.emit_expr_inline(*step_expr, heap, syms)));
+                        }
+                    }
+                    for (vname, code) in &step_codes {
+                        out.push_str(&format!("let _next_{vn} = {code}; ", vn = rust_ident(vname)));
+                    }
+                    for (vname, _) in &step_codes {
+                        out.push_str(&format!("{vn} = _next_{vn}; ", vn = rust_ident(vname)));
+                    }
+
+                    out.push_str("} }");
+                    return out;
+                }
                 "lambda" => {
                     return self.compile_lambda(rest, heap, syms);
                 }
