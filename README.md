@@ -47,24 +47,24 @@ For interpreted execution, REPL, and running the self-hosted tools (reflective t
 
 | Benchmark | Wispy (no GC) | Wispy (Cheney) | Chez | Winner |
 |-----------|:------------:|:--------------:|:----:|--------|
-| fib | 2.38s | 2.15s | 3.42s | **Wispy** 1.44x |
-| tak | 1.12s | 1.02s | 1.38s | **Wispy** 1.23x |
-| sum | 1.09s | 4.33s | 2.49s | **Wispy** 2.28x |
-| ack | 4.99s | 8.93s | 2.38s | **Chez** 2.10x |
-| deriv | 2.92s | 2.10s | 0.88s | **Chez** 3.32x |
-| diviter | 4.67s | 4.68s | 1.17s | **Chez** 3.99x |
-| divrec | 7.81s | 7.92s | 1.36s | **Chez** 5.74x |
-| nqueens | 8.36s | 10.94s | 3.83s | **Chez** 2.18x |
-| destruc | 2.87s | 3.37s | 1.27s | **Chez** 2.26x |
-| triangl | 21.44s | 22.41s | 2.10s | **Chez** 10.21x |
-| takl | 3.99s | 4.11s | 3.31s | **Chez** 1.21x |
-| primes | 2.35s | 2.63s | 0.65s | **Chez** 3.62x |
+| fib | 2.15s | 2.17s | 3.31s | **Wispy** 1.5x |
+| tak | 1.03s | 1.04s | 1.39s | **Wispy** 1.3x |
+| sum | 0.93s | 4.29s | 2.35s | **Wispy** 2.5x |
+| ack | 4.92s | 8.90s | 2.33s | **Chez** 2.1x |
+| deriv | 2.97s | 2.14s | 0.97s | **Chez** 3.1x |
+| diviter | 4.65s | 3.84s | 1.06s | **Chez** 4.4x |
+| divrec | 7.56s | 7.54s | 1.40s | **Chez** 5.4x |
+| nqueens | 8.53s | 10.86s | 3.83s | **Chez** 2.2x |
+| destruc | 2.83s | 3.28s | 1.26s | **Chez** 2.2x |
+| triangl | 21.49s | 22.24s | 2.07s | **Chez** 10.4x |
+| takl | 3.95s | 3.95s | 3.31s | **Chez** 1.2x |
+| primes | 2.30s | 2.58s | 0.66s | **Chez** 3.5x |
 
 Benchmarks from [r7rs-benchmarks](https://github.com/ecraven/r7rs-benchmarks) with standard parameters. Wispy wins 3/12 (fixnum-heavy), Chez wins 9/12 (allocation/list-heavy).
 
-**No-GC mode** (grow-only heap) wins on pure fixnum recursion: 2.3× faster than Chez on sum, 1.4× on fib, 1.2× on tak. The gap on allocation-heavy benchmarks (triangl 10×, divrec 5.7×) is due to unbounded heap growth and no compaction.
+**No-GC mode** (grow-only heap) wins on pure fixnum recursion: 2.5× faster than Chez on sum, 1.5× on fib, 1.3× on tak. The gap on allocation-heavy benchmarks (triangl 10×, divrec 5.4×) is due to unbounded heap growth and no compaction.
 
-**Cheney GC mode** uses liveness-based root elision: functions whose bodies (transitively) never allocate emit zero GC overhead. On fib/tak, Cheney is actually *faster* than no-GC (compaction improves cache locality on the call stack). On deriv, Cheney beats no-GC by 28% (2.10s vs 2.92s). The remaining overhead on allocation-heavy benchmarks is from shadow-stack bookkeeping in functions that do allocate.
+**Cheney GC mode** uses liveness-based root elision: functions whose bodies (transitively) never allocate emit zero GC overhead. On fib/tak/takl/divrec, Cheney matches no-GC exactly. On deriv/diviter, Cheney *beats* no-GC (compaction improves cache locality). The remaining overhead on sum/ack/nqueens is from the benchmark harness calling closures via `call_val`, which the analysis conservatively treats as allocating.
 
 ## Garbage Collection
 
