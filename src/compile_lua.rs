@@ -71,6 +71,28 @@ impl LuaCompiler {
                             }
                             continue;
                         }
+                        if name == "load" {
+                            // Compile-time file inclusion
+                            let rest = heap.cdr(expr);
+                            let path_val = heap.car(rest);
+                            if heap.tag(path_val) == crate::table::T_STR {
+                                let mut path_chars = Vec::new();
+                                let mut chars = heap.rib_car(path_val);
+                                while heap.is_pair(chars) {
+                                    if let Some(cp) = heap.car(chars).as_fixnum() {
+                                        path_chars.push(cp as u8 as char);
+                                    }
+                                    chars = heap.cdr(chars);
+                                }
+                                let path: String = path_chars.into_iter().collect();
+                                if let Ok(src) = std::fs::read_to_string(&path) {
+                                    let loaded = crate::reader::read_all(&src, heap, syms)
+                                        .unwrap_or_default();
+                                    self.process(loaded.as_slice(), heap, syms);
+                                }
+                            }
+                            continue;
+                        }
                         if name == "define" {
                             let expanded = self.expand_all(expr, &macros, heap, syms);
                             self.process_define(expanded, heap, syms);
@@ -142,7 +164,9 @@ impl LuaCompiler {
             let body = if heap.cdr(body_list) == Val::NIL {
                 heap.car(body_list)
             } else {
-                body_list
+                // Wrap multi-body in (begin ...)
+                let begin_sym = syms.intern("begin", heap);
+                heap.cons(begin_sym, body_list)
             };
             self.functions.push((name, params, body));
         }
@@ -392,6 +416,14 @@ impl LuaCompiler {
         out.push_str(LUA_RUNTIME);
         out.push_str("\n");
 
+        // Forward-declare globals (so functions can reference them via set!)
+        if !self.globals.is_empty() {
+            let names: Vec<String> = self.globals.iter()
+                .map(|(name, _)| lua_ident(name))
+                .collect();
+            out.push_str(&format!("local {}\n\n", names.join(", ")));
+        }
+
         // Functions
         for (name, params, body) in &self.functions {
             let lname = lua_ident(name);
@@ -419,18 +451,19 @@ impl LuaCompiler {
             }
         }
 
-        // Globals
+        // Initialize globals (already forward-declared above)
         for (name, init) in &self.globals {
             let lname = lua_ident(name);
             let init_code = self.emit_expr_inline(init.clone(), heap, syms);
-            out.push_str(&format!("local {lname} = {init_code}\n"));
+            out.push_str(&format!("{lname} = {init_code}\n"));
         }
 
-        // Main expressions
+        // Main expressions — wrap in dummy local to make any expression a valid statement
         for &expr in &self.main_exprs {
             let code = self.emit_expr_inline(expr, heap, syms);
-            out.push_str(&code);
-            out.push_str("\n");
+            // Use `local _ = expr` to make any expression a valid Lua statement
+            // and avoid the ambiguity of (expr)(...) across lines
+            out.push_str(&format!("local _ = {code}\n"));
         }
 
         out
@@ -589,6 +622,19 @@ impl LuaCompiler {
         if tag == table::BOT {
             return "false".to_string();
         }
+        if tag == table::T_STR {
+            // Extract string characters from the rib
+            let mut chars = Vec::new();
+            let mut cl = heap.rib_car(expr);
+            while heap.is_pair(cl) {
+                if let Some(cp) = heap.car(cl).as_fixnum() {
+                    chars.push(cp as u8 as char);
+                }
+                cl = heap.cdr(cl);
+            }
+            let s: String = chars.into_iter().collect();
+            return format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"));
+        }
         if tag != table::T_PAIR {
             return "NIL".to_string();
         }
@@ -681,6 +727,18 @@ impl LuaCompiler {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
                     return format!("(type({a}) == \"boolean\")");
                 }
+                "string?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("(type({a}) == \"string\")");
+                }
+                "char?" => {
+                    // Chars are not a distinct type in our Lua representation
+                    return "false".to_string();
+                }
+                "symbol?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("is_symbol({a})");
+                }
                 "zero?" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
                     return format!("({a} == 0)");
@@ -708,7 +766,7 @@ impl LuaCompiler {
                 "eq?" | "eqv?" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
                     let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("({a} == {b})");
+                    return format!("scm_eq({a}, {b})");
                 }
                 "equal?" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
@@ -746,6 +804,16 @@ impl LuaCompiler {
                     }
                     return s;
                 }
+                "list-ref" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("list_ref({a}, {b})");
+                }
+                "list-tail" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("list_tail({a}, {b})");
+                }
                 "append" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
                     let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
@@ -760,7 +828,7 @@ impl LuaCompiler {
                     return format!("scm_display({a})");
                 }
                 "newline" => {
-                    return "io.write(\"\\n\")".to_string();
+                    return "scm_newline()".to_string();
                 }
                 "and" => {
                     let mut parts = Vec::new();
@@ -790,7 +858,105 @@ impl LuaCompiler {
                     let val = heap.car(heap.cdr(rest));
                     let vname = syms.symbol_name(var).unwrap_or("_");
                     let val_code = self.emit_expr_inline(val, heap, syms);
-                    return format!("(function() {} = {} end)()", lua_ident(vname), val_code);
+                    return format!("(function() {} = {}; return NIL end)()", lua_ident(vname), val_code);
+                }
+                // Control-flow forms as inline expressions (IIFE wrappers)
+                "let" | "let*" => {
+                    let bindings = heap.car(rest);
+                    let body = heap.cdr(rest);
+                    let mut parts = String::from("(function() ");
+                    let mut b = bindings;
+                    while heap.is_pair(b) {
+                        let binding = heap.car(b);
+                        let var = heap.car(binding);
+                        let init = heap.car(heap.cdr(binding));
+                        let vname = syms.symbol_name(var).unwrap_or("_");
+                        let init_code = self.emit_expr_inline(init, heap, syms);
+                        parts.push_str(&format!("local {} = {}; ", lua_ident(vname), init_code));
+                        b = heap.cdr(b);
+                    }
+                    parts.push_str(&self.emit_iife_body(body, heap, syms));
+                    parts.push_str(" end)()");
+                    return parts;
+                }
+                "letrec" => {
+                    let bindings = heap.car(rest);
+                    let body = heap.cdr(rest);
+                    let mut parts = String::from("(function() ");
+                    let mut b = bindings;
+                    // Declare all
+                    let mut names = Vec::new();
+                    while heap.is_pair(b) {
+                        let binding = heap.car(b);
+                        let var = heap.car(binding);
+                        let vname = syms.symbol_name(var).unwrap_or("_");
+                        names.push(lua_ident(vname));
+                        b = heap.cdr(b);
+                    }
+                    for n in &names {
+                        parts.push_str(&format!("local {}; ", n));
+                    }
+                    // Assign
+                    b = bindings;
+                    for n in &names {
+                        let binding = heap.car(b);
+                        let init = heap.car(heap.cdr(binding));
+                        let init_code = self.emit_expr_inline(init, heap, syms);
+                        parts.push_str(&format!("{} = {}; ", n, init_code));
+                        b = heap.cdr(b);
+                    }
+                    parts.push_str(&self.emit_iife_body(body, heap, syms));
+                    parts.push_str(" end)()");
+                    return parts;
+                }
+                "begin" => {
+                    let mut count = 0;
+                    let mut r = rest;
+                    while heap.is_pair(r) { count += 1; r = heap.cdr(r); }
+                    if count == 1 {
+                        return self.emit_expr_inline(heap.car(rest), heap, syms);
+                    }
+                    let mut parts = String::from("(function() ");
+                    parts.push_str(&self.emit_iife_body(rest, heap, syms));
+                    parts.push_str(" end)()");
+                    return parts;
+                }
+                "cond" => {
+                    // Emit cond as nested ternary or IIFE
+                    let mut parts = String::from("(function() ");
+                    let mut clauses = rest;
+                    let mut first = true;
+                    while heap.is_pair(clauses) {
+                        let clause = heap.car(clauses);
+                        let test = heap.car(clause);
+                        let body = heap.cdr(clause);
+                        let body_code = self.emit_begin_inline(body, heap, syms);
+
+                        if heap.is_symbol(test) && syms.sym_eq(test, "else") {
+                            parts.push_str(&format!("return {} ", body_code));
+                            parts.push_str("end)()");
+                            return parts;
+                        }
+
+                        let test_code = self.emit_expr_inline(test, heap, syms);
+                        let cond = if self.is_boolean_expr(test, heap, syms) {
+                            test_code
+                        } else {
+                            format!("is_true({})", test_code)
+                        };
+                        if first {
+                            parts.push_str(&format!("if {} then return {} ", cond, body_code));
+                            first = false;
+                        } else {
+                            parts.push_str(&format!("elseif {} then return {} ", cond, body_code));
+                        }
+                        clauses = heap.cdr(clauses);
+                    }
+                    if !first {
+                        parts.push_str("else return NIL end ");
+                    }
+                    parts.push_str("end)()");
+                    return parts;
                 }
                 "quote" => {
                     let datum = heap.car(rest);
@@ -872,9 +1038,29 @@ impl LuaCompiler {
             } else {
                 let code = self.emit_expr_inline(heap.car(body), heap, syms);
                 let pad = "  ".repeat(indent);
-                out.push_str(&format!("{pad}{code}\n"));
+                let semi = if code.starts_with('(') { ";" } else { "" };
+                out.push_str(&format!("{pad}{semi}{code}\n"));
             }
             body = heap.cdr(body);
+        }
+        out
+    }
+
+    /// Emit a body list as statements inside an IIFE: all but last as statements, last as return.
+    fn emit_iife_body(&self, mut body: Val, heap: &Heap, syms: &SymbolTable) -> String {
+        let mut exprs = Vec::new();
+        while heap.is_pair(body) {
+            exprs.push(heap.car(body));
+            body = heap.cdr(body);
+        }
+        let mut out = String::new();
+        for (i, &e) in exprs.iter().enumerate() {
+            let code = self.emit_expr_inline(e, heap, syms);
+            if i == exprs.len() - 1 {
+                out.push_str(&format!("return {}", code));
+            } else {
+                out.push_str(&format!("{}; ", code));
+            }
         }
         out
     }
@@ -937,14 +1123,25 @@ impl LuaCompiler {
         }
         if heap.is_symbol(datum) {
             let name = syms.symbol_name(datum).unwrap_or("_");
-            // Quoted symbol → string for identity
-            return format!("\"{}\"", name);
+            return format!("mksym(\"{}\")", name);
         }
         if heap.tag(datum) == table::TRUE {
             return "true".to_string();
         }
         if heap.tag(datum) == table::BOT {
             return "false".to_string();
+        }
+        if heap.tag(datum) == table::T_STR {
+            let mut chars = Vec::new();
+            let mut cl = heap.rib_car(datum);
+            while heap.is_pair(cl) {
+                if let Some(cp) = heap.car(cl).as_fixnum() {
+                    chars.push(cp as u8 as char);
+                }
+                cl = heap.cdr(cl);
+            }
+            let s: String = chars.into_iter().collect();
+            return format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"));
         }
         if heap.is_pair(datum) {
             let car_code = self.emit_datum(heap.car(datum), heap, syms);
@@ -1003,6 +1200,21 @@ const LUA_RUNTIME: &str = r#"
 -- Sentinel for '()
 local NIL = {}
 
+-- Symbols as tagged tables
+local _sym_cache = {}
+function mksym(name)
+  if not _sym_cache[name] then _sym_cache[name] = {__sym = name} end
+  return _sym_cache[name]
+end
+function is_symbol(v) return type(v) == "table" and v.__sym ~= nil end
+function sym_name(v) return v.__sym end
+
+function scm_eq(a, b)
+  if a == b then return true end
+  if is_symbol(a) and is_symbol(b) then return a.__sym == b.__sym end
+  return false
+end
+
 -- Cons cells as tables: {car, cdr}
 function cons(a, b) return {a, b} end
 function car(p) if type(p) == "table" and p ~= NIL then return p[1] else return NIL end end
@@ -1015,6 +1227,16 @@ function list_length(lst)
   local n = 0
   while lst ~= NIL and type(lst) == "table" do n = n + 1; lst = lst[2] end
   return n
+end
+
+function list_ref(lst, n)
+  for i = 1, n do lst = lst[2] end
+  return lst[1]
+end
+
+function list_tail(lst, n)
+  for i = 1, n do lst = lst[2] end
+  return lst
 end
 
 function list_append(a, b)
@@ -1033,7 +1255,9 @@ end
 
 function scm_equal(a, b)
   if a == b then return true end
+  if is_symbol(a) and is_symbol(b) then return a.__sym == b.__sym end
   if type(a) == "table" and type(b) == "table" and a ~= NIL and b ~= NIL then
+    if a.__sym or b.__sym then return false end
     return scm_equal(a[1], b[1]) and scm_equal(a[2], b[2])
   end
   return false
@@ -1044,6 +1268,7 @@ function scm_display(v)
   elseif v == true then io.write(string.char(35) .. "t")
   elseif v == false then io.write(string.char(35) .. "f")
   elseif type(v) == "number" then io.write(tostring(v))
+  elseif is_symbol(v) then io.write(v.__sym)
   elseif type(v) == "string" then io.write(v)
   elseif type(v) == "table" then
     io.write("(")
@@ -1061,6 +1286,8 @@ function scm_display(v)
     io.write(")")
   end
 end
+
+function scm_newline() io.write("\n"); return NIL end
 
 function scm_tau(v)
   if v == NIL then return TOP end
