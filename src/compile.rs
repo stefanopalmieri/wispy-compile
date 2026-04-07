@@ -16,12 +16,13 @@ use crate::val::Val;
 use crate::table;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// A clause for case-lambda: (params, body_list).
 #[derive(Clone)]
 struct CaseClause {
     params: Vec<String>,
+    rest_param: Option<String>,
     body_list: Val,
 }
 
@@ -30,6 +31,7 @@ struct CaseClause {
 struct LiftedLambda {
     id: usize,
     params: Vec<String>,
+    rest_param: Option<String>,
     free_vars: Vec<String>,
     body_list: Val, // list of body expressions (use emit_begin)
     /// If Some, this is a case-lambda with multiple dispatch clauses.
@@ -61,10 +63,18 @@ struct RecordType {
     mutators: Vec<(usize, String)>,  // (field_index, mutator_name)
 }
 
+/// A top-level function definition.
+struct Function {
+    name: String,
+    params: Vec<String>,
+    rest_param: Option<String>,
+    body: Val,
+}
+
 /// Compiler state.
 pub struct Compiler {
-    /// Collected top-level function definitions: (name, params, body)
-    functions: Vec<(String, Vec<String>, Val)>,
+    /// Collected top-level function definitions
+    functions: Vec<Function>,
     /// Top-level expressions to run in main
     main_exprs: Vec<Val>,
     /// Global variable definitions: (name, init_expr)
@@ -81,6 +91,8 @@ pub struct Compiler {
     record_types: Vec<RecordType>,
     /// User-defined libraries
     libraries: Vec<Library>,
+    /// Builtin closures: maps builtin name to its lambda ID
+    builtin_closures: RefCell<HashMap<String, usize>>,
 }
 
 impl Compiler {
@@ -95,6 +107,7 @@ impl Compiler {
             set_targets: RefCell::new(HashSet::new()),
             record_types: Vec::new(),
             libraries: Vec::new(),
+            builtin_closures: RefCell::new(HashMap::new()),
         }
     }
 
@@ -178,8 +191,8 @@ impl Compiler {
         for &expr in &self.main_exprs {
             self.collect_set_targets(expr, heap, syms);
         }
-        for &(_, _, body) in &self.functions {
-            self.collect_set_targets(body, heap, syms);
+        for func in &self.functions {
+            self.collect_set_targets(func.body, heap, syms);
         }
     }
 
@@ -242,6 +255,10 @@ impl Compiler {
                 }
                 p = heap.cdr(p);
             }
+            // Check for rest param (dotted tail)
+            let rest_param = if heap.is_symbol(p) {
+                syms.symbol_name(p).map(|s| s.to_string())
+            } else { None };
             // Collect body (may be multiple expressions)
             let body_list = heap.cdr(rest);
             let body = if heap.cdr(body_list) == Val::NIL {
@@ -251,7 +268,7 @@ impl Compiler {
                 let begin_sym = syms.intern("begin", heap);
                 heap.cons(begin_sym, body_list)
             };
-            self.functions.push((name, params, body));
+            self.functions.push(Function { name, params, rest_param, body });
         }
     }
 
@@ -455,9 +472,45 @@ impl Compiler {
 
     // ── Closure support helpers ────────────────────────────────────
 
+    /// Check if a name is a callable builtin (can be used as a first-class value).
+    fn is_callable_builtin(name: &str) -> bool {
+        matches!(name,
+            "+" | "-" | "*" | "/" | "=" | "<" | ">" | "<=" | ">=" |
+            "cons" | "car" | "cdr" | "null?" | "pair?" | "number?" | "integer?" |
+            "zero?" | "positive?" | "negative?" | "even?" | "odd?" | "not" |
+            "eq?" | "eqv?" | "equal?" | "boolean?" | "procedure?" |
+            "abs" | "max" | "min" | "expt" | "gcd" | "quotient" | "remainder" | "modulo" |
+            "set-car!" | "set-cdr!" | "length" | "append" | "reverse" |
+            "list-ref" | "list-tail" | "list" | "map" | "for-each" |
+            "display" | "newline" | "write" | "write-char" | "apply" | "error" |
+            "exact?" | "inexact?" | "char?" | "string?" | "vector?" | "symbol?" |
+            "char->integer" | "integer->char" | "number->string" | "string->number" |
+            "string-length" | "string-ref" | "string-append" |
+            "make-vector" | "vector-length" | "vector-ref" | "vector-set!" |
+            "lcm" | "raise" | "values" | "call-with-values" |
+            "error-object?" | "error-object-message" | "error-object-irritants"
+        )
+    }
+
+    /// Get or create a builtin closure ID for a builtin used as a value.
+    fn get_or_create_builtin_closure(&self, name: &str) -> usize {
+        if let Some(&id) = self.builtin_closures.borrow().get(name) {
+            return id;
+        }
+        let id = self.next_lambda_id.get();
+        self.next_lambda_id.set(id + 1);
+        self.builtin_closures.borrow_mut().insert(name.to_string(), id);
+        id
+    }
+
+    /// Check if a known top-level function is variadic (has rest param).
+    fn is_variadic_function(&self, name: &str) -> bool {
+        self.functions.iter().any(|f| f.name == name && f.rest_param.is_some())
+    }
+
     /// Check if a name is a known top-level function (including record type functions).
     fn is_known_function(&self, name: &str) -> bool {
-        self.functions.iter().any(|(n, _, _)| n == name)
+        self.functions.iter().any(|f| f.name == name)
             || self.record_types.iter().any(|rt| {
                 rt.constructor_name == name
                     || rt.predicate_name == name
@@ -468,7 +521,7 @@ impl Compiler {
 
     /// Get the closure ID for a known top-level function, if any.
     fn function_closure_id(&self, name: &str) -> Option<usize> {
-        self.functions.iter().position(|(n, _, _)| n == name)
+        self.functions.iter().position(|f| f.name == name)
     }
 
     /// Check if a name is a compiler builtin or special form (not a user variable).
@@ -500,7 +553,7 @@ impl Compiler {
             "string-ci=?" | "string-ci<?" | "string-ci>?" | "string-ci<=?" | "string-ci>=?" |
             "string=?" | "string<?" | "string>?" | "string<=?" | "string>=?" |
             "string-set!" | "substring" |
-            "call-with-current-continuation" | "force" | "lcm" |
+            "call-with-current-continuation" | "call/cc" | "force" | "lcm" |
             "values" | "call-with-values" |
             "raise" | "error-object?" | "error-object-message" | "error-object-irritants" |
             "guard" | "with-exception-handler" |
@@ -542,12 +595,25 @@ impl Compiler {
                     let params_list = heap.car(rest);
                     let body_exprs = heap.cdr(rest);
                     let mut new_bound = bound.clone();
-                    let mut p = params_list;
-                    while heap.is_pair(p) {
-                        if let Some(pname) = syms.symbol_name(heap.car(p)) {
+                    if heap.is_symbol(params_list) {
+                        // (lambda args body) — bare symbol
+                        if let Some(pname) = syms.symbol_name(params_list) {
                             new_bound.insert(pname.to_string());
                         }
-                        p = heap.cdr(p);
+                    } else {
+                        let mut p = params_list;
+                        while heap.is_pair(p) {
+                            if let Some(pname) = syms.symbol_name(heap.car(p)) {
+                                new_bound.insert(pname.to_string());
+                            }
+                            p = heap.cdr(p);
+                        }
+                        // Rest param in dotted tail
+                        if heap.is_symbol(p) {
+                            if let Some(pname) = syms.symbol_name(p) {
+                                new_bound.insert(pname.to_string());
+                            }
+                        }
                     }
                     self.walk_free_vars_list(body_exprs, heap, syms, &new_bound, fv, seen);
                 }
@@ -565,6 +631,12 @@ impl Compiler {
                                 new_bound.insert(pname.to_string());
                             }
                             p = heap.cdr(p);
+                        }
+                        // Rest param in dotted tail
+                        if heap.is_symbol(p) {
+                            if let Some(pname) = syms.symbol_name(p) {
+                                new_bound.insert(pname.to_string());
+                            }
                         }
                         self.walk_free_vars_list(body_exprs, heap, syms, &new_bound, fv, seen);
                         clauses = heap.cdr(clauses);
@@ -689,18 +761,29 @@ impl Compiler {
         let params_list = heap.car(rest);
         let body_list = heap.cdr(rest);
 
-        // Collect params
+        // Collect params — handle bare symbol (lambda args body) and dotted (lambda (x . rest) body)
         let mut params = Vec::new();
-        let mut p = params_list;
-        while heap.is_pair(p) {
-            if let Some(pname) = syms.symbol_name(heap.car(p)) {
-                params.push(pname.to_string());
+        let mut rest_param = None;
+        if heap.is_symbol(params_list) {
+            // (lambda args body) — all args collected into a list
+            rest_param = syms.symbol_name(params_list).map(|s| s.to_string());
+        } else {
+            let mut p = params_list;
+            while heap.is_pair(p) {
+                if let Some(pname) = syms.symbol_name(heap.car(p)) {
+                    params.push(pname.to_string());
+                }
+                p = heap.cdr(p);
             }
-            p = heap.cdr(p);
+            // Check for rest param (dotted tail)
+            if heap.is_symbol(p) {
+                rest_param = syms.symbol_name(p).map(|s| s.to_string());
+            }
         }
 
         // Analyze free variables
-        let bound: HashSet<String> = params.iter().cloned().collect();
+        let mut bound: HashSet<String> = params.iter().cloned().collect();
+        if let Some(ref rp) = rest_param { bound.insert(rp.clone()); }
         // Also add global names to bound so they aren't captured
         // (globals are available to top-level functions but NOT to lifted lambdas,
         //  so we actually DO want to capture them)
@@ -714,6 +797,7 @@ impl Compiler {
         self.lifted.borrow_mut().push(LiftedLambda {
             id,
             params,
+            rest_param,
             free_vars: fvs.clone(),
             body_list,
             case_clauses: None,
@@ -742,6 +826,7 @@ impl Compiler {
             let params_list = heap.car(clause);
             let body_list = heap.cdr(clause);
             let mut params = Vec::new();
+            let mut clause_rest = None;
             let mut p = params_list;
             while heap.is_pair(p) {
                 if let Some(pname) = syms.symbol_name(heap.car(p)) {
@@ -749,7 +834,10 @@ impl Compiler {
                 }
                 p = heap.cdr(p);
             }
-            clauses.push(CaseClause { params, body_list });
+            if heap.is_symbol(p) {
+                clause_rest = syms.symbol_name(p).map(|s| s.to_string());
+            }
+            clauses.push(CaseClause { params, rest_param: clause_rest, body_list });
             c = heap.cdr(c);
         }
 
@@ -764,7 +852,8 @@ impl Compiler {
         let mut fv = Vec::new();
         let mut seen = HashSet::new();
         for clause in &clauses {
-            let clause_bound: HashSet<String> = clause.params.iter().cloned().collect();
+            let mut clause_bound: HashSet<String> = clause.params.iter().cloned().collect();
+            if let Some(ref rp) = clause.rest_param { clause_bound.insert(rp.clone()); }
             self.walk_free_vars_list(clause.body_list, heap, syms, &clause_bound, &mut fv, &mut seen);
         }
         // Filter out builtins and known functions
@@ -781,6 +870,7 @@ impl Compiler {
         self.lifted.borrow_mut().push(LiftedLambda {
             id,
             params: nominal_params,
+            rest_param: None,
             free_vars: fvs.clone(),
             body_list: Val::NIL, // not used for case-lambda
             case_clauses: Some(clauses),
@@ -837,15 +927,38 @@ impl Compiler {
             out.push_str("    match args.len() {\n");
             for clause in clauses {
                 let arity = clause.params.len();
-                out.push_str(&format!("        {arity} => {{\n"));
+                if clause.rest_param.is_some() {
+                    out.push_str(&format!("        __n if __n >= {arity} => {{\n"));
+                } else {
+                    out.push_str(&format!("        {arity} => {{\n"));
+                }
                 for (i, p) in clause.params.iter().enumerate() {
                     out.push_str(&format!("            let {} = args[{i}];\n", rust_ident(p)));
+                }
+                if let Some(ref rp) = clause.rest_param {
+                    let rn = rust_ident(rp);
+                    out.push_str(&format!("            let {rn} = {{ let mut __r = Val::NIL; let mut __i = args.len(); while __i > {arity} {{ __i -= 1; __r = cons(args[__i], __r); }} __r }};\n"));
                 }
                 out.push_str(&self.emit_begin(clause.body_list, heap, syms, 3));
                 out.push_str("        }\n");
             }
             out.push_str("        _ => Val::NIL,\n");
             out.push_str("    }\n");
+            out.push_str("}\n\n");
+            return out;
+        }
+
+        // Variadic lambda: takes args as a slice
+        if lambda.rest_param.is_some() {
+            let mut out = format!("fn {lname}(__env: Val, args: &[Val]) -> Val {{\n");
+            out.push_str(&Self::emit_env_extraction(&lambda.free_vars));
+            for (i, p) in lambda.params.iter().enumerate() {
+                out.push_str(&format!("    let {} = args[{i}];\n", rust_ident(p)));
+            }
+            let rest_name = rust_ident(lambda.rest_param.as_ref().unwrap());
+            let n_fixed = lambda.params.len();
+            out.push_str(&format!("    let {rest_name} = {{ let mut __r = Val::NIL; let mut __i = args.len(); while __i > {n_fixed} {{ __i -= 1; __r = cons(args[__i], __r); }} __r }};\n"));
+            out.push_str(&self.emit_begin(lambda.body_list, heap, syms, 1));
             out.push_str("}\n\n");
             return out;
         }
@@ -867,6 +980,98 @@ impl Compiler {
     }
 
     /// Generate the dispatch_closure function.
+    /// Emit wrapper functions for builtins used as first-class values.
+    fn emit_builtin_wrappers(&self) -> String {
+        let closures = self.builtin_closures.borrow();
+        if closures.is_empty() { return String::new(); }
+        let mut out = String::from("// Builtin closure wrappers\n");
+        for (name, id) in closures.iter() {
+            let fname = format!("__builtin_{id}");
+            out.push_str(&format!("fn {fname}(__env: Val, args: &[Val]) -> Val {{\n"));
+            out.push_str(&Self::emit_builtin_wrapper_body(name));
+            out.push_str("}\n\n");
+        }
+        out
+    }
+
+    /// Generate the body of a builtin wrapper function.
+    fn emit_builtin_wrapper_body(name: &str) -> String {
+                let body = match name {
+                    "+" => "    let mut __acc = 0i64; for __a in args { __acc += __a.as_fixnum().unwrap(); } Val::fixnum(__acc)\n",
+                    "-" => "    if args.len() == 1 { Val::fixnum(-args[0].as_fixnum().unwrap()) } else { Val::fixnum(args[0].as_fixnum().unwrap() - args[1].as_fixnum().unwrap()) }\n",
+                    "*" => "    let mut __acc = 1i64; for __a in args { __acc *= __a.as_fixnum().unwrap(); } Val::fixnum(__acc)\n",
+                    "/" | "quotient" => "    Val::fixnum(args[0].as_fixnum().unwrap() / args[1].as_fixnum().unwrap())\n",
+                    "remainder" | "modulo" => "    Val::fixnum(args[0].as_fixnum().unwrap() % args[1].as_fixnum().unwrap())\n",
+                    "=" => "    bool_to_val(args[0].as_fixnum().unwrap() == args[1].as_fixnum().unwrap())\n",
+                    "<" => "    bool_to_val(args[0].as_fixnum().unwrap() < args[1].as_fixnum().unwrap())\n",
+                    ">" => "    bool_to_val(args[0].as_fixnum().unwrap() > args[1].as_fixnum().unwrap())\n",
+                    "<=" => "    bool_to_val(args[0].as_fixnum().unwrap() <= args[1].as_fixnum().unwrap())\n",
+                    ">=" => "    bool_to_val(args[0].as_fixnum().unwrap() >= args[1].as_fixnum().unwrap())\n",
+                    "cons" => "    cons(args[0], args[1])\n",
+                    "car" => "    car(args[0])\n",
+                    "cdr" => "    cdr(args[0])\n",
+                    "null?" => "    bool_to_val(args[0] == Val::NIL)\n",
+                    "pair?" => "    bool_to_val(args[0] != Val::NIL && !args[0].is_fixnum())\n",
+                    "number?" | "integer?" => "    bool_to_val(args[0].is_fixnum())\n",
+                    "zero?" => "    bool_to_val(args[0].as_fixnum() == Some(0))\n",
+                    "positive?" => "    bool_to_val(args[0].as_fixnum().map_or(false, |n| n > 0))\n",
+                    "negative?" => "    bool_to_val(args[0].as_fixnum().map_or(false, |n| n < 0))\n",
+                    "even?" => "    bool_to_val(args[0].as_fixnum().unwrap() % 2 == 0)\n",
+                    "odd?" => "    bool_to_val(args[0].as_fixnum().unwrap() % 2 != 0)\n",
+                    "not" => "    bool_to_val(!is_true(args[0]))\n",
+                    "eq?" | "eqv?" => "    bool_to_val(args[0] == args[1])\n",
+                    "equal?" => "    bool_to_val(scheme_equal(args[0], args[1]))\n",
+                    "boolean?" => "    bool_to_val(args[0] == TRUE_VAL || args[0] == FALSE_VAL)\n",
+                    "procedure?" => "    bool_to_val(!args[0].is_fixnum() && args[0] != Val::NIL && unsafe { HEAP[args[0].as_rib()].tag == TAG_CLS })\n",
+                    "abs" => "    Val::fixnum(args[0].as_fixnum().unwrap().abs())\n",
+                    "max" => "    Val::fixnum(std::cmp::max(args[0].as_fixnum().unwrap(), args[1].as_fixnum().unwrap()))\n",
+                    "min" => "    Val::fixnum(std::cmp::min(args[0].as_fixnum().unwrap(), args[1].as_fixnum().unwrap()))\n",
+                    "length" => "    { let mut __l = args[0]; let mut __n = 0i64; while __l != Val::NIL && !__l.is_fixnum() { __n += 1; __l = cdr(__l); } Val::fixnum(__n) }\n",
+                    "append" => "    append(args[0], args[1])\n",
+                    "reverse" => "    { let mut __l = args[0]; let mut __r = Val::NIL; while __l != Val::NIL && !__l.is_fixnum() { __r = cons(car(__l), __r); __l = cdr(__l); } __r }\n",
+                    "list" => "    { let mut __r = Val::NIL; let mut __i = args.len(); while __i > 0 { __i -= 1; __r = cons(args[__i], __r); } __r }\n",
+                    "display" => "    { display(args[0]); Val::NIL }\n",
+                    "newline" => "    { println!(); Val::NIL }\n",
+                    "write" => "    { scheme_write(args[0]); Val::NIL }\n",
+                    "map" => "    scheme_map(args[0], args[1])\n",
+                    "for-each" => "    { scheme_for_each(args[0], args[1]); Val::NIL }\n",
+                    "apply" => "    scheme_apply(args[0], &args[1..])\n",
+                    "set-car!" => "    { set_car(args[0], args[1]); Val::NIL }\n",
+                    "set-cdr!" => "    { set_cdr(args[0], args[1]); Val::NIL }\n",
+                    "list-ref" => "    list_ref(args[0], args[1].as_fixnum().unwrap())\n",
+                    "list-tail" => "    list_tail(args[0], args[1].as_fixnum().unwrap())\n",
+                    "string-length" => "    string_length(args[0])\n",
+                    "string-ref" => "    string_ref(args[0], args[1])\n",
+                    "string-append" => "    string_append(args[0], args[1])\n",
+                    "make-vector" => "    make_vector_fill(args[0].as_fixnum().unwrap(), if args.len() > 1 { args[1] } else { Val::fixnum(0) })\n",
+                    "vector-length" => "    vector_length(args[0])\n",
+                    "vector-ref" => "    vector_ref(args[0], args[1].as_fixnum().unwrap())\n",
+                    "vector-set!" => "    { vector_set(args[0], args[1].as_fixnum().unwrap(), args[2]); Val::NIL }\n",
+                    "vector?" => "    bool_to_val(is_vector(args[0]))\n",
+                    "char?" => "    bool_to_val(is_char(args[0]))\n",
+                    "string?" => "    bool_to_val(is_string(args[0]))\n",
+                    "exact?" => "    bool_to_val(args[0].is_fixnum())\n",
+                    "inexact?" => "    bool_to_val(!args[0].is_fixnum())\n",
+                    "expt" => "    Val::fixnum(args[0].as_fixnum().unwrap().pow(args[1].as_fixnum().unwrap() as u32))\n",
+                    "char->integer" => "    char_to_integer(args[0])\n",
+                    "integer->char" => "    make_char(args[0].as_fixnum().unwrap())\n",
+                    "number->string" => "    number_to_string(args[0])\n",
+                    "string->number" => "    string_to_number(args[0])\n",
+                    "values" => "    if args.len() == 1 { args[0] } else { let mut __l = Val::NIL; let mut __i = args.len(); while __i > 0 { __i -= 1; __l = cons(args[__i], __l); } make_values(__l, args.len() as i64) }\n",
+                    "call-with-values" => "    call_with_values(args[0], args[1])\n",
+                    "error" => "    { let mut __irr = Val::NIL; let mut __i = args.len(); while __i > 1 { __i -= 1; __irr = cons(args[__i], __irr); } scheme_raise(make_error(args[0], __irr)) }\n",
+                    "raise" => "    scheme_raise(args[0])\n",
+                    "error-object?" => "    bool_to_val(is_error_object(args[0]))\n",
+                    "error-object-message" => "    car(args[0])\n",
+                    "error-object-irritants" => "    cdr(args[0])\n",
+                    "gcd" => "    { let (mut a, mut b) = (args[0].as_fixnum().unwrap().abs(), args[1].as_fixnum().unwrap().abs()); while b != 0 { let t = b; b = a % b; a = t; } Val::fixnum(a) }\n",
+                    "lcm" => "    { let (a, b) = (args[0].as_fixnum().unwrap().abs(), args[1].as_fixnum().unwrap().abs()); if a == 0 || b == 0 { Val::fixnum(0) } else { let (mut x, mut y) = (a, b); while y != 0 { let t = y; y = x % y; x = t; } Val::fixnum(a / x * b) } }\n",
+                    "write-char" => "    { let __cp = if is_char(args[0]) { car(args[0]).as_fixnum().unwrap_or(0) } else { args[0].as_fixnum().unwrap_or(0) }; print!(\"{}\", __cp as u8 as char); Val::NIL }\n",
+                    _ => "    Val::NIL\n",
+                };
+                body.to_string()
+    }
+
     fn emit_dispatch(&self, _heap: &Heap, _syms: &SymbolTable) -> String {
         let mut out = String::new();
         out.push_str("fn dispatch_closure(closure: Val, args: &[Val]) -> Val {\n");
@@ -875,20 +1080,25 @@ impl Compiler {
         out.push_str("    match code_id {\n");
 
         // Top-level functions (IDs 0..N-1)
-        for (i, (name, params, _)) in self.functions.iter().enumerate() {
-            let fname = rust_ident(name);
-            let args: Vec<String> = (0..params.len())
-                .map(|j| format!("args[{j}]"))
-                .collect();
-            let args_str = args.join(", ");
-            out.push_str(&format!("        {i} => {fname}({args_str}),\n"));
+        for (i, func) in self.functions.iter().enumerate() {
+            let fname = rust_ident(&func.name);
+            if func.rest_param.is_some() {
+                // Variadic: pass args slice
+                out.push_str(&format!("        {i} => {fname}(args),\n"));
+            } else {
+                let args: Vec<String> = (0..func.params.len())
+                    .map(|j| format!("args[{j}]"))
+                    .collect();
+                let args_str = args.join(", ");
+                out.push_str(&format!("        {i} => {fname}({args_str}),\n"));
+            }
         }
 
         // Lifted lambdas (IDs N..)
         for lambda in self.lifted.borrow().iter() {
             let lname = format!("__lambda_{}", lambda.id);
-            if lambda.case_clauses.is_some() {
-                // Case-lambda: pass args slice directly
+            if lambda.case_clauses.is_some() || lambda.rest_param.is_some() {
+                // Case-lambda or variadic: pass args slice directly
                 out.push_str(&format!("        {} => {lname}(__env, args),\n", lambda.id));
             } else {
                 let mut args = vec!["__env".to_string()];
@@ -898,6 +1108,12 @@ impl Compiler {
                 let args_str = args.join(", ");
                 out.push_str(&format!("        {} => {lname}({args_str}),\n", lambda.id));
             }
+        }
+
+        // Builtin closures
+        for (_, id) in self.builtin_closures.borrow().iter() {
+            let fname = format!("__builtin_{id}");
+            out.push_str(&format!("        {id} => {fname}(__env, args),\n"));
         }
 
         out.push_str("        _ => Val::NIL,\n");
@@ -930,6 +1146,8 @@ impl Compiler {
         out.push_str(&format!("const TAG_VALUES: u8 = {};\n", table::T_VALUES));
         out.push_str(&format!("const TAG_ERROR: u8 = {};\n", table::T_ERROR));
         out.push_str(&format!("const TAG_RECORD: u8 = {};\n", table::T_RECORD));
+        out.push_str(&format!("const TAG_VEC: u8 = {};\n", table::T_VEC));
+        out.push_str(&format!("const TAG_CONT: u8 = {};\n", table::T_CONT));
         out.push_str("\n");
 
         // Inline the table data
@@ -964,13 +1182,32 @@ impl Compiler {
 
         // Collect function bodies (this triggers lambda lifting)
         let mut func_code = String::new();
-        for (name, params, body) in &self.functions {
-            let rname = rust_ident(name);
-            let needs_tco = self.has_self_tail_call(*body, name, heap, syms);
+        for func in &self.functions {
+            let rname = rust_ident(&func.name);
+
+            if func.rest_param.is_some() {
+                // Variadic function: takes args slice
+                func_code.push_str(&format!("fn {rname}(args: &[Val]) -> Val {{\n"));
+                // Extract fixed params
+                for (i, p) in func.params.iter().enumerate() {
+                    let rp = rust_ident(p);
+                    let mutk = if self.is_set_target(p) { "mut " } else { "" };
+                    func_code.push_str(&format!("    let {mutk}{rp} = args[{i}];\n"));
+                }
+                // Collect rest args into a list
+                let rest_name = rust_ident(func.rest_param.as_ref().unwrap());
+                let n_fixed = func.params.len();
+                let mutk = if self.is_set_target(func.rest_param.as_ref().unwrap()) { "mut " } else { "" };
+                func_code.push_str(&format!("    let {mutk}{rest_name} = {{ let mut __r = Val::NIL; let mut __i = args.len(); while __i > {n_fixed} {{ __i -= 1; __r = cons(args[__i], __r); }} __r }};\n"));
+                let body_code = self.emit_expr(func.body, heap, syms, 1);
+                func_code.push_str(&body_code);
+                func_code.push_str("}\n\n");
+            } else {
+            let needs_tco = self.has_self_tail_call(func.body, &func.name, heap, syms);
 
             if needs_tco {
                 // Emit with mut params and loop wrapper
-                let rparams: Vec<String> = params.iter()
+                let rparams: Vec<String> = func.params.iter()
                     .map(|p| format!("mut {}: Val", rust_ident(p)))
                     .collect();
                 let params_str = rparams.join(", ");
@@ -978,16 +1215,16 @@ impl Compiler {
                 func_code.push_str("    loop {\n");
                 // Set TCO context
                 *self.tco.borrow_mut() = Some(TcoContext {
-                    fn_name: name.clone(),
-                    params: params.clone(),
+                    fn_name: func.name.clone(),
+                    params: func.params.clone(),
                 });
-                let body_code = self.emit_expr(*body, heap, syms, 2);
+                let body_code = self.emit_expr(func.body, heap, syms, 2);
                 func_code.push_str(&body_code);
                 *self.tco.borrow_mut() = None;
                 func_code.push_str("    }\n");
                 func_code.push_str("}\n\n");
             } else {
-                let rparams: Vec<String> = params.iter()
+                let rparams: Vec<String> = func.params.iter()
                     .map(|p| {
                         let mutk = if self.is_set_target(p) { "mut " } else { "" };
                         format!("{mutk}{}: Val", rust_ident(p))
@@ -995,10 +1232,11 @@ impl Compiler {
                     .collect();
                 let params_str = rparams.join(", ");
                 func_code.push_str(&format!("fn {rname}({params_str}) -> Val {{\n"));
-                let body_code = self.emit_expr(*body, heap, syms, 1);
+                let body_code = self.emit_expr(func.body, heap, syms, 1);
                 func_code.push_str(&body_code);
                 func_code.push_str("}\n\n");
             }
+            } // end if rest_param else
         }
 
         // Emit record type functions (constructors, predicates, accessors, mutators)
@@ -1080,6 +1318,9 @@ impl Compiler {
 
         // Lifted lambda functions
         out.push_str(&lifted_code);
+
+        // Builtin closure wrappers (for builtins used as first-class values)
+        out.push_str(&self.emit_builtin_wrappers());
 
         // dispatch_closure (must come after all functions are defined)
         out.push_str(&self.emit_dispatch(heap, syms));
@@ -1341,6 +1582,11 @@ impl Compiler {
             // Known function in value position → wrap as closure
             if let Some(id) = self.function_closure_id(name) {
                 return format!("make_closure({id}, Val::NIL)");
+            }
+            // Callable builtin in value position → wrap as closure
+            if Self::is_callable_builtin(name) {
+                let id = self.get_or_create_builtin_closure(name);
+                return format!("make_closure({id} as i64, Val::NIL)");
             }
             return rust_ident(name);
         }
@@ -1746,6 +1992,106 @@ impl Compiler {
                     return format!("make_char((char_codepoint({a}) as u8).to_ascii_lowercase() as i64)");
                 }
 
+                // ── Missing builtins ────────────
+                "equal?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(scheme_equal({a}, {b}))");
+                }
+                "boolean?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val({a} == TRUE_VAL || {a} == FALSE_VAL)");
+                }
+                "procedure?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val(!{a}.is_fixnum() && {a} != Val::NIL && unsafe {{ HEAP[{a}.as_rib()].tag == TAG_CLS }})");
+                }
+                "exact?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val({a}.is_fixnum())");
+                }
+                "inexact?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val(!{a}.is_fixnum())");
+                }
+                "expt" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("Val::fixnum({a}.as_fixnum().unwrap().pow({b}.as_fixnum().unwrap() as u32))");
+                }
+                "lcm" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{{ let (a, b) = ({a}.as_fixnum().unwrap().abs(), {b}.as_fixnum().unwrap().abs()); if a == 0 || b == 0 {{ Val::fixnum(0) }} else {{ let (mut x, mut y) = (a, b); while y != 0 {{ let t = y; y = x % y; x = t; }} Val::fixnum(a / x * b) }} }}");
+                }
+                "list-ref" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("list_ref({a}, {b}.as_fixnum().unwrap())");
+                }
+                "list-tail" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("list_tail({a}, {b}.as_fixnum().unwrap())");
+                }
+                "apply" => {
+                    let f = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let mut args = Vec::new();
+                    let mut a = heap.cdr(rest);
+                    while heap.is_pair(a) {
+                        args.push(self.emit_expr_inline(heap.car(a), heap, syms));
+                        a = heap.cdr(a);
+                    }
+                    if args.len() == 1 {
+                        return format!("apply_val({f}, {})", args[0]);
+                    }
+                    return format!("scheme_apply({f}, &[{}])", args.join(", "));
+                }
+                "map" => {
+                    let f = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let lst = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("scheme_map({f}, {lst})");
+                }
+                "for-each" => {
+                    let f = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let lst = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{{ scheme_for_each({f}, {lst}); Val::NIL }}");
+                }
+                "write" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{{ scheme_write({a}); Val::NIL }}");
+                }
+                "write-char" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("{{ let __cp = if is_char({a}) {{ car({a}).as_fixnum().unwrap_or(0) }} else {{ {a}.as_fixnum().unwrap_or(0) }}; print!(\"{{}}\" , __cp as u8 as char); Val::NIL }}");
+                }
+                // ── Vector operations ────────────
+                "make-vector" => {
+                    let n = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let fill = if heap.is_pair(heap.cdr(rest)) {
+                        self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms)
+                    } else { "Val::fixnum(0)".to_string() };
+                    return format!("make_vector_fill({n}.as_fixnum().unwrap(), {fill})");
+                }
+                "vector-length" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("vector_length({a})");
+                }
+                "vector-ref" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("vector_ref({a}, {b}.as_fixnum().unwrap())");
+                }
+                "vector-set!" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    let c = self.emit_expr_inline(heap.car(heap.cdr(heap.cdr(rest))), heap, syms);
+                    return format!("{{ vector_set({a}, {b}.as_fixnum().unwrap(), {c}); Val::NIL }}");
+                }
+                "vector?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val(is_vector({a}))");
+                }
                 // ── Algebra extension ────────────
                 "dot" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
@@ -1814,6 +2160,10 @@ impl Compiler {
                 "error-object-irritants" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
                     return format!("cdr({a})");
+                }
+                "call-with-current-continuation" | "call/cc" => {
+                    let proc = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("call_with_current_continuation({proc})");
                 }
                 "with-exception-handler" => {
                     let handler = self.emit_expr_inline(heap.car(rest), heap, syms);
@@ -1997,6 +2347,9 @@ impl Compiler {
                         a = heap.cdr(a);
                     }
                     if self.is_known_function(name) {
+                        if self.is_variadic_function(name) {
+                            return format!("{fname}(&[{}])", args.join(", "));
+                        }
                         return format!("{fname}({})", args.join(", "));
                     } else {
                         return format!("call_val({fname}, &[{}])", args.join(", "));
@@ -2634,8 +2987,14 @@ fn make_closure(code_id: i64, env: Val) -> Val {
 fn call_val(f: Val, args: &[Val]) -> Val {
     if !f.is_fixnum() && f != Val::NIL {
         unsafe {
-            if HEAP[f.as_rib()].tag == TAG_CLS {
+            let tag = HEAP[f.as_rib()].tag;
+            if tag == TAG_CLS {
                 return dispatch_closure(f, args);
+            }
+            if tag == TAG_CONT {
+                let cont_id = HEAP[f.as_rib()].car.as_fixnum().unwrap() as u64;
+                let value = if args.is_empty() { Val::NIL } else { args[0] };
+                std::panic::resume_unwind(Box::new(ContinuationPayload { value, target_id: cont_id }));
             }
         }
     }
@@ -2762,6 +3121,44 @@ fn with_exception_handler(handler: Val, thunk: Val) -> Val {
     }
 }
 
+// ── Escape continuations ────────────────────────────────────────
+
+struct ContinuationPayload {
+    value: Val,
+    target_id: u64,
+}
+
+static mut NEXT_CONT_ID: u64 = 0;
+
+fn make_continuation(cont_id: u64) -> Val {
+    unsafe {
+        let idx = HEAP.len();
+        HEAP.push(Rib { car: Val::fixnum(cont_id as i64), cdr: Val::NIL, tag: TAG_CONT });
+        Val::rib(idx)
+    }
+}
+
+fn call_with_current_continuation(proc: Val) -> Val {
+    unsafe {
+        let cont_id = NEXT_CONT_ID;
+        NEXT_CONT_ID += 1;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let k = make_continuation(cont_id);
+            call_val(proc, &[k])
+        })) {
+            Ok(v) => v,
+            Err(payload) => {
+                if let Some(cp) = payload.downcast_ref::<ContinuationPayload>() {
+                    if cp.target_id == cont_id {
+                        return cp.value;
+                    }
+                }
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+}
+
 fn display_to(v: Val, w: &mut dyn std::io::Write) {
     if v == Val::NIL { let _ = write!(w, "()"); }
     else if let Some(n) = v.as_fixnum() { let _ = write!(w, "{n}"); }
@@ -2780,6 +3177,159 @@ fn display_to(v: Val, w: &mut dyn std::io::Write) {
             }
         }
     }
+}
+
+// ── Structural equality ─────────────────────────────────────────
+
+fn scheme_equal(a: Val, b: Val) -> bool {
+    if a == b { return true; }
+    if a.is_fixnum() || b.is_fixnum() { return false; }
+    if a == Val::NIL || b == Val::NIL { return false; }
+    unsafe {
+        let ra = &HEAP[a.as_rib()];
+        let rb = &HEAP[b.as_rib()];
+        if ra.tag != rb.tag { return false; }
+        if ra.tag == TAG_PAIR {
+            return scheme_equal(ra.car, rb.car) && scheme_equal(ra.cdr, rb.cdr);
+        }
+        if ra.tag == TAG_STR { return string_eq(a, b); }
+        if ra.tag == TAG_CHAR { return ra.car == rb.car; }
+        false
+    }
+}
+
+// ── Map / for-each ──────────────────────────────────────────────
+
+fn scheme_map(f: Val, lst: Val) -> Val {
+    if lst == Val::NIL || lst.is_fixnum() { return Val::NIL; }
+    let head = call_val(f, &[car(lst)]);
+    let tail = scheme_map(f, cdr(lst));
+    cons(head, tail)
+}
+
+fn scheme_for_each(f: Val, lst: Val) {
+    let mut l = lst;
+    while l != Val::NIL && !l.is_fixnum() {
+        call_val(f, &[car(l)]);
+        l = cdr(l);
+    }
+}
+
+// ── Apply ───────────────────────────────────────────────────────
+
+fn scheme_apply(f: Val, args: &[Val]) -> Val {
+    // (apply f arg1 arg2 ... list) — last arg is a list to spread
+    if args.is_empty() { return call_val(f, &[]); }
+    let mut flat = Vec::new();
+    for i in 0..args.len()-1 {
+        flat.push(args[i]);
+    }
+    // Unpack the last argument (a list)
+    let mut l = args[args.len()-1];
+    while l != Val::NIL && !l.is_fixnum() {
+        flat.push(car(l));
+        l = cdr(l);
+    }
+    call_val(f, &flat)
+}
+
+// ── List ref/tail ───────────────────────────────────────────────
+
+fn list_ref(lst: Val, idx: i64) -> Val {
+    let mut l = lst;
+    for _ in 0..idx { l = cdr(l); }
+    car(l)
+}
+
+fn list_tail(lst: Val, idx: i64) -> Val {
+    let mut l = lst;
+    for _ in 0..idx { l = cdr(l); }
+    l
+}
+
+// ── Write (with quoting) ────────────────────────────────────────
+
+fn scheme_write(v: Val) {
+    if v == Val::NIL { print!("()"); }
+    else if let Some(n) = v.as_fixnum() { print!("{n}"); }
+    else {
+        unsafe {
+            let rib = &HEAP[v.as_rib()];
+            if rib.tag == TAG_PAIR {
+                print!("(");
+                scheme_write(rib.car);
+                let mut rest = rib.cdr;
+                while rest != Val::NIL && !rest.is_fixnum() && HEAP[rest.as_rib()].tag == TAG_PAIR {
+                    print!(" ");
+                    scheme_write(HEAP[rest.as_rib()].car);
+                    rest = HEAP[rest.as_rib()].cdr;
+                }
+                if rest != Val::NIL {
+                    print!(" . ");
+                    scheme_write(rest);
+                }
+                print!(")");
+            } else if rib.tag == TAG_STR {
+                print!("{}", '"');
+                let mut chars = rib.car;
+                while chars != Val::NIL && !chars.is_fixnum() {
+                    let cp = HEAP[chars.as_rib()].car.as_fixnum().unwrap_or(0);
+                    let ch = cp as u8 as char;
+                    match ch {
+                        '"' => print!("\\{}", '"'),
+                        '\\' => print!("\\\\"),
+                        '\n' => print!("\\n"),
+                        _ => print!("{ch}"),
+                    }
+                    chars = HEAP[chars.as_rib()].cdr;
+                }
+                print!("{}", '"');
+            } else if rib.tag == TAG_CHAR {
+                let cp = rib.car.as_fixnum().unwrap_or(0);
+                print!("{}{}{}", '\x23', '\\', cp as u8 as char);
+            } else if rib.tag == TAG_BOT {
+                print!("{}{}", '\x23', 'f');
+            } else if rib.tag == 20 {
+                print!("{}{}", '\x23', 't');
+            } else if rib.tag == TAG_CLS {
+                print!("<procedure>");
+            } else {
+                print!("<rib>");
+            }
+        }
+    }
+}
+
+// ── Vector support ──────────────────────────────────────────────
+
+fn make_vector_fill(n: i64, fill: Val) -> Val {
+    let mut elems = Val::NIL;
+    for _ in 0..n { elems = cons(fill, elems); }
+    unsafe {
+        let idx = HEAP.len();
+        HEAP.push(Rib { car: elems, cdr: Val::fixnum(n), tag: TAG_VEC });
+        Val::rib(idx)
+    }
+}
+
+fn is_vector(v: Val) -> bool {
+    !v.is_fixnum() && v != Val::NIL && unsafe { HEAP[v.as_rib()].tag == TAG_VEC }
+}
+
+fn vector_length(v: Val) -> Val {
+    if is_vector(v) { cdr(v) } else { Val::fixnum(0) }
+}
+
+fn vector_ref(v: Val, idx: i64) -> Val {
+    let mut elems = car(v);
+    for _ in 0..idx { elems = cdr(elems); }
+    car(elems)
+}
+
+fn vector_set(v: Val, idx: i64, val: Val) {
+    let mut elems = car(v);
+    for _ in 0..idx { elems = cdr(elems); }
+    set_car(elems, val);
 }
 "#;
 
