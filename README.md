@@ -130,14 +130,22 @@ cargo check --no-default-features --lib
 
 ## Future Work
 
-- **Self-hosted compiler.** `examples/transpile.scm` is a self-hosted IR → Rust code generator ported from Kamea. The goal is to extend it to cover full Scheme, replacing `compile.rs` with Scheme-in-Scheme compiled by its own output.
-- **Futamura P3.** Specialize the transpiler on a known program to produce a residual Rust-emitting program — a compiler generated from an interpreter.
-- **Mutual tail recursion.** Trampoline or CPS transform for mutually recursive tail calls.
-- **Full continuations.** CPS transform for reentrant `call/cc`.
-- **Type inference / specialization.** `(+ (car x) 1)` currently emits `.as_fixnum().unwrap()` on the car result. Propagating type information through the call graph would eliminate runtime type checks on provably-fixnum paths — the same optimization that makes Chez 2-5× faster on list-heavy benchmarks.
-- **Cross-function inlining.** Lifted lambdas dispatch through `match code_id` in `dispatch_closure`. Inlining small closures at call sites would eliminate this indirect dispatch and enable further optimization by `rustc`.
+Runtime changes (survive self-hosting):
+
 - **Flat vectors.** Vectors are currently encoded as cons chains (`vector-ref` walks N cdrs). A flat `Vec<Val>` or inline array representation would make vector-heavy benchmarks like triangl competitive — this alone accounts for the 10× gap vs Chez.
 - **Bare-metal RISC-V.** `--target no-std` with fixed-size heap arrays, no alloc crate, UART output.
+
+Self-hosting:
+
+- **Self-hosted compiler.** `examples/transpile.scm` is a self-hosted IR → Rust code generator ported from Kamea. The goal is to extend it to cover full Scheme, replacing `compile.rs` with Scheme-in-Scheme compiled by its own output.
+- **Futamura P3.** Specialize the transpiler on a known program to produce a residual Rust-emitting program — a compiler generated from an interpreter.
+
+Optimization passes (best written in the self-hosted compiler):
+
+- **Type inference / specialization.** `(+ (car x) 1)` currently emits `.as_fixnum().unwrap()` on the car result. Propagating type information through the call graph would eliminate runtime type checks on provably-fixnum paths — the same optimization that makes Chez 2-5× faster on list-heavy benchmarks.
+- **Cross-function inlining.** Lifted lambdas dispatch through `match code_id` in `dispatch_closure`. Inlining small closures at call sites would eliminate this indirect dispatch and enable further optimization by `rustc`.
+- **Mutual tail recursion.** Trampoline or CPS transform for mutually recursive tail calls.
+- **Full continuations.** CPS transform for reentrant `call/cc`.
 
 ## Lineage
 
