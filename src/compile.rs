@@ -93,6 +93,8 @@ pub struct Compiler {
     libraries: Vec<Library>,
     /// Builtin closures: maps builtin name to its lambda ID
     builtin_closures: RefCell<HashMap<String, usize>>,
+    /// Parameters of the currently-emitting function (to avoid direct-call for shadowed names)
+    current_params: RefCell<HashSet<String>>,
 }
 
 impl Compiler {
@@ -108,6 +110,7 @@ impl Compiler {
             record_types: Vec::new(),
             libraries: Vec::new(),
             builtin_closures: RefCell::new(HashMap::new()),
+            current_params: RefCell::new(HashSet::new()),
         }
     }
 
@@ -259,8 +262,9 @@ impl Compiler {
             let rest_param = if heap.is_symbol(p) {
                 syms.symbol_name(p).map(|s| s.to_string())
             } else { None };
-            // Collect body (may be multiple expressions)
-            let body_list = heap.cdr(rest);
+            // Collect body (may be multiple expressions), hoisting internal defines
+            let mut body_list = heap.cdr(rest);
+            body_list = self.hoist_internal_defines(body_list, heap, syms);
             let body = if heap.cdr(body_list) == Val::NIL {
                 heap.car(body_list)
             } else {
@@ -270,6 +274,57 @@ impl Compiler {
             };
             self.functions.push(Function { name, params, rest_param, body });
         }
+    }
+
+    /// Convert leading internal `define` forms into a `letrec` wrapping the remaining body.
+    /// (define (f x) (define (g y) ...) (define h 1) body...)
+    /// → (define (f x) (letrec ((g (lambda (y) ...)) (h 1)) body...))
+    fn hoist_internal_defines(&mut self, mut body_list: Val, heap: &mut Heap, syms: &mut SymbolTable) -> Val {
+        // Pre-intern symbols we'll need
+        let lambda_sym = syms.intern("lambda", heap);
+        let letrec_sym = syms.intern("letrec", heap);
+
+        let mut bindings = Vec::new();
+        loop {
+            if !heap.is_pair(body_list) { break; }
+            let expr = heap.car(body_list);
+            if !heap.is_pair(expr) { break; }
+            let head = heap.car(expr);
+            if !heap.is_symbol(head) { break; }
+            if syms.symbol_name(head) != Some("define") { break; }
+
+            let rest = heap.cdr(expr);
+            let target = heap.car(rest);
+            if heap.is_symbol(target) {
+                // (define x expr) → binding (x expr)
+                let init = heap.car(heap.cdr(rest));
+                let init_list = heap.cons(init, Val::NIL);
+                let binding = heap.cons(target, init_list);
+                bindings.push(binding);
+            } else if heap.is_pair(target) {
+                // (define (f args...) body...) → binding (f (lambda (args...) body...))
+                let name_sym = heap.car(target);
+                let params = heap.cdr(target);
+                let fn_body = heap.cdr(rest);
+                let params_body = heap.cons(params, fn_body);
+                let lambda_expr = heap.cons(lambda_sym, params_body);
+                let lambda_list = heap.cons(lambda_expr, Val::NIL);
+                let binding = heap.cons(name_sym, lambda_list);
+                bindings.push(binding);
+            }
+            body_list = heap.cdr(body_list);
+        }
+        if bindings.is_empty() {
+            return body_list;
+        }
+        // Build (letrec ((name init) ...) body...)
+        let mut bindings_list = Val::NIL;
+        for b in bindings.iter().rev() {
+            bindings_list = heap.cons(*b, bindings_list);
+        }
+        let bindings_body = heap.cons(bindings_list, body_list);
+        let letrec_expr = heap.cons(letrec_sym, bindings_body);
+        heap.cons(letrec_expr, Val::NIL)
     }
 
     /// Parse a define-record-type form and register the record type.
@@ -504,6 +559,11 @@ impl Compiler {
         id
     }
 
+    /// Check if a name is a global variable (accessible as static).
+    fn is_global(&self, name: &str) -> bool {
+        self.globals.iter().any(|(n, _)| n == name)
+    }
+
     /// Check if a known top-level function is variadic (has rest param).
     fn is_variadic_function(&self, name: &str) -> bool {
         self.functions.iter().any(|f| f.name == name && f.rest_param.is_some())
@@ -583,6 +643,7 @@ impl Compiler {
             if !name.is_empty() && !bound.contains(&name)
                 && !Self::is_builtin_or_special(&name)
                 && !self.is_known_function(&name)
+                && !self.is_global(&name)
                 && !seen.contains(&name)
             {
                 seen.insert(name.clone());
@@ -1194,6 +1255,14 @@ impl Compiler {
         let mut func_code = String::new();
         for func in &self.functions {
             let rname = rust_ident(&func.name);
+            // Track current function's parameters so emit_expr_inline doesn't use
+            // the direct-call optimization for known functions that are shadowed by local params.
+            {
+                let mut cp = self.current_params.borrow_mut();
+                cp.clear();
+                cp.extend(func.params.iter().cloned());
+                if let Some(ref rp) = func.rest_param { cp.insert(rp.clone()); }
+            }
 
             if func.rest_param.is_some() {
                 // Variadic function: takes args slice
@@ -1248,6 +1317,7 @@ impl Compiler {
             }
             } // end if rest_param else
         }
+        self.current_params.borrow_mut().clear();
 
         // Emit record type functions (constructors, predicates, accessors, mutators)
         let mut record_code = String::new();
@@ -1289,12 +1359,15 @@ impl Compiler {
             }
         }
 
-        // Collect global + main code (may also lift lambdas)
-        let mut globals_code = String::new();
+        // Emit globals as module-level statics (accessible from lifted lambdas)
+        let mut statics_code = String::new();
+        let mut globals_init_code = String::new();
         for (name, init) in &self.globals {
             let rname = rust_ident(name);
             let init_code = self.emit_expr_inline(*init, heap, syms);
-            globals_code.push_str(&format!("    let mut {rname} = {init_code};\n"));
+            statics_code.push_str(&format!("static mut {rname}: Val = Val(0);\n"));
+            globals_init_code.push_str(
+                &format!("    unsafe {{ {rname} = {init_code}; }}\n"));
         }
         let mut main_code = String::new();
         for &expr in &self.main_exprs {
@@ -1320,6 +1393,10 @@ impl Compiler {
 
         // ── Assemble output ─────────────────────────────────────────
 
+        // Global variable statics
+        out.push_str(&statics_code);
+        if !statics_code.is_empty() { out.push('\n'); }
+
         // Top-level Scheme functions
         out.push_str(&func_code);
 
@@ -1338,7 +1415,7 @@ impl Compiler {
         // Main
         out.push_str("fn main() {\n");
         out.push_str("    heap_init();\n");
-        out.push_str(&globals_code);
+        out.push_str(&globals_init_code);
         out.push_str("\n");
         out.push_str(&main_code);
         out.push_str("}\n");
@@ -1604,6 +1681,9 @@ impl Compiler {
                 let id = self.get_or_create_builtin_closure(name);
                 return format!("make_closure({id} as i64, Val::NIL)");
             }
+            if self.is_global(name) {
+                return format!("unsafe {{ {} }}", rust_ident(name));
+            }
             return rust_ident(name);
         }
         if tag == table::T_STR {
@@ -1803,6 +1883,9 @@ impl Compiler {
                     let val_expr = heap.car(heap.cdr(rest));
                     let vname = syms.symbol_name(var).unwrap_or("_");
                     let val_code = self.emit_expr_inline(val_expr, heap, syms);
+                    if self.is_global(vname) {
+                        return format!("{{ unsafe {{ {} = {val_code}; }} Val::NIL }}", rust_ident(vname));
+                    }
                     return format!("{{ {} = {val_code}; Val::NIL }}", rust_ident(vname));
                 }
                 "set-car!" => {
@@ -2444,11 +2527,16 @@ impl Compiler {
                         args.push(self.emit_expr_inline(heap.car(a), heap, syms));
                         a = heap.cdr(a);
                     }
-                    if self.is_known_function(name) {
+                    // Use direct call only when name is a known function AND is not
+                    // shadowed by a local parameter in the current function.
+                    let shadowed = self.current_params.borrow().contains(name);
+                    if self.is_known_function(name) && !shadowed {
                         if self.is_variadic_function(name) {
                             return format!("{fname}(&[{}])", args.join(", "));
                         }
                         return format!("{fname}({})", args.join(", "));
+                    } else if self.is_global(name) {
+                        return format!("call_val(unsafe {{ {fname} }}, &[{}])", args.join(", "));
                     } else {
                         return format!("call_val({fname}, &[{}])", args.join(", "));
                     }
@@ -2528,8 +2616,8 @@ impl Compiler {
             s.push_str(&format!(" else {{ let _v = {}; if !is_true(_v) {{ _v }}", p));
         }
         s.push_str(&format!(" else {{ {} }}", parts.last().unwrap()));
+        // Close all else-blocks opened above (one per element except the last, plus the outer block)
         for _ in 0..parts.len()-1 { s.push_str(" }"); }
-        s.push_str(" }");
         s
     }
 
