@@ -554,6 +554,12 @@ impl Compiler {
             "string=?" | "string<?" | "string>?" | "string<=?" | "string>=?" |
             "string-set!" | "substring" |
             "call-with-current-continuation" | "call/cc" | "force" | "lcm" |
+            "open-input-file" | "open-output-file" | "close-port" |
+            "read-char" | "peek-char" | "read-line" |
+            "current-input-port" | "current-output-port" | "current-error-port" |
+            "port?" | "input-port?" | "output-port?" |
+            "eof-object" | "eof-object?" |
+            "write-string" | "display-string" |
             "values" | "call-with-values" |
             "raise" | "error-object?" | "error-object-message" | "error-object-irritants" |
             "guard" | "with-exception-handler" |
@@ -1148,6 +1154,8 @@ impl Compiler {
         out.push_str(&format!("const TAG_RECORD: u8 = {};\n", table::T_RECORD));
         out.push_str(&format!("const TAG_VEC: u8 = {};\n", table::T_VEC));
         out.push_str(&format!("const TAG_CONT: u8 = {};\n", table::T_CONT));
+        out.push_str(&format!("const TAG_PORT: u8 = {};\n", table::T_PORT));
+        out.push_str(&format!("const TAG_EOF: u8 = {};\n", table::EOF));
         out.push_str("\n");
 
         // Inline the table data
@@ -2063,6 +2071,10 @@ impl Compiler {
                 }
                 "write-char" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    if heap.is_pair(heap.cdr(rest)) {
+                        let p = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                        return format!("write_char_port({a}, {p})");
+                    }
                     return format!("{{ let __cp = if is_char({a}) {{ car({a}).as_fixnum().unwrap_or(0) }} else {{ {a}.as_fixnum().unwrap_or(0) }}; print!(\"{{}}\" , __cp as u8 as char); Val::NIL }}");
                 }
                 // ── Vector operations ────────────
@@ -2243,6 +2255,76 @@ impl Compiler {
                     }
                     out.push_str(" } }");
                     return out;
+                }
+                // ── Ports / I/O ──────────────────
+                "current-input-port" => {
+                    return "current_input_port()".to_string();
+                }
+                "current-output-port" => {
+                    return "current_output_port()".to_string();
+                }
+                "current-error-port" => {
+                    return "current_error_port()".to_string();
+                }
+                "open-input-file" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("open_input_file({a})");
+                }
+                "open-output-file" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("open_output_file({a})");
+                }
+                "close-port" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("close_port({a})");
+                }
+                "read-char" => {
+                    if heap.is_pair(rest) {
+                        let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                        return format!("read_char_port({a})");
+                    }
+                    return "read_char_port(current_input_port())".to_string();
+                }
+                "peek-char" => {
+                    if heap.is_pair(rest) {
+                        let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                        return format!("peek_char_port({a})");
+                    }
+                    return "peek_char_port(current_input_port())".to_string();
+                }
+                "read-line" => {
+                    if heap.is_pair(rest) {
+                        let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                        return format!("read_line_port({a})");
+                    }
+                    return "read_line_port(current_input_port())".to_string();
+                }
+                "write-string" => {
+                    let s = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    if heap.is_pair(heap.cdr(rest)) {
+                        let p = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                        return format!("write_string_port({s}, {p})");
+                    }
+                    return format!("write_string_port({s}, current_output_port())");
+                }
+                "port?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val(is_port({a}))");
+                }
+                "input-port?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val(is_port({a}) && port_direction({a}) == 0)");
+                }
+                "output-port?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val(is_port({a}) && port_direction({a}) == 1)");
+                }
+                "eof-object" => {
+                    return "EOF_VAL".to_string();
+                }
+                "eof-object?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val({a} == EOF_VAL)");
                 }
                 "strict-mode" => {
                     return "Val::NIL".to_string();
@@ -2680,11 +2762,18 @@ static mut HEAP: Vec<Rib> = Vec::new();
 const FALSE_VAL: Val = Val(1 << 1); // rib index 1
 const TRUE_VAL: Val = Val(2 << 1);  // rib index 2
 
+const EOF_VAL: Val = Val(3 << 1);  // rib index 3
+
 fn heap_init() {
     unsafe { HEAP = Vec::with_capacity(65536);
              HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: TAG_TOP });  // rib 0: nil
              HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: TAG_BOT });  // rib 1: #f
              HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: 20 });       // rib 2: #t
+             HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: TAG_EOF });  // rib 3: eof
+             PORTS = Vec::with_capacity(16);
+             PORTS.push(PortInner::Stdin(std::io::BufReader::new(std::io::stdin())));
+             PORTS.push(PortInner::Stdout);
+             PORTS.push(PortInner::Stderr);
     }
 }
 
@@ -3330,6 +3419,168 @@ fn vector_set(v: Val, idx: i64, val: Val) {
     let mut elems = car(v);
     for _ in 0..idx { elems = cdr(elems); }
     set_car(elems, val);
+}
+
+// ── Ports / I/O ─────────────────────────────────────────────────
+
+enum PortInner {
+    Stdin(std::io::BufReader<std::io::Stdin>),
+    Stdout,
+    Stderr,
+    FileIn(std::io::BufReader<std::fs::File>),
+    FileOut(std::fs::File),
+    Closed,
+}
+
+static mut PORTS: Vec<PortInner> = Vec::new();
+
+fn make_port(port_id: i64, direction: i64) -> Val {
+    unsafe {
+        let idx = HEAP.len();
+        HEAP.push(Rib { car: Val::fixnum(port_id), cdr: Val::fixnum(direction), tag: TAG_PORT });
+        Val::rib(idx)
+    }
+}
+
+fn is_port(v: Val) -> bool {
+    !v.is_fixnum() && v != Val::NIL && unsafe { HEAP[v.as_rib()].tag == TAG_PORT }
+}
+
+fn port_id(v: Val) -> usize {
+    car(v).as_fixnum().unwrap() as usize
+}
+
+fn port_direction(v: Val) -> i64 {
+    cdr(v).as_fixnum().unwrap()
+}
+
+fn current_input_port() -> Val { make_port(0, 0) }
+fn current_output_port() -> Val { make_port(1, 1) }
+fn current_error_port() -> Val { make_port(2, 1) }
+
+fn open_input_file(path: Val) -> Val {
+    let s = val_to_rust_string(path);
+    let file = std::fs::File::open(&s).expect("open-input-file failed");
+    unsafe {
+        let id = PORTS.len();
+        PORTS.push(PortInner::FileIn(std::io::BufReader::new(file)));
+        make_port(id as i64, 0)
+    }
+}
+
+fn open_output_file(path: Val) -> Val {
+    let s = val_to_rust_string(path);
+    let file = std::fs::File::create(&s).expect("open-output-file failed");
+    unsafe {
+        let id = PORTS.len();
+        PORTS.push(PortInner::FileOut(file));
+        make_port(id as i64, 1)
+    }
+}
+
+fn close_port(port: Val) -> Val {
+    let id = port_id(port);
+    unsafe { PORTS[id] = PortInner::Closed; }
+    Val::NIL
+}
+
+fn read_char_port(port: Val) -> Val {
+    use std::io::Read;
+    let id = port_id(port);
+    let mut buf = [0u8; 1];
+    let n = unsafe {
+        match &mut PORTS[id] {
+            PortInner::Stdin(r) => r.read(&mut buf).unwrap_or(0),
+            PortInner::FileIn(r) => r.read(&mut buf).unwrap_or(0),
+            _ => 0,
+        }
+    };
+    if n == 0 { EOF_VAL } else { make_char(buf[0] as i64) }
+}
+
+fn peek_char_port(port: Val) -> Val {
+    use std::io::BufRead;
+    let id = port_id(port);
+    let byte = unsafe {
+        match &mut PORTS[id] {
+            PortInner::Stdin(r) => r.fill_buf().ok().and_then(|b| b.first().copied()),
+            PortInner::FileIn(r) => r.fill_buf().ok().and_then(|b| b.first().copied()),
+            _ => None,
+        }
+    };
+    match byte {
+        Some(b) => make_char(b as i64),
+        None => EOF_VAL,
+    }
+}
+
+fn write_char_port(ch: Val, port: Val) -> Val {
+    use std::io::Write;
+    let cp = if is_char(ch) { car(ch).as_fixnum().unwrap_or(0) } else { ch.as_fixnum().unwrap_or(0) };
+    let id = port_id(port);
+    unsafe {
+        match &mut PORTS[id] {
+            PortInner::Stdout => { print!("{}", cp as u8 as char); }
+            PortInner::Stderr => { eprint!("{}", cp as u8 as char); }
+            PortInner::FileOut(f) => { let _ = f.write_all(&[cp as u8]); }
+            _ => {}
+        }
+    }
+    Val::NIL
+}
+
+fn write_string_port(s: Val, port: Val) -> Val {
+    use std::io::Write;
+    let id = port_id(port);
+    let rust_str = val_to_rust_string(s);
+    unsafe {
+        match &mut PORTS[id] {
+            PortInner::Stdout => { print!("{rust_str}"); }
+            PortInner::Stderr => { eprint!("{rust_str}"); }
+            PortInner::FileOut(f) => { let _ = f.write_all(rust_str.as_bytes()); }
+            _ => {}
+        }
+    }
+    Val::NIL
+}
+
+fn read_line_port(port: Val) -> Val {
+    use std::io::BufRead;
+    let id = port_id(port);
+    let mut line = String::new();
+    let n = unsafe {
+        match &mut PORTS[id] {
+            PortInner::Stdin(r) => r.read_line(&mut line).unwrap_or(0),
+            PortInner::FileIn(r) => r.read_line(&mut line).unwrap_or(0),
+            _ => 0,
+        }
+    };
+    if n == 0 { return EOF_VAL; }
+    // Remove trailing newline
+    if line.ends_with('\n') { line.pop(); }
+    if line.ends_with('\r') { line.pop(); }
+    rust_string_to_val(&line)
+}
+
+fn val_to_rust_string(v: Val) -> String {
+    if !is_string(v) { return String::new(); }
+    let mut s = String::new();
+    let mut chars = car(v);
+    while chars != Val::NIL && !chars.is_fixnum() {
+        let cp = car(chars).as_fixnum().unwrap_or(0);
+        s.push(cp as u8 as char);
+        chars = cdr(chars);
+    }
+    s
+}
+
+fn rust_string_to_val(s: &str) -> Val {
+    let len = s.len() as i64;
+    let mut chars = Val::NIL;
+    for b in s.bytes().rev() {
+        chars = cons(Val::fixnum(b as i64), chars);
+    }
+    make_string(chars, Val::fixnum(len))
 }
 "#;
 
