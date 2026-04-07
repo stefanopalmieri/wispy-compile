@@ -100,11 +100,14 @@
       ((eq? head 'number?) (pe-eval-pred number? 'number? (cdr expr) env))
       ((eq? head 'symbol?) (pe-eval-pred symbol? 'symbol? (cdr expr) env))
       ((eq? head 'boolean?) (pe-eval-pred boolean? 'boolean? (cdr expr) env))
+      ((eq? head 'string?) (pe-eval-pred string? 'string? (cdr expr) env))
+      ((eq? head 'char?)  (pe-eval-pred char? 'char? (cdr expr) env))
       ((eq? head 'eq?)   (pe-eval-eq (cdr expr) env))
       ((eq? head 'equal?) (pe-eval-equal (cdr expr) env))
       ((eq? head 'not)   (pe-eval-not (cdr expr) env))
       ((eq? head 'and)   (pe-eval-and (cdr expr) env))
       ((eq? head 'or)    (pe-eval-or (cdr expr) env))
+      ((eq? head 'list)  (pe-eval-list (cdr expr) env))
       (else (pe-eval-call head (cdr expr) env)))))
 
 ;;; ── Form handlers ──────────────────────────────────────────────────
@@ -208,6 +211,18 @@
             (if v v (pe-eval-or (cdr exprs) env))
             *unknown*))))
 
+;;; ── List construction ──────────────────────────────────────────────
+;;; Always build the list — unknown elements stay as unknowns inside it.
+;;; This allows continuation frames like (list 'k-if then else env k)
+;;; to be constructed even when k is unknown, so apply-k can dispatch
+;;; on the known tag.
+
+(define (pe-eval-list args env)
+  (if (null? args) '()
+      (let ((head (pe-eval (car args) env))
+            (tail (pe-eval-list (cdr args) env)))
+        (cons head tail))))
+
 ;;; ── Function call ──────────────────────────────────────────────────
 
 (define (pe-eval-call fn-name arg-exprs env)
@@ -222,7 +237,11 @@
                 (set! *depth* (+ *depth* 1))
                 (let ((result (pe-eval body (pe-extend params args '()))))
                   (set! *depth* (- *depth* 1))
-                  result)))))))
+                  ;; If body evaluated to unknown, residualize the call
+                  ;; instead of propagating unknown (enables P2)
+                  (if (unknown? result)
+                      (make-residual (cons fn-name (pe-lift-args args)))
+                      result))))))))
 
 (define (pe-eval-args exprs env)
   (if (null? exprs) '()

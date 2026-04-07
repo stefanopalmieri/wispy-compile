@@ -30,3 +30,5 @@ pub mod eval;
 pub mod cps;
 #[cfg(feature = "std")]
 pub mod compile;
+#[cfg(feature = "std")]
+pub mod compile_lua;
