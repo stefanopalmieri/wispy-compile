@@ -57,24 +57,17 @@ The [wispy-vm](https://github.com/stefanopalmieri/wispy-vm) fork of [Stak](https
 ## Quick Start
 
 ```bash
-cargo run                            # REPL
-cargo run -- examples/fib.scm        # run a file
-cargo run -- -e '(+ 1 2)'           # evaluate expression
-cargo run -- --permissive examples/fib.scm   # permissive mode (type errors return BOT)
-cargo run -- --compile examples/nqueens.scm > nqueens.rs  # compile to Rust
-rustc -O -o nqueens nqueens.rs && ./nqueens   # native binary
-cargo run -- examples/reflective-tower.scm   # run the self-hosted reflective tower
-cd lean && lake build                        # verify table proofs (14 theorems, ~6s)
-```
+# Compile to native Rust
+cargo run -- --compile examples/nqueens.scm > nqueens.rs
+rustc -O -o nqueens nqueens.rs && ./nqueens   # 92
 
-As a library:
+# Run on wispy-vm (bytecode VM with GC — see github.com/stefanopalmieri/wispy-vm)
+wispy examples/algebra-smoke.scm              # 83 algebra assertions
+wispy examples/reflective-tower.scm           # full reflective tower (12ms)
+wispy-repl                                    # interactive REPL with Cayley algebra
 
-```rust
-use wispy_scheme::eval::Eval;
-
-let mut ev = Eval::new();
-ev.eval_str("(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))");
-let result = ev.eval_str("(fib 10)"); // 55
+# Verify table proofs
+cd lean && lake build                         # 14 theorems, ~6s
 ```
 
 ## The Algebra Extension
@@ -133,15 +126,14 @@ src/
 ├── table.rs        32×32 Cayley table (1KB const array), algebraic axiom tests
 ├── val.rs          Val = tagged pointer (fixnum | rib index)
 ├── heap.rs         Rib heap: uniform (car, cdr, tag) for all types
-├── symbol.rs       Symbol interning (shared reader/evaluator)
+├── symbol.rs       Symbol interning (shared reader/compiler)
 ├── reader.rs       S-expression parser
 ├── macros.rs       syntax-rules: pattern matching, ellipsis, template instantiation
-├── eval.rs         Tree-walking evaluator, 104 builtins, tail call trampoline
 └── compile.rs      Scheme → Rust compiler (standalone native binaries)
 ```
 
 Two execution paths:
-- **wispy-vm** ([Stak fork](https://github.com/stefanopalmieri/wispy-vm)): bytecode VM with semi-space GC, `no_std`/`no_alloc`, R7RS, 18× faster than the tree-walking interpreter. The Cayley table is integrated into the VM. All 157 self-hosted test assertions pass. This is the primary execution path for development, REPL, and embedded deployment.
+- **wispy-vm** ([Stak fork](https://github.com/stefanopalmieri/wispy-vm)): bytecode VM with semi-space GC, `no_std`/`no_alloc`, R7RS, native Cayley algebra primitives. All 157 self-hosted test assertions pass. Primary execution path: `wispy` CLI for file execution, `wispy-repl` for interactive use (164ms startup, instant per-expression eval).
 - **Rust compiler** (`compile.rs`): Scheme → standalone Rust, 1.7x faster than Chez Scheme on nqueens(8). Self-tail-call → loop optimization, closure conversion, 55+ inlined builtins. For production hot paths that need native speed.
 
 Self-hosted tools (all `.scm` files running on WispyScheme itself):
@@ -159,9 +151,9 @@ Self-hosted tools (all `.scm` files running on WispyScheme itself):
 
 **Macros:** `syntax-rules` with pattern matching, ellipsis (`...`), literals, wildcards (`_`), and multiple clauses.
 
-**Control:** `call-with-current-continuation` (via metacircular CPS evaluator), tail call optimization, rest parameters
+**Control:** `call-with-current-continuation` (via metacircular CPS evaluator on wispy-vm), tail call optimization, rest parameters
 
-**129 builtin procedures** covering arithmetic, comparison, pairs/lists, type predicates, booleans, equivalence, strings (including case-insensitive), vectors, characters (including case-insensitive), symbols, higher-order functions, port I/O, `read`, and `load`.
+**Builtins** covering arithmetic, comparison, pairs/lists, type predicates, booleans, equivalence, strings, vectors, characters, symbols, higher-order functions, and I/O — provided by Stak's R7RS standard library plus the Cayley algebra primitives (`dot`, `tau`, `type-valid?`).
 
 ### R4RS status
 
@@ -254,11 +246,11 @@ Every continuation is a tagged list, not a closure. The program can read, modify
 **The reflective tower on wispy-vm** — the entire tower (CPS evaluator + reify/reflect + branch swap) runs on the Stak VM fork at 11.4ms — 18× faster than the interpreter. All 157 self-hosted test assertions pass (83 algebra + 29 PE + 25 metacircular + 20 reflective tower). Smith's 3-Lisp on a bytecode VM with garbage collection.
 
 ```bash
-cargo run -- examples/reflective-tower.scm       # interpreted (203ms)
-cargo run -- examples/futamura-real.scm           # Futamura P1
-cargo run -- examples/futamura-cps.scm            # Futamura P2
-cargo run -- examples/pe.scm                      # PE tests
-cargo run -- examples/algebra-smoke.scm           # 83 algebra assertions
+wispy examples/reflective-tower.scm              # full tower (12ms pre-compiled)
+wispy examples/futamura-real.scm                 # Futamura P1
+wispy examples/futamura-cps.scm                  # Futamura P2
+wispy examples/pe.scm                            # PE tests
+wispy examples/algebra-smoke.scm                 # 83 algebra assertions
 ```
 
 ## `no_std` Support
@@ -271,7 +263,7 @@ WispyScheme compiles in three configurations:
 | **alloc** | `--no-default-features --features alloc` | `Vec<Rib>` (growable) | `Vec<(String, Val)>` | WASM, custom allocators |
 | **bare metal** | `--no-default-features` | `[Rib; 8192]` (fixed) | `[([u8; 48], u8, Val); 512]` (fixed) | RP2040, ESP32, cortex-m |
 
-The table, value representation, reader, heap, and symbol interning all compile without `std` or `alloc`. The evaluator (`eval.rs`) and compiler (`compile.rs`) require `std` due to I/O and string formatting. For `no_std` execution, use [wispy-vm](https://github.com/stefanopalmieri/wispy-vm) which supports `no_std` and `no_alloc` natively.
+The table, value representation, reader, heap, and symbol interning all compile without `std` or `alloc`. The compiler (`compile.rs`) requires `std` due to I/O and string formatting. For `no_std` execution, use [wispy-vm](https://github.com/stefanopalmieri/wispy-vm) which supports `no_std` and `no_alloc` natively.
 
 ```bash
 # Verify bare-metal build
@@ -279,8 +271,6 @@ cargo check --no-default-features --lib
 ```
 
 ## Future Work
-
-- **wispy-vm bytecode compiler.** The WispyScheme reader + macro expander produce ASTs that currently run through the tree-walking interpreter. A bytecode compiler targeting wispy-vm's instruction set (Constant, Get, Set, If, Call) would make wispy-vm the default execution path, with GC, `no_std`, and 18× speed included.
 
 - **P2 → compiled pipeline.** The Futamura P2 demo produces residual CPS code for partially-known programs. Piping that residual through `--compile` (Rust) would complete the compiler pipeline: Scheme → PE specializes CPS evaluator → residual CPS → native binary with call/cc preserved.
 
