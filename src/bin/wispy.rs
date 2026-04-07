@@ -9,7 +9,6 @@
 
 use wispy_scheme::eval::Eval;
 use wispy_scheme::compile;
-use wispy_scheme::compile_lua;
 
 use std::io::{self, Write, BufRead};
 
@@ -18,7 +17,6 @@ fn main() {
 
     let mut permissive = false;
     let mut compile_mode = false;
-    let mut compile_lua_mode = false;
     let mut expr = None;
     let mut files = Vec::new();
 
@@ -28,7 +26,6 @@ fn main() {
             "--strict" => {}  // now the default; accepted for backwards compat
             "--permissive" => permissive = true,
             "--compile" => compile_mode = true,
-            "--compile-lua" => compile_lua_mode = true,
             "-e" => {
                 i += 1;
                 if i < args.len() {
@@ -37,27 +34,11 @@ fn main() {
             }
             arg if !arg.starts_with('-') => files.push(arg.to_string()),
             _ => {
-                eprintln!("Usage: wispy [--permissive] [--compile] [--compile-lua] [-e expr] [file.scm ...]");
+                eprintln!("Usage: wispy [--permissive] [--compile] [-e expr] [file.scm ...]");
                 std::process::exit(1);
             }
         }
         i += 1;
-    }
-
-    // Compile to Lua mode
-    if compile_lua_mode {
-        if files.is_empty() {
-            eprintln!("--compile-lua requires a file argument");
-            std::process::exit(1);
-        }
-        let mut src = String::new();
-        for f in &files {
-            src.push_str(&std::fs::read_to_string(f)
-                .unwrap_or_else(|e| { eprintln!("{f}: {e}"); std::process::exit(1); }));
-            src.push('\n');
-        }
-        print!("{}", compile_lua::compile_lua(&src));
-        return;
     }
 
     // Compile mode

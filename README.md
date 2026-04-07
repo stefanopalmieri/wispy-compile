@@ -42,11 +42,17 @@ On this cons-heavy, branch-heavy workload, compiled WispyScheme is 1.7x faster t
 |---|---|---|---|
 | **WispyScheme → Rust** | AOT native | **5.3ms** | 1× |
 | **LuaJIT** | JIT | 9.6ms | 1.8× |
-| **WispyScheme → Lua** | transpiled | **71ms** | 13× |
-| **Lua 5.5** | bytecode VM | 69ms | 13× |
+| **wispy-vm** (Stak fork) | bytecode VM | **160ms** | 30× |
 | **MicroPython** | bytecode VM | 197ms | 37× |
 
-The Lua backend (`--compile-lua`) matches handwritten Lua performance — transpiled Scheme runs at the same speed as hand-written Lua. On ESP32 (where LuaJIT is unavailable), this means WispyScheme compiled to Lua is the fastest scriptable option.
+### Reflective tower
+
+| Runtime | Time | vs. interpreter |
+|---|---|---|
+| **wispy-vm** (Stak fork) | **11.4ms** | 18× faster |
+| WispyScheme interpreter | 203ms | 1× |
+
+The [wispy-vm](https://github.com/stefanopalmieri/wispy-vm) fork of [Stak](https://github.com/raviqqe/stak) — a Ribbit-derived bytecode VM with semi-space GC and `no_std`/`no_alloc` support — runs the entire reflective tower (reify, reflect, branch swap) at 11.4ms. All 157 self-hosted test assertions pass on the forked VM.
 
 ## Quick Start
 
@@ -57,7 +63,6 @@ cargo run -- -e '(+ 1 2)'           # evaluate expression
 cargo run -- --permissive examples/fib.scm   # permissive mode (type errors return BOT)
 cargo run -- --compile examples/nqueens.scm > nqueens.rs  # compile to Rust
 rustc -O -o nqueens nqueens.rs && ./nqueens   # native binary
-cargo run -- --compile-lua examples/fib.scm | lua -       # compile to Lua, run immediately
 cargo run -- examples/reflective-tower.scm   # run the self-hosted reflective tower
 cd lean && lake build                        # verify table proofs (14 theorems, ~6s)
 ```
@@ -124,7 +129,7 @@ The evaluator layer (`car`, `cdr`, etc. on actual values) is strict by default: 
 ```
 src/
 ├── lib.rs          crate root
-├── bin/wispy.rs    REPL, file runner, -e flag, --compile, --compile-lua
+├── bin/wispy.rs    REPL, file runner, -e flag, --compile
 ├── table.rs        32×32 Cayley table (1KB const array), algebraic axiom tests
 ├── val.rs          Val = tagged pointer (fixnum | rib index)
 ├── heap.rs         Rib heap: uniform (car, cdr, tag) for all types
@@ -132,16 +137,12 @@ src/
 ├── reader.rs       S-expression parser
 ├── macros.rs       syntax-rules: pattern matching, ellipsis, template instantiation
 ├── eval.rs         Tree-walking evaluator, 104 builtins, tail call trampoline
-├── cps.rs          CPS evaluator with first-class continuations (call/cc)
-├── compile.rs      Scheme → Rust compiler (standalone native binaries)
-└── compile_lua.rs  Scheme → Lua compiler (runs on Lua VM, GC'd)
+└── compile.rs      Scheme → Rust compiler (standalone native binaries)
 ```
 
-Four execution paths:
-- **Interpreter** (`eval.rs`): tail call optimization, 104 builtins, strict by default (`--permissive` for embedded fault tolerance)
-- **CPS evaluator** (`cps.rs`): first-class continuations, `call/cc`, re-entrant
-- **Rust compiler** (`compile.rs`): Scheme → standalone Rust, 1.7x faster than Chez Scheme on nqueens(8). Self-tail-call → loop optimization, closure conversion, 55+ inlined builtins.
-- **Lua compiler** (`compile_lua.rs`): Scheme → standalone Lua. Matches handwritten Lua performance. Includes compile-time `load`, symbol/string distinction, cons cells with GC, Cayley table as Lua array. The entire reflective tower (metacircular evaluator + reify/reflect + branch swap) compiles and runs on Lua — 12.6x faster than the interpreter.
+Two execution paths:
+- **wispy-vm** ([Stak fork](https://github.com/stefanopalmieri/wispy-vm)): bytecode VM with semi-space GC, `no_std`/`no_alloc`, R7RS, 18× faster than the tree-walking interpreter. The Cayley table is integrated into the VM. All 157 self-hosted test assertions pass. This is the primary execution path for development, REPL, and embedded deployment.
+- **Rust compiler** (`compile.rs`): Scheme → standalone Rust, 1.7x faster than Chez Scheme on nqueens(8). Self-tail-call → loop optimization, closure conversion, 55+ inlined builtins. For production hot paths that need native speed.
 
 Self-hosted tools (all `.scm` files running on WispyScheme itself):
 - **Online PE** (`examples/pe.scm`): partial evaluator for Scheme — Futamura Projection 1 on a real interpreter
@@ -156,9 +157,9 @@ Self-hosted tools (all `.scm` files running on WispyScheme itself):
 
 **Special forms:** `quote`, `if`, `define`, `define-syntax`, `lambda` (multi-body), `set!`, `begin`, `cond`, `case`, `and`, `or`, `let`, `let*`, `letrec`, named `let`, `do`, `delay`, `quasiquote`/`unquote`/`unquote-splicing`
 
-**Macros:** `syntax-rules` with pattern matching, ellipsis (`...`), literals, wildcards (`_`), and multiple clauses. Expansion in all three execution paths (interpreter, CPS, compiler).
+**Macros:** `syntax-rules` with pattern matching, ellipsis (`...`), literals, wildcards (`_`), and multiple clauses.
 
-**Control:** `call-with-current-continuation` (CPS evaluator), tail call optimization, rest parameters
+**Control:** `call-with-current-continuation` (via metacircular CPS evaluator), tail call optimization, rest parameters
 
 **129 builtin procedures** covering arithmetic, comparison, pairs/lists, type predicates, booleans, equivalence, strings (including case-insensitive), vectors, characters (including case-insensitive), symbols, higher-order functions, port I/O, `read`, and `load`.
 
@@ -167,7 +168,7 @@ Self-hosted tools (all `.scm` files running on WispyScheme itself):
 Nearly complete. Remaining gaps:
 - `dynamic-wind`
 - Full macro hygiene (current `syntax-rules` is unhygienic)
-- `call/cc` in the compiler (only the CPS evaluator supports `call/cc`)
+- `call/cc` in the Rust compiler (available via metacircular CPS evaluator on wispy-vm)
 - `char-ready?` (optional in R4RS)
 
 See [`docs/r7rs-small-plan.md`](docs/r7rs-small-plan.md) for the path to R7RS-small compliance.
@@ -250,15 +251,14 @@ The CPS evaluator's 14 continuation types, mutual recursion (`meval`/`apply-k`/`
 
 Every continuation is a tagged list, not a closure. The program can read, modify, and rewrite its own control flow.
 
-**The reflective tower on Lua** — the entire tower (CPS evaluator + reify/reflect + branch swap) compiles to Lua via `--compile-lua` and runs 12.6x faster than the interpreter (16.7ms vs 210ms). All 45 tests pass, including the branch swap. Smith's 3-Lisp on a Lua VM with garbage collection.
+**The reflective tower on wispy-vm** — the entire tower (CPS evaluator + reify/reflect + branch swap) runs on the Stak VM fork at 11.4ms — 18× faster than the interpreter. All 157 self-hosted test assertions pass (83 algebra + 29 PE + 25 metacircular + 20 reflective tower). Smith's 3-Lisp on a bytecode VM with garbage collection.
 
 ```bash
-cargo run -- examples/reflective-tower.scm                             # interpreted
-cargo run -- --compile-lua examples/reflective-tower.scm | lua -       # compiled to Lua (12.6x faster)
-cargo run -- examples/futamura-real.scm                                # Futamura P1
-cargo run -- examples/futamura-cps.scm                                 # Futamura P2
-cargo run -- examples/pe.scm                                           # PE tests
-cargo run -- examples/algebra-smoke.scm                                # 83 algebra assertions
+cargo run -- examples/reflective-tower.scm       # interpreted (203ms)
+cargo run -- examples/futamura-real.scm           # Futamura P1
+cargo run -- examples/futamura-cps.scm            # Futamura P2
+cargo run -- examples/pe.scm                      # PE tests
+cargo run -- examples/algebra-smoke.scm           # 83 algebra assertions
 ```
 
 ## `no_std` Support
@@ -271,7 +271,7 @@ WispyScheme compiles in three configurations:
 | **alloc** | `--no-default-features --features alloc` | `Vec<Rib>` (growable) | `Vec<(String, Val)>` | WASM, custom allocators |
 | **bare metal** | `--no-default-features` | `[Rib; 8192]` (fixed) | `[([u8; 48], u8, Val); 512]` (fixed) | RP2040, ESP32, cortex-m |
 
-The table, value representation, reader, heap, and symbol interning all compile without `std` or `alloc`. The evaluators (`eval.rs`, `cps.rs`) and compiler (`compile.rs`) require `std` due to I/O and string formatting.
+The table, value representation, reader, heap, and symbol interning all compile without `std` or `alloc`. The evaluator (`eval.rs`) and compiler (`compile.rs`) require `std` due to I/O and string formatting. For `no_std` execution, use [wispy-vm](https://github.com/stefanopalmieri/wispy-vm) which supports `no_std` and `no_alloc` natively.
 
 ```bash
 # Verify bare-metal build
@@ -280,15 +280,13 @@ cargo check --no-default-features --lib
 
 ## Future Work
 
-- **GC for the interpreter.** The tree-walking interpreter's heap grows without bound (400MB on fib(30)). A mark-and-sweep over the rib heap would fix this. The Lua backend sidesteps the problem entirely — Lua's GC manages cons cells.
+- **wispy-vm bytecode compiler.** The WispyScheme reader + macro expander produce ASTs that currently run through the tree-walking interpreter. A bytecode compiler targeting wispy-vm's instruction set (Constant, Get, Set, If, Call) would make wispy-vm the default execution path, with GC, `no_std`, and 18× speed included.
 
-- **P2 → Lua pipeline.** The Futamura P2 demo produces residual CPS code for partially-known programs. Piping that residual through `--compile-lua` would complete the compiler pipeline: Scheme → PE specializes CPS evaluator → residual CPS → fast Lua with call/cc preserved.
+- **P2 → compiled pipeline.** The Futamura P2 demo produces residual CPS code for partially-known programs. Piping that residual through `--compile` (Rust) would complete the compiler pipeline: Scheme → PE specializes CPS evaluator → residual CPS → native binary with call/cc preserved.
 
-- **Bytecode VM.** The interpreter is 100x slower than Lua because it tree-walks. A bytecode compiler and register-based VM would close this gap. The Lua backend is the practical workaround.
+- **ESP32 deployment.** wispy-vm supports `no_std` and `no_alloc` natively. Target ESP32 (Xtensa or RISC-V) with a fixed-size heap and the Cayley table in flash. No cross-compilation of Scheme needed — compile bytecode on the workstation, upload to the device.
 
-- **ESP32 deployment.** The Lua backend targets [NodeMCU](https://nodemcu.readthedocs.io/) (Lua on ESP32). Compile Scheme to Lua on the workstation, upload `.lua` files over serial or MQTT. The Cayley table is a Lua array. No cross-compilation needed.
-
-- **Compiler improvements.** Mutual tail recursion (currently only self-tail-calls are optimized), `call/cc` support in compiled Rust output, named `let` in both compiler backends.
+- **Compiler improvements.** Mutual tail recursion (currently only self-tail-calls are optimized), `call/cc` support in compiled Rust output, named `let` in the Rust compiler backend.
 
 - **Self-hosted compiler.** The self-hosted transpiler (`examples/transpile.scm`) currently only handles the 7-node algebraic IR. Extending it to cover full R4RS Scheme would replace `compile.rs` with a Scheme-in-Scheme compiler.
 
