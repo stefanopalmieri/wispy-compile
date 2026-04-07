@@ -102,6 +102,12 @@ pub struct Compiler {
     gc_slots: RefCell<HashMap<String, String>>,
     /// Counter for unique GC slot names (reset per function).
     gc_slot_counter: Cell<usize>,
+    /// Pre-computed: set of function names whose bodies might allocate (transitively).
+    /// None until computed. Functions NOT in this set are guaranteed non-allocating.
+    fn_alloc_flags: RefCell<Option<HashSet<String>>>,
+    /// During analysis: names that are self-tail-calls (loop names from named let / TCO).
+    /// These are non-allocating (they compile to `continue`).
+    analysis_loop_names: RefCell<HashSet<String>>,
 }
 
 impl Compiler {
@@ -121,6 +127,8 @@ impl Compiler {
             gc_mode: GcMode::None,
             gc_slots: RefCell::new(HashMap::new()),
             gc_slot_counter: Cell::new(0),
+            fn_alloc_flags: RefCell::new(None),
+            analysis_loop_names: RefCell::new(HashSet::new()),
         }
     }
 
@@ -157,6 +165,7 @@ impl Compiler {
     }
 
     /// Check if an expression might allocate (conservatively).
+    /// Uses fn_alloc_flags for known function calls when available.
     fn expr_might_alloc(&self, expr: Val, heap: &Heap, syms: &SymbolTable) -> bool {
         if expr.is_fixnum() || expr == Val::NIL { return false; }
         if !expr.is_rib() { return false; }
@@ -177,9 +186,185 @@ impl Compiler {
             "car" | "cdr" | "char->integer" | "string-length" | "vector-length" |
             "eof-object?" | "port?" | "input-port?" | "output-port?" |
             "procedure?" => false,
-            // if/and/or: might, depends on branches (conservatively say yes)
-            _ => true,
+            _ => {
+                // Check transitive non-allocation flags for known functions
+                if self.is_known_function(name) {
+                    let flags = self.fn_alloc_flags.borrow();
+                    if let Some(ref set) = *flags {
+                        if !set.contains(name) {
+                            return false; // transitively non-allocating
+                        }
+                    }
+                }
+                true
+            }
         }
+    }
+
+    // ── Liveness-based root elision ─────────────────────────────────
+
+    /// Deep recursive check: can any sub-expression in this tree allocate?
+    /// Unlike expr_might_alloc (shallow), this walks the entire AST including
+    /// if/let/begin branches. Uses fn_alloc_flags for known function calls.
+    fn body_might_alloc(&self, expr: Val, heap: &Heap, syms: &SymbolTable) -> bool {
+        if expr.is_fixnum() || expr == Val::NIL { return false; }
+        if !expr.is_rib() { return false; }
+        let tag = heap.tag(expr);
+        if tag == table::T_SYM { return false; }
+        if tag == table::T_STR || tag == table::T_CHAR || tag == table::TRUE || tag == table::BOT {
+            return false;
+        }
+        if tag != table::T_PAIR { return false; }
+        let head = heap.car(expr);
+        let rest = heap.cdr(expr);
+        if !heap.is_symbol(head) { return true; } // generic call
+        let name = syms.symbol_name(head).unwrap_or("");
+        match name {
+            // Pure non-allocating ops: recurse into args
+            "+" | "-" | "*" | "/" | "quotient" | "remainder" | "modulo" |
+            "=" | "<" | ">" | "<=" | ">=" |
+            "zero?" | "positive?" | "negative?" | "even?" | "odd?" |
+            "not" | "eq?" | "eqv?" | "null?" | "pair?" | "number?" | "integer?" |
+            "abs" | "max" | "min" | "expt" | "gcd" | "boolean?" |
+            "exact?" | "inexact?" | "char?" | "string?" | "vector?" |
+            "car" | "cdr" | "char->integer" | "string-length" | "vector-length" |
+            "eof-object?" | "port?" | "input-port?" | "output-port?" |
+            "procedure?" | "set-car!" | "set-cdr!" |
+            "vector-ref" | "vector-set!" |
+            "string-ref" | "string-set!" |
+            "char=?" | "char<?" | "char>?" | "char<=?" | "char>=?" |
+            "string=?" | "string<?" | "string>?" | "string<=?" | "string>=?" |
+            "display" | "newline" | "write" | "write-char" => {
+                self.body_might_alloc_list(rest, heap, syms)
+            }
+            // Control flow: recurse
+            "if" | "begin" | "and" | "or" | "cond" | "case" | "set!" => {
+                self.body_might_alloc_list(rest, heap, syms)
+            }
+            "let" | "let*" => {
+                let first = heap.car(rest);
+                if name == "let" && heap.is_symbol(first) {
+                    // named let: register loop name as non-allocating self-call
+                    let loop_name = syms.symbol_name(first).unwrap_or("_").to_string();
+                    self.analysis_loop_names.borrow_mut().insert(loop_name.clone());
+                    let bindings = heap.car(heap.cdr(rest));
+                    let body = heap.cdr(heap.cdr(rest));
+                    let result = self.body_might_alloc_bindings(bindings, heap, syms)
+                        || self.body_might_alloc_list(body, heap, syms);
+                    self.analysis_loop_names.borrow_mut().remove(&loop_name);
+                    result
+                } else {
+                    self.body_might_alloc_bindings(first, heap, syms)
+                        || self.body_might_alloc_list(heap.cdr(rest), heap, syms)
+                }
+            }
+            "letrec" => {
+                self.body_might_alloc_bindings(heap.car(rest), heap, syms)
+                    || self.body_might_alloc_list(heap.cdr(rest), heap, syms)
+            }
+            "do" => self.body_might_alloc_list(rest, heap, syms),
+            "quote" => {
+                let datum = heap.car(rest);
+                // Quoted lists call cons at runtime via emit_datum
+                datum != Val::NIL && !datum.is_fixnum() && heap.is_pair(datum)
+            }
+            "lambda" | "case-lambda" => true, // make_closure allocates
+            // Known allocating builtins
+            "cons" | "list" | "append" | "reverse" | "map" | "for-each" |
+            "make-vector" | "make-string" | "string-append" | "substring" |
+            "number->string" | "string->number" | "apply" | "values" |
+            "call-with-values" | "call-with-current-continuation" | "call/cc" |
+            "error" | "raise" | "guard" | "with-exception-handler" |
+            "read" | "read-char" | "read-line" | "make-char" |
+            "integer->char" | "char-upcase" | "char-downcase" => true,
+            // Known function / loop name: consult fn_alloc_flags + loop names
+            _ => {
+                // Self-tail-calls (named let loops) compile to `continue`, never allocate
+                if self.analysis_loop_names.borrow().contains(name) {
+                    return self.body_might_alloc_list(rest, heap, syms);
+                }
+                if self.is_known_function(name) {
+                    let flags = self.fn_alloc_flags.borrow();
+                    if let Some(ref set) = *flags {
+                        if !set.contains(name) {
+                            return self.body_might_alloc_list(rest, heap, syms);
+                        }
+                    }
+                }
+                true // unknown call or allocating function
+            }
+        }
+    }
+
+    fn body_might_alloc_list(&self, mut list: Val, heap: &Heap, syms: &SymbolTable) -> bool {
+        while heap.is_pair(list) {
+            if self.body_might_alloc(heap.car(list), heap, syms) { return true; }
+            list = heap.cdr(list);
+        }
+        false
+    }
+
+    fn body_might_alloc_bindings(&self, mut bindings: Val, heap: &Heap, syms: &SymbolTable) -> bool {
+        while heap.is_pair(bindings) {
+            let binding = heap.car(bindings);
+            let init = heap.car(heap.cdr(binding));
+            if self.body_might_alloc(init, heap, syms) { return true; }
+            bindings = heap.cdr(bindings);
+        }
+        false
+    }
+
+    /// Pre-compute which top-level functions might allocate (transitively).
+    /// Uses fixed-point iteration: a function allocates if its body intrinsically
+    /// allocates or if it calls a function that allocates.
+    fn compute_function_alloc_flags(&self, heap: &Heap, syms: &SymbolTable) {
+        // Phase 1: compute intrinsic flags (treating all user function calls as non-allocating)
+        *self.fn_alloc_flags.borrow_mut() = Some(HashSet::new());
+        let mut alloc_set: HashSet<String> = HashSet::new();
+
+        // First pass: which functions have bodies that intrinsically allocate
+        // (ignoring calls to other known functions)?
+        // We set fn_alloc_flags to empty (all functions "non-allocating")
+        // so body_might_alloc will recurse through known-function calls as non-allocating.
+        for func in &self.functions {
+            if self.body_might_alloc(func.body, heap, syms) {
+                alloc_set.insert(func.name.clone());
+            }
+        }
+
+        // Fixed-point: propagate — if f calls g and g allocates, f allocates
+        loop {
+            let prev_size = alloc_set.len();
+            *self.fn_alloc_flags.borrow_mut() = Some(alloc_set.clone());
+            for func in &self.functions {
+                if !alloc_set.contains(&func.name) {
+                    if self.body_might_alloc(func.body, heap, syms) {
+                        alloc_set.insert(func.name.clone());
+                    }
+                }
+            }
+            if alloc_set.len() == prev_size { break; }
+        }
+        *self.fn_alloc_flags.borrow_mut() = Some(alloc_set);
+    }
+
+    /// Check if a variable needs a GC root in Cheney mode.
+    /// `body` can be a single expression or a body list (for begin/let bodies).
+    /// Returns false if the body never allocates.
+    fn needs_gc_root(&self, _var: &str, body: Val, heap: &Heap, syms: &SymbolTable) -> bool {
+        if !self.is_cheney() { return false; }
+        // Phase A: if the body never allocates, no roots needed at all
+        if !self.body_might_alloc(body, heap, syms) { return false; }
+        // Phase B: per-variable fixnum analysis would go here (future optimization)
+        // For now, conservatively: needs root
+        true
+    }
+
+    /// Like needs_gc_root but for a body that is a list of expressions (begin body).
+    fn needs_gc_root_list(&self, _var: &str, body: Val, heap: &Heap, syms: &SymbolTable) -> bool {
+        if !self.is_cheney() { return false; }
+        if !self.body_might_alloc_list(body, heap, syms) { return false; }
+        true
     }
 
     /// In Cheney mode: emit a function call where args that precede an allocating
@@ -1239,11 +1424,34 @@ impl Compiler {
 
         let mut out = format!("fn {lname}({params_str}) -> Val {{\n");
         if self.is_cheney() {
-            out.push_str("    let _gcg = GcGuard(gc_frame());\n");
-            self.emit_env_gc_push(&lambda.free_vars, &mut out);
+            let all_vars: Vec<&String> = lambda.free_vars.iter().chain(lambda.params.iter()).collect();
+            let any_rooted = all_vars.iter()
+                .any(|v| self.needs_gc_root_list(v, lambda.body_list, heap, syms));
+            if any_rooted {
+                out.push_str("    let _gcg = GcGuard(gc_frame());\n");
+            }
+            // Extract free vars: gc_push those that need roots, plain locals otherwise
+            for (i, fv) in lambda.free_vars.iter().enumerate() {
+                let access = if i == 0 {
+                    "car(__env)".to_string()
+                } else {
+                    let mut s = "__env".to_string();
+                    for _ in 0..i { s = format!("cdr({s})"); }
+                    format!("car({s})")
+                };
+                if self.needs_gc_root(fv, lambda.body_list, heap, syms) {
+                    let slot = self.gc_register(fv);
+                    out.push_str(&format!("    let {slot} = gc_push({access});\n"));
+                } else {
+                    out.push_str(&format!("    let {} = {access};\n", rust_ident(fv)));
+                }
+            }
+            // Push params that need roots
             for p in &lambda.params {
-                let slot = self.gc_register(p);
-                out.push_str(&format!("    let {slot} = gc_push({});\n", rust_ident(p)));
+                if self.needs_gc_root(p, lambda.body_list, heap, syms) {
+                    let slot = self.gc_register(p);
+                    out.push_str(&format!("    let {slot} = gc_push({});\n", rust_ident(p)));
+                }
             }
         } else {
             out.push_str(&Self::emit_env_extraction(&lambda.free_vars));
@@ -1479,6 +1687,11 @@ impl Compiler {
 
         // ── Code generation (may discover lambdas) ─────────────────
 
+        // Pre-compute which functions might allocate (for root elision)
+        if self.is_cheney() {
+            self.compute_function_alloc_flags(heap, syms);
+        }
+
         // Collect function bodies (this triggers lambda lifting)
         let mut func_code = String::new();
         for func in &self.functions {
@@ -1529,20 +1742,34 @@ impl Compiler {
 
             if needs_tco {
                 if self.is_cheney() {
-                    // TCO with shadow stack: params on GC_STACK, gc_store on continue
+                    // TCO with shadow stack: only root params that need it
+                    let any_rooted = func.params.iter()
+                        .any(|p| self.needs_gc_root(p, func.body, heap, syms));
                     let rparams: Vec<String> = func.params.iter()
-                        .map(|p| format!("{}: Val", rust_ident(p)))
+                        .map(|p| {
+                            if any_rooted && self.needs_gc_root(p, func.body, heap, syms) {
+                                format!("{}: Val", rust_ident(p))
+                            } else {
+                                format!("mut {}: Val", rust_ident(p))
+                            }
+                        })
                         .collect();
                     let params_str = rparams.join(", ");
                     func_code.push_str(&format!("fn {rname}({params_str}) -> Val {{\n"));
-                    func_code.push_str("    let _gcg = GcGuard(gc_frame());\n");
-                    for p in &func.params {
-                        let slot = self.gc_register(p);
-                        func_code.push_str(&format!("    let {slot} = gc_push({});\n", rust_ident(p)));
+                    if any_rooted {
+                        func_code.push_str("    let _gcg = GcGuard(gc_frame());\n");
+                        for p in &func.params {
+                            if self.needs_gc_root(p, func.body, heap, syms) {
+                                let slot = self.gc_register(p);
+                                func_code.push_str(&format!("    let {slot} = gc_push({});\n", rust_ident(p)));
+                            }
+                        }
+                        func_code.push_str("    let __loop_base = gc_frame();\n");
+                        func_code.push_str("    loop {\n");
+                        func_code.push_str("        gc_unwind(__loop_base);\n");
+                    } else {
+                        func_code.push_str("    loop {\n");
                     }
-                    func_code.push_str("    let __loop_base = gc_frame();\n");
-                    func_code.push_str("    loop {\n");
-                    func_code.push_str("        gc_unwind(__loop_base);\n");
                     *self.tco.borrow_mut() = Some(TcoContext {
                         fn_name: func.name.clone(),
                         params: func.params.clone(),
@@ -1572,16 +1799,27 @@ impl Compiler {
                 }
             } else {
                 if self.is_cheney() {
-                    // Non-TCO with shadow stack
+                    // Non-TCO: only root params that need it
+                    let any_rooted = func.params.iter()
+                        .any(|p| self.needs_gc_root(p, func.body, heap, syms));
                     let rparams: Vec<String> = func.params.iter()
-                        .map(|p| format!("{}: Val", rust_ident(p)))
+                        .map(|p| {
+                            let mutk = if !any_rooted || !self.needs_gc_root(p, func.body, heap, syms) {
+                                if self.is_set_target(p) { "mut " } else { "" }
+                            } else { "" };
+                            format!("{mutk}{}: Val", rust_ident(p))
+                        })
                         .collect();
                     let params_str = rparams.join(", ");
                     func_code.push_str(&format!("fn {rname}({params_str}) -> Val {{\n"));
-                    func_code.push_str("    let _gcg = GcGuard(gc_frame());\n");
-                    for p in &func.params {
-                        let slot = self.gc_register(p);
-                        func_code.push_str(&format!("    let {slot} = gc_push({});\n", rust_ident(p)));
+                    if any_rooted {
+                        func_code.push_str("    let _gcg = GcGuard(gc_frame());\n");
+                        for p in &func.params {
+                            if self.needs_gc_root(p, func.body, heap, syms) {
+                                let slot = self.gc_register(p);
+                                func_code.push_str(&format!("    let {slot} = gc_push({});\n", rust_ident(p)));
+                            }
+                        }
                     }
                     let body_code = self.emit_expr(func.body, heap, syms, 1);
                     func_code.push_str(&body_code);
@@ -1839,7 +2077,7 @@ impl Compiler {
                         let init = heap.car(heap.cdr(binding));
                         let vname = syms.symbol_name(var).unwrap_or("_");
                         let init_code = self.emit_expr_inline(init, heap, syms);
-                        if self.is_cheney() {
+                        if self.is_cheney() && self.needs_gc_root_list(vname, body, heap, syms) {
                             let slot = self.gc_register(vname);
                             out.push_str(&format!("{pad}    let {slot} = gc_push({init_code});\n"));
                         } else {
@@ -1866,7 +2104,7 @@ impl Compiler {
                         let init = heap.car(heap.cdr(binding));
                         let vname = syms.symbol_name(var).unwrap_or("_");
                         let init_code = self.emit_expr_inline(init, heap, syms);
-                        if self.is_cheney() {
+                        if self.is_cheney() && self.needs_gc_root_list(vname, body, heap, syms) {
                             let slot = self.gc_register(vname);
                             out.push_str(&format!("{pad}    let {slot} = gc_push({init_code});\n"));
                         } else {
@@ -2067,13 +2305,17 @@ impl Compiler {
                             ctx.as_ref().unwrap().params.clone()
                         };
                         let mut args = Vec::new();
+                        let mut arg_exprs = Vec::new();
                         let mut a = rest;
                         while heap.is_pair(a) {
+                            arg_exprs.push(heap.car(a));
                             args.push(self.emit_expr_inline(heap.car(a), heap, syms));
                             a = heap.cdr(a);
                         }
+                        let any_arg_allocs = self.is_cheney() && args.len() > 1 &&
+                            arg_exprs.iter().any(|e| self.expr_might_alloc(*e, heap, syms));
                         let mut out = String::new();
-                        if self.is_cheney() && args.len() > 1 {
+                        if self.is_cheney() && any_arg_allocs {
                             // Protect TCO temporaries: gc_push each, then gc_load back
                             for (i, arg) in args.iter().enumerate() {
                                 out.push_str(&format!("{pad}let __ts{i} = gc_push({arg});\n"));
