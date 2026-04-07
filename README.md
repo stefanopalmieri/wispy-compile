@@ -22,7 +22,7 @@ Type dispatch in the compiled output is branchless: instead of tag-bit branch ch
 |------|------|---------|
 | [**wispy-table**](https://github.com/stefanopalmieri/wispy-table) | 1KB Cayley table + Lean proofs + Z3 search | `cargo add wispy-table` |
 | [**wispy-vm**](https://github.com/stefanopalmieri/wispy-vm) | Stak VM fork + REPL + examples + benchmarks | `cargo install --path wispy` |
-| **WispyScheme** (this repo) | Scheme → Rust AOT compiler | `cargo install --path .` |
+| **wispy-compile** (this repo) | Scheme → Rust AOT compiler | `cargo install --path .` |
 
 For interpreted execution, REPL, and running the self-hosted tools (reflective tower, partial evaluator, Futamura projections), use [wispy-vm](https://github.com/stefanopalmieri/wispy-vm).
 
