@@ -54,7 +54,7 @@ For interpreted execution, REPL, and running the self-hosted tools (reflective t
 | deriv | 2.51s | 2.13s | 0.86s | **Chez** 2.92x |
 | diviter | 4.07s | 3.91s | 1.08s | **Chez** 3.77x |
 | divrec | 7.47s | 8.04s | 1.36s | **Chez** 5.49x |
-| nqueens | 8.21s | — | 4.11s | **Chez** 2.00x |
+| nqueens | 8.21s | 11.67s | 4.11s | **Chez** 2.00x |
 | destruc | 2.67s | 3.23s | 1.26s | **Chez** 2.12x |
 | triangl | 20.96s | 22.35s | 1.79s | **Chez** 11.71x |
 | takl | 3.79s | 9.56s | 3.30s | **Chez** 1.15x |
@@ -64,7 +64,7 @@ Benchmarks from [r7rs-benchmarks](https://github.com/ecraven/r7rs-benchmarks) wi
 
 **No-GC mode** (grow-only heap) wins on pure fixnum recursion: 3× faster than Chez on sum, 1.6× on fib/tak. The gap on allocation-heavy benchmarks (triangl 11.7×, divrec 5.5×) is due to unbounded heap growth causing poor cache locality.
 
-**Cheney GC mode** adds a shadow stack for precise root tracking. On deriv, Cheney GC is actually *faster* than no-GC (2.13s vs 2.51s) — semi-space copying compacts live data. On fixnum benchmarks, the shadow stack overhead (gc_push/gc_load on every variable) costs 2–9× vs no-GC. The nqueens benchmark currently crashes in Cheney mode due to a codegen bug with nested named let scopes.
+**Cheney GC mode** adds a shadow stack for precise root tracking. On deriv, Cheney GC is actually *faster* than no-GC (2.13s vs 2.51s) — semi-space copying compacts live data. On fixnum benchmarks, the shadow stack overhead (gc_push/gc_load on every variable) costs 2–9× vs no-GC.
 
 ## Garbage Collection
 

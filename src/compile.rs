@@ -182,6 +182,93 @@ impl Compiler {
         }
     }
 
+    /// In Cheney mode: emit a function call where args that precede an allocating
+    /// arg are gc_push'd to prevent staleness. Returns a safe call expression.
+    /// `callee` is the function expression (e.g. "my_func" or "gc_load(__gs0)").
+    /// `arg_codes` are the emitted arg strings.
+    /// `arg_exprs` are the AST Val nodes for each arg (for alloc analysis).
+    /// If `is_call_val` is true, wraps as call_val(callee, &[args]).
+    fn emit_gc_safe_call(
+        &self,
+        callee: &str,
+        arg_codes: &[String],
+        arg_exprs: &[Val],
+        heap: &Heap,
+        syms: &SymbolTable,
+        is_call_val: bool,
+    ) -> String {
+        if !self.is_cheney() || arg_codes.is_empty() {
+            let args_str = arg_codes.join(", ");
+            return if is_call_val {
+                format!("call_val({callee}, &[{args_str}])")
+            } else {
+                format!("{callee}({args_str})")
+            };
+        }
+
+        // Scan right-to-left: does any arg to the RIGHT of position i allocate?
+        let n = arg_codes.len();
+        let mut any_alloc_after = vec![false; n];
+        let mut seen_alloc = false;
+        for i in (0..n).rev() {
+            any_alloc_after[i] = seen_alloc;
+            if self.expr_might_alloc(arg_exprs[i], heap, syms) {
+                seen_alloc = true;
+            }
+        }
+
+        // Also check: does the callee need protection?
+        // (callee is evaluated before all args in Rust's left-to-right order)
+        let callee_needs_protect = is_call_val && seen_alloc;
+
+        if !seen_alloc && !callee_needs_protect {
+            // No arg allocates → no protection needed
+            let args_str = arg_codes.join(", ");
+            return if is_call_val {
+                format!("call_val({callee}, &[{args_str}])")
+            } else {
+                format!("{callee}({args_str})")
+            };
+        }
+
+        if is_call_val && callee_needs_protect {
+            // Callee is a heap value (e.g. gc_load of a closure) AND args allocate.
+            // gc_push ALL args first so all allocations complete, then build the
+            // args array with only gc_load reads (no allocations during array creation),
+            // then read callee fresh from updated shadow stack.
+            let mut pre = String::new();
+            let mut safe_args: Vec<String> = Vec::new();
+            for i in 0..n {
+                let slot = self.next_gc_slot();
+                pre.push_str(&format!("let {slot} = gc_push({}); ", arg_codes[i]));
+                safe_args.push(format!("gc_load({slot})"));
+            }
+            let args_str = safe_args.join(", ");
+            format!("{{ {pre}let __args = [{args_str}]; call_val({callee}, &__args) }}")
+        } else {
+            // Direct call (callee is a Rust function name) or no allocating args.
+            // Only gc_push args that precede an allocating arg.
+            let mut pre = String::new();
+            let mut safe_args: Vec<String> = Vec::new();
+            for i in 0..n {
+                if any_alloc_after[i] {
+                    let slot = self.next_gc_slot();
+                    pre.push_str(&format!("let {slot} = gc_push({}); ", arg_codes[i]));
+                    safe_args.push(format!("gc_load({slot})"));
+                } else {
+                    safe_args.push(arg_codes[i].clone());
+                }
+            }
+            let args_str = safe_args.join(", ");
+            let call = if is_call_val {
+                format!("call_val({callee}, &[{args_str}])")
+            } else {
+                format!("{callee}({args_str})")
+            };
+            if pre.is_empty() { call } else { format!("{{ {pre}{call} }}") }
+        }
+    }
+
     /// Emit a variable reference — uses gc_load in Cheney mode when the var is on the shadow stack.
     fn emit_var_ref(&self, name: &str) -> String {
         if self.is_cheney() {
@@ -3069,10 +3156,12 @@ impl Compiler {
                     return self.compile_case_lambda(rest, heap, syms);
                 }
                 _ => {
-                    let mut args = Vec::new();
+                    let mut arg_codes = Vec::new();
+                    let mut arg_exprs = Vec::new();
                     let mut a = rest;
                     while heap.is_pair(a) {
-                        args.push(self.emit_expr_inline(heap.car(a), heap, syms));
+                        arg_exprs.push(heap.car(a));
+                        arg_codes.push(self.emit_expr_inline(heap.car(a), heap, syms));
                         a = heap.cdr(a);
                     }
                     // Use direct call only when name is a known function AND is not
@@ -3081,13 +3170,12 @@ impl Compiler {
                     if self.is_known_function(name) && !shadowed {
                         let fname = rust_ident(name);
                         if self.is_variadic_function(name) {
-                            return format!("{fname}(&[{}])", args.join(", "));
+                            return self.emit_gc_safe_call(&format!("{fname}"), &arg_codes, &arg_exprs, heap, syms, true);
                         }
-                        return format!("{fname}({})", args.join(", "));
+                        return self.emit_gc_safe_call(&fname, &arg_codes, &arg_exprs, heap, syms, false);
                     } else {
-                        // Use emit_var_ref for GC-aware variable lookup
                         let fref = self.emit_var_ref(name);
-                        return format!("call_val({fref}, &[{}])", args.join(", "));
+                        return self.emit_gc_safe_call(&fref, &arg_codes, &arg_exprs, heap, syms, true);
                     }
                 }
             }
@@ -3096,14 +3184,15 @@ impl Compiler {
         // Generic call (head is not a symbol) — e.g. ((lambda ...) args)
         {
             let head_code = self.emit_expr_inline(head, heap, syms);
-            let mut args = Vec::new();
+            let mut arg_codes = Vec::new();
+            let mut arg_exprs = Vec::new();
             let mut a = rest;
             while heap.is_pair(a) {
-                args.push(self.emit_expr_inline(heap.car(a), heap, syms));
+                arg_exprs.push(heap.car(a));
+                arg_codes.push(self.emit_expr_inline(heap.car(a), heap, syms));
                 a = heap.cdr(a);
             }
-            let args_str = args.join(", ");
-            format!("call_val({head_code}, &[{args_str}])")
+            self.emit_gc_safe_call(&head_code, &arg_codes, &arg_exprs, heap, syms, true)
         }
     }
 
