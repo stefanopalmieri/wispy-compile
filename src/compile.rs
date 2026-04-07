@@ -1234,6 +1234,7 @@ impl Compiler {
             GcMode::None => out.push_str(RUNTIME_PRELUDE),
             GcMode::Cheney => out.push_str(RUNTIME_CHENEY),
         }
+        out.push_str(RUNTIME_SHARED);
         out.push_str("\n");
 
         // Algebra element constants (Val) — accessible from compiled Scheme code
@@ -1374,6 +1375,10 @@ impl Compiler {
             statics_code.push_str(&format!("static mut {rname}: Val = Val(0);\n"));
             globals_init_code.push_str(
                 &format!("    unsafe {{ {rname} = {init_code}; }}\n"));
+            if self.gc_mode == GcMode::Cheney {
+                globals_init_code.push_str(
+                    &format!("    gc_register_global(unsafe {{ &mut {rname} as *mut Val }});\n"));
+            }
         }
         let mut main_code = String::new();
         for &expr in &self.main_exprs {
@@ -3115,6 +3120,11 @@ fn cdr(v: Val) -> Val {
     unsafe { HEAP[v.as_rib()].cdr }
 }
 
+"#;
+
+/// Shared runtime code used by both no-GC and Cheney runtimes.
+/// Everything from is_true() through the read functions.
+const RUNTIME_SHARED: &str = r#"
 #[inline(always)]
 fn is_true(v: Val) -> bool {
     // R4RS: only #f is false. '() is truthy.
@@ -4102,8 +4112,180 @@ fn skip_atom_tail(r: &mut dyn std::io::BufRead) {
 }
 "#;
 
-/// Cheney semi-space GC runtime (TODO: implement).
-const RUNTIME_CHENEY: &str = RUNTIME_PRELUDE; // placeholder — same as no-GC for now
+/// Cheney semi-space GC runtime.
+/// Same API as RUNTIME_PRELUDE but replaces alloc_rib/heap_init with
+/// a copying collector. HEAP is always the active space; HEAP_ALT is
+/// the inactive space. After GC, they swap.
+const RUNTIME_CHENEY: &str = r#"
+// ── Inline runtime (semi-space Cheney GC) ───────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Val(i64);
+
+impl Val {
+    const NIL: Val = Val(0);
+
+    #[inline(always)]
+    const fn fixnum(n: i64) -> Val { Val((n << 1) | 1) }
+
+    #[inline(always)]
+    const fn rib(idx: usize) -> Val { Val((idx as i64) << 1) }
+
+    #[inline(always)]
+    fn is_fixnum(self) -> bool { (self.0 & 1) != 0 }
+
+    #[inline(always)]
+    fn as_fixnum(self) -> Option<i64> {
+        if self.is_fixnum() { Some(self.0 >> 1) } else { None }
+    }
+
+    #[inline(always)]
+    fn as_rib(self) -> usize { (self.0 >> 1) as usize }
+}
+
+#[derive(Clone, Copy)]
+struct Rib { car: Val, cdr: Val, tag: u8 }
+
+// ── Semi-space heap ─────────────────────────────────────────────
+
+const SEMI_SIZE: usize = 1 << 19; // 512K ribs per semi-space
+const RESERVED: usize = 4;         // nil, #f, #t, eof
+const FORWARDED: u8 = 255;         // sentinel tag for forwarding pointers
+
+static mut HEAP: Vec<Rib> = Vec::new();      // active space
+static mut HEAP_ALT: Vec<Rib> = Vec::new();  // inactive space
+static mut ALLOC_PTR: usize = RESERVED;      // next free index in active space
+
+// ── GC root tracking ────────────────────────────────────────────
+// Global roots registered via gc_register_global().
+// All globals are updated during GC.
+
+static mut GC_GLOBALS: Vec<*mut Val> = Vec::new();
+
+fn gc_register_global(p: *mut Val) { unsafe { GC_GLOBALS.push(p); } }
+
+// Rib 0 = nil/'(), rib 1 = #f (BOT), rib 2 = #t, rib 3 = eof
+const FALSE_VAL: Val = Val(1 << 1);
+const TRUE_VAL: Val = Val(2 << 1);
+const EOF_VAL: Val = Val(3 << 1);
+
+fn heap_init() {
+    unsafe {
+        HEAP = vec![Rib { car: Val::NIL, cdr: Val::NIL, tag: 0 }; SEMI_SIZE];
+        HEAP_ALT = vec![Rib { car: Val::NIL, cdr: Val::NIL, tag: 0 }; SEMI_SIZE];
+        ALLOC_PTR = RESERVED;
+        HEAP[0] = Rib { car: Val::NIL, cdr: Val::NIL, tag: TAG_TOP };  // nil
+        HEAP[1] = Rib { car: Val::NIL, cdr: Val::NIL, tag: TAG_BOT };  // #f
+        HEAP[2] = Rib { car: Val::NIL, cdr: Val::NIL, tag: 20 };       // #t
+        HEAP[3] = Rib { car: Val::NIL, cdr: Val::NIL, tag: TAG_EOF };  // eof
+        GC_GLOBALS = Vec::with_capacity(64);
+        PORTS = Vec::with_capacity(16);
+        PORTS.push(PortInner::Stdin(std::io::BufReader::new(std::io::stdin())));
+        PORTS.push(PortInner::Stdout);
+        PORTS.push(PortInner::Stderr);
+    }
+}
+
+// ── Allocation with GC trigger ──────────────────────────────────
+
+#[inline]
+fn alloc_rib(car: Val, cdr: Val, tag: u8) -> Val {
+    unsafe {
+        if ALLOC_PTR >= SEMI_SIZE {
+            gc_collect();
+            if ALLOC_PTR >= SEMI_SIZE - (SEMI_SIZE / 8) {
+                // Less than 12.5% free after GC — out of memory
+                eprintln!("Out of memory after GC ({} live ribs)", ALLOC_PTR);
+                std::process::exit(1);
+            }
+        }
+        let idx = ALLOC_PTR;
+        ALLOC_PTR += 1;
+        HEAP[idx] = Rib { car, cdr, tag };
+        Val::rib(idx)
+    }
+}
+
+// ── Cheney semi-space copying GC ────────────────────────────────
+
+fn gc_collect() {
+    unsafe {
+        // HEAP is "from-space", HEAP_ALT becomes "to-space"
+        ALLOC_PTR = RESERVED;
+
+        // Copy reserved ribs to to-space
+        for i in 0..RESERVED {
+            HEAP_ALT[i] = HEAP[i];
+        }
+
+        // Copy roots: registered globals
+        for gp in &GC_GLOBALS {
+            **gp = gc_copy_val(**gp);
+        }
+
+        // Cheney scan: breadth-first copy of reachable objects
+        let mut scan = RESERVED;
+        while scan < ALLOC_PTR {
+            let car = HEAP_ALT[scan].car;
+            let cdr = HEAP_ALT[scan].cdr;
+            HEAP_ALT[scan].car = gc_copy_val(car);
+            HEAP_ALT[scan].cdr = gc_copy_val(cdr);
+            scan += 1;
+        }
+
+        // Swap spaces: HEAP_ALT (to-space with live objects) becomes HEAP
+        std::mem::swap(&mut HEAP, &mut HEAP_ALT);
+    }
+}
+
+/// Copy a Val's rib from from-space (HEAP) to to-space (HEAP_ALT).
+/// Returns the updated Val pointing into to-space.
+#[inline]
+fn gc_copy_val(v: Val) -> Val {
+    if v.is_fixnum() || v == Val::NIL { return v; }
+    let idx = v.as_rib();
+    if idx < RESERVED { return v; } // reserved ribs are copied in bulk
+    unsafe { gc_copy_rib(idx) }
+}
+
+/// Copy a single rib from from-space to to-space.
+/// Uses forwarding pointers to handle sharing and cycles.
+unsafe fn gc_copy_rib(old_idx: usize) -> Val {
+    // Check if already forwarded
+    if HEAP[old_idx].tag == FORWARDED {
+        return HEAP[old_idx].car; // forwarding pointer to new location
+    }
+
+    // Copy rib to to-space at ALLOC_PTR
+    let new_idx = ALLOC_PTR;
+    ALLOC_PTR += 1;
+    HEAP_ALT[new_idx] = HEAP[old_idx];
+
+    // Install forwarding pointer in from-space
+    HEAP[old_idx] = Rib { car: Val::rib(new_idx), cdr: Val::NIL, tag: FORWARDED };
+
+    Val::rib(new_idx)
+}
+
+// ── Core operations (same API as no-GC runtime) ─────────────────
+
+#[inline]
+fn cons(car: Val, cdr: Val) -> Val {
+    alloc_rib(car, cdr, TAG_PAIR)
+}
+
+#[inline(always)]
+fn car(v: Val) -> Val {
+    if v.is_fixnum() || v == Val::NIL { return Val::NIL; }
+    unsafe { HEAP[v.as_rib()].car }
+}
+
+#[inline(always)]
+fn cdr(v: Val) -> Val {
+    if v.is_fixnum() || v == Val::NIL { return Val::NIL; }
+    unsafe { HEAP[v.as_rib()].cdr }
+}
+"#;
 
 /// GC mode for compiled output.
 #[derive(Clone, Copy, PartialEq, Eq)]
