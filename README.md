@@ -130,36 +130,45 @@ cargo check --no-default-features --lib
 
 ## Limitations
 
+**compile.rs (direct-style):**
 - **Mutual tail recursion** — only self-tail-calls are optimized to loops. Mutually recursive functions in tail position use regular calls and can overflow the stack.
 - **call/cc** — escape-only (non-reentrant). Full continuations would require a CPS transform.
 
-## Self-Hosted Compiler (in progress)
+**rsc.scm (CPS)** resolves both limitations: all calls go through a trampoline (constant stack depth), and continuations are first-class closures.
 
-`examples/rsc.scm` is a self-hosted Scheme→Rust compiler written in Scheme. It reads Scheme from stdin and emits a standalone `.rs` file — the same output format as `compile.rs`. Phase 1 (fixnum arithmetic, `if`, `define`, `let`, named `let`, self-tail-call optimization) is complete and produces identical performance to `compile.rs` on fixnum benchmarks:
+## Self-Hosted Compiler
+
+`examples/rsc.scm` is a self-hosted Scheme→Rust compiler written in Scheme (~1600 lines). It uses a CPS + closure conversion pipeline based on Feeley's 90-minute Scheme-to-C compiler: all function calls become tail calls through a trampoline, closures are lambda-lifted with cons-list environments, and every continuation's free variables are the precise live set.
+
+The compiler can compile itself: Chez runs rsc.scm, which reads rsc.scm from stdin and emits a standalone Rust binary. That binary correctly compiles Scheme programs.
 
 ```bash
-# Bootstrap: compile rsc.scm with compile.rs
-cargo run -- --compile examples/rsc.scm > /tmp/rsc.rs && rustc -O -o /tmp/rsc /tmp/rsc.rs
+# Development: use Chez as the host Scheme
+echo '(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (display (fib 30)) (newline)' \
+  | chez --script examples/rsc.scm > fib.rs && rustc -O -o fib fib.rs && ./fib  # 832040
 
-# Use the self-hosted compiler
+# Self-compilation: rsc.scm compiles itself
+chez --script examples/rsc.scm < examples/rsc.scm > /tmp/rsc.rs
+rustc -O -o /tmp/rsc /tmp/rsc.rs
+
+# Use the self-compiled compiler
 echo '(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (display (fib 30)) (newline)' \
   | /tmp/rsc > fib.rs && rustc -O -o fib fib.rs && ./fib  # 832040
 ```
 
-Remaining phases: closures/lambda lifting, data types, macros, full runtime, Cheney GC, self-hosting bootstrap, optimization passes (type inference, inlining), and Futamura P3.
+**What it compiles:** `define`, `lambda`, `if`, `cond`, `let`/`let*`/`letrec`, named `let`, `begin`, `and`/`or`, `set!`, `quote`, `quasiquote`, closures, higher-order functions (`map`, `for-each`, `apply`), strings, symbols, characters, `equal?`, `read`/`eof-object?`, `display`/`newline`/`write-char`, `error`.
+
+**Pipeline:** S-expression → AST (tagged lists) → CPS conversion → lambda lifting / closure conversion → Rust emission (trampoline + `dispatch_cps` + `__lambda_N` functions).
+
+Remaining work: full generation-2 self-compilation (self-compiled binary compiling rsc.scm), Cheney GC via CPS roots, optimization passes (type inference, inlining), and Futamura P3.
 
 ## Future Work
 
-Runtime changes (survive self-hosting):
-
+- **Cheney GC in the self-hosted compiler.** CPS makes GC root tracking systematic — every continuation's free variables are the precise live set. No shadow stack needed.
+- **Type inference / specialization.** Propagating type information through the call graph would eliminate runtime type checks on provably-fixnum paths.
+- **Cross-function inlining.** Inlining small closures at call sites would eliminate the `dispatch_cps` indirect dispatch.
+- **Full continuations.** The CPS architecture already represents continuations as closures — `call/cc` just captures the current one.
 - **Bare-metal RISC-V.** `--target no-std` with fixed-size heap arrays, no alloc crate, UART output.
-
-Optimization passes (best written in the self-hosted compiler):
-
-- **Type inference / specialization.** `(+ (car x) 1)` currently emits `.as_fixnum().unwrap()` on the car result. Propagating type information through the call graph would eliminate runtime type checks on provably-fixnum paths — the same optimization that makes Chez 2-5× faster on list-heavy benchmarks.
-- **Cross-function inlining.** Lifted lambdas dispatch through `match code_id` in `dispatch_closure`. Inlining small closures at call sites would eliminate this indirect dispatch and enable further optimization by `rustc`.
-- **Mutual tail recursion.** Trampoline or CPS transform for mutually recursive tail calls.
-- **Full continuations.** CPS transform for reentrant `call/cc`.
 
 ## Lineage
 
