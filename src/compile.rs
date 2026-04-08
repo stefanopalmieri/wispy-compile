@@ -2051,8 +2051,9 @@ impl Compiler {
                         );
                     } else {
                         *self.gc_slots.borrow_mut() = saved_slots;
+                        let else_code = self.tco_return(&format!("{pad}    "), "Val::NIL");
                         return format!(
-                            "{pad}if is_true({test_code}) {{\n{t_code}{pad}}} else {{\n{pad}    Val::NIL\n{pad}}}\n"
+                            "{pad}if is_true({test_code}) {{\n{t_code}{pad}}} else {{\n{else_code}{pad}}}\n"
                         );
                     }
                 }

@@ -129,16 +129,26 @@ cargo check --no-default-features --lib
 - **Mutual tail recursion** — only self-tail-calls are optimized to loops. Mutually recursive functions in tail position use regular calls and can overflow the stack.
 - **call/cc** — escape-only (non-reentrant). Full continuations would require a CPS transform.
 
+## Self-Hosted Compiler (in progress)
+
+`examples/rsc.scm` is a self-hosted Scheme→Rust compiler written in Scheme. It reads Scheme from stdin and emits a standalone `.rs` file — the same output format as `compile.rs`. Phase 1 (fixnum arithmetic, `if`, `define`, `let`, named `let`, self-tail-call optimization) is complete and produces identical performance to `compile.rs` on fixnum benchmarks:
+
+```bash
+# Bootstrap: compile rsc.scm with compile.rs
+cargo run -- --compile examples/rsc.scm > /tmp/rsc.rs && rustc -O -o /tmp/rsc /tmp/rsc.rs
+
+# Use the self-hosted compiler
+echo '(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (display (fib 30)) (newline)' \
+  | /tmp/rsc > fib.rs && rustc -O -o fib fib.rs && ./fib  # 832040
+```
+
+Remaining phases: closures/lambda lifting, data types, macros, full runtime, Cheney GC, self-hosting bootstrap, optimization passes (type inference, inlining), and Futamura P3.
+
 ## Future Work
 
 Runtime changes (survive self-hosting):
 
 - **Bare-metal RISC-V.** `--target no-std` with fixed-size heap arrays, no alloc crate, UART output.
-
-Self-hosting:
-
-- **Self-hosted compiler.** `examples/transpile.scm` is a self-hosted IR → Rust code generator ported from Kamea. The goal is to extend it to cover full Scheme, replacing `compile.rs` with Scheme-in-Scheme compiled by its own output.
-- **Futamura P3.** Specialize the transpiler on a known program to produce a residual Rust-emitting program — a compiler generated from an interpreter.
 
 Optimization passes (best written in the self-hosted compiler):
 
