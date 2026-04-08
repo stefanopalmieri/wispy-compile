@@ -489,16 +489,29 @@
     ((ref? ast)
      (let ((name (ref-var ast)))
        (let ((gid (assq name *global-ids*)))
-         (if gid
-             (begin (emit "make_closure(") (emit (cdr gid)) (emit ", Val::NIL)"))
-             (rust-ident name)))))
+         (cond
+           (gid
+            (emit "make_closure(") (emit (cdr gid)) (emit ", Val::NIL)"))
+           ((memq name *globals*)
+            (emit "unsafe { ") (rust-ident name) (emit " }"))
+           (else
+            (rust-ident name))))))
 
     ((set? ast)
-     (emit "{ ")
-     (rust-ident (set-var ast))
-     (emit " = ")
-     (emit-val (set-val ast))
-     (emit "; Val::NIL }"))
+     (let ((name (set-var ast)))
+       (if (memq name *globals*)
+           (begin
+             (emit "{ unsafe { ")
+             (rust-ident name)
+             (emit " = ")
+             (emit-val (set-val ast))
+             (emit "; } Val::NIL }"))
+           (begin
+             (emit "{ ")
+             (rust-ident name)
+             (emit " = ")
+             (emit-val (set-val ast))
+             (emit "; Val::NIL }")))))
 
     ((prim? ast)
      (emit-prim (prim-op ast) (prim-args ast)))
@@ -934,63 +947,75 @@
 ;;; ════════════════════════════════════════════════════════════════════
 
 (define (define? form) (and (pair? form) (eq? (car form) 'define)))
+(define (func-define? form)
+  (and (define? form) (pair? (cadr form))))  ;; (define (name ...) ...)
+(define (var-define? form)
+  (and (define? form) (symbol? (cadr form)))) ;; (define name expr)
 
-(define (func-name def)
-  (if (pair? (cadr def)) (car (cadr def)) (cadr def)))
+(define (func-name def) (car (cadr def)))
+(define (func-params def) (cdr (cadr def)))
+(define (func-body def) (cddr def))
 
-(define (func-params def)
-  (if (pair? (cadr def)) (cdr (cadr def)) '()))
-
-(define (func-body def)
-  (if (pair? (cadr def)) (cddr def) (list (caddr def))))
+(define (var-name def) (cadr def))
+(define (var-init def) (caddr def))
 
 (define (compile-program forms)
-  (let* ((defines (filter define? forms))
+  (let* ((func-defs (filter func-define? forms))
+         (var-defs (filter var-define? forms))
          (exprs (filter (lambda (x) (not (define? x))) forms))
-         ;; Register known function names (for the parser)
-         (func-names (map func-name defines)))
+         (func-names (map func-name func-defs))
+         (var-names (map var-name var-defs)))
 
     ;; Reset state
     (set! *lambdas* '())
     (set! *next-id* 0)
     (set! *gensym-counter* 0)
-    (set! *globals* func-names)
+    (set! *globals* (append func-names var-names))
     (set! *global-ids* '())
 
-    ;; Phase 1: Parse each function body and the top-level expressions
-    ;; Phase 2: CPS-convert each function (adding k parameter)
-    ;; Phase 3: Lift all lambdas (closure-convert + collect)
-    (let ((lifted-funcs
+    ;; CPS + lift each function definition
+    (let* ((lifted-funcs
             (map (lambda (def)
                    (let* ((name (func-name def))
                           (params (func-params def))
                           (body-ast (parse-body (func-body def)))
-                          ;; CPS: the body gets a k parameter
                           (k (gensym 'k))
                           (cps-body (cps body-ast (make-ref k)))
-                          ;; Lift lambdas from CPS'd body
                           (lifted-body (lift cps-body))
-                          ;; Register this function as a lambda with (k . params)
                           (id (add-lambda! (cons k params) lifted-body))
                           (free (diff (fv lifted-body) (cons k params))))
-                     ;; Record global name → ID mapping
                      (set! *global-ids* (cons (cons name id) *global-ids*))
                      (list name id params free)))
-                 defines))
-          ;; CPS + lift top-level expressions
+                 func-defs))
+
+          ;; Convert variable defines to set! expressions, then append body exprs
+          ;; (define x 5) (define y 10) (display x) → (set! x 5) (set! y 10) (display x)
+          (all-exprs (append
+                       (map (lambda (vd) `(set! ,(var-name vd) ,(var-init vd))) var-defs)
+                       exprs))
+
+          ;; CPS + lift top-level expressions (including variable inits)
           (entry-ast
-            (if (null? exprs)
+            (if (null? all-exprs)
                 (make-prim '%halt (list (make-lit 0)))
-                (let* ((body-ast (parse-body exprs))
+                (let* ((body-ast (parse-body all-exprs))
                        (cps-body (cps-convert body-ast))
                        (lifted-body (lift cps-body)))
                   lifted-body))))
 
-      ;; Register entry point as a lambda (no params, no free vars)
+      ;; Register entry point as a lambda
       (let ((entry-id (add-lambda! '() entry-ast)))
 
         ;; Emit everything
         (emit-runtime)
+
+        ;; Emit global variable statics
+        (for-each (lambda (name)
+                    (emit "static mut ")
+                    (rust-ident name)
+                    (emit-line ": Val = Val::NIL;"))
+                  var-names)
+        (if (pair? var-names) (newline))
 
         ;; Emit all lambda functions
         (for-each emit-lambda (reverse *lambdas*))
