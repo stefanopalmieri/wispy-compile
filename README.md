@@ -39,6 +39,8 @@ For interpreted execution, REPL, and running the self-hosted tools (reflective t
 
 **First-class builtins:** Operators like `+`, `cons`, `car` can be passed as values (e.g., `(map + '(1 2) '(3 4))`).
 
+**Vectors:** Flat contiguous layout — header rib + N element ribs. `vector-ref` and `vector-set!` are O(1) direct indexing. Cheney GC bulk-copies vectors as a single unit.
+
 **Closures:** Full closure conversion with lambda lifting. Self-tail-call → loop optimization.
 
 ## Performance
@@ -97,7 +99,7 @@ src/
 ├── symbol.rs       symbol interning
 ├── reader.rs       S-expression parser
 ├── macros.rs       syntax-rules: pattern matching, ellipsis, dotted tails, template instantiation
-└── compile.rs      Scheme → Rust compiler (~5300 lines, includes both runtimes)
+└── compile.rs      Scheme → Rust compiler (~5900 lines, includes both runtimes)
 ```
 
 ## The Cayley Table
