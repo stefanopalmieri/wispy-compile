@@ -205,7 +205,7 @@
     list append reverse length
     display newline write-char read
     string-length string-ref string-append
-    string->symbol symbol->string number->string
+    string->symbol symbol->string number->string string->number
     char->integer integer->char
     apply error
     char=? memq assq assoc map for-each
@@ -220,7 +220,7 @@
     ((memq name '(car cdr null? pair? symbol? string? boolean? char?
                   procedure? number? not zero? positive? negative?
                   eof-object? display newline write-char read
-                  string-length symbol->string number->string
+                  string-length symbol->string number->string string->number
                   char->integer integer->char error reverse length
                   vector-length vector? vector->list list->vector))
      1)
@@ -307,6 +307,16 @@
             (parse `(let ,(map (lambda (b) (list (car b) #f)) bindings)
                       ,@(map (lambda (b) `(set! ,(car b) ,(cadr b))) bindings)
                       ,@body))))
+
+         ((eq? head 'when)
+          (make-if (parse (cadr expr))
+                   (parse-body (cddr expr))
+                   (make-lit #f)))
+
+         ((eq? head 'unless)
+          (make-if (parse (cadr expr))
+                   (make-lit #f)
+                   (parse-body (cddr expr))))
 
          ((eq? head 'cond)
           (parse-cond (cdr expr)))
@@ -681,6 +691,24 @@
           (null? (closure-free fn-ast))))
     (else #f)))
 
+;; Collect all variables that are set! inside an AST (not crossing lambda boundaries)
+(define (mutated-vars ast)
+  (cond
+    ((set? ast) (list (set-var ast)))
+    ((app? ast)
+     (if (or (lam? (app-fn ast)) (cont? (app-fn ast)))
+         (mutated-vars (if (lam? (app-fn ast))
+                           (lam-body (app-fn ast))
+                           (cont-body (app-fn ast))))
+         (union-multi (map mutated-vars (cdr ast)))))
+    ((if? ast)  (union (mutated-vars (if-test ast))
+                       (union (mutated-vars (if-then ast))
+                              (mutated-vars (if-else ast)))))
+    ((seq? ast) (union-multi (map mutated-vars (seq-exprs ast))))
+    ((lam? ast) '())   ;; don't recurse into nested lambdas
+    ((cont? ast) '())
+    (else '())))
+
 ;; Scan an AST for any self-tail-call (used to decide whether to emit loop)
 (define (has-self-tail-call? ast)
   (cond
@@ -868,7 +896,7 @@
      (emit "bool_to_val(") (emit-val (car args)) (emit " == Val::NIL)"))
     ((eq? op 'pair?)
      (emit "bool_to_val({ let __v = ") (emit-val (car args))
-     (emit "; __v != Val::NIL && !__v.is_fixnum() && unsafe { HEAP[__v.as_rib()].tag == TAG_PAIR } })"))
+     (emit "; __v != Val::NIL && !__v.is_fixnum() && unsafe { FROM[__v.as_rib()].tag == TAG_PAIR } })"))
     ((eq? op 'eq?)
      (emit "bool_to_val(") (emit-val (car args)) (emit " == ") (emit-val (cadr args)) (emit ")"))
     ((eq? op 'not)
@@ -889,7 +917,7 @@
     ;; Type predicates
     ((eq? op 'symbol?)
      (emit "bool_to_val(!") (emit-val (car args)) (emit ".is_fixnum() && ") (emit-val (car args))
-     (emit " != Val::NIL && unsafe { HEAP[") (emit-val (car args)) (emit ".as_rib()].tag == TAG_SYM })"))
+     (emit " != Val::NIL && unsafe { FROM[") (emit-val (car args)) (emit ".as_rib()].tag == TAG_SYM })"))
     ((eq? op 'string?)
      (emit "bool_to_val(is_string(") (emit-val (car args)) (emit "))"))
     ((eq? op 'boolean?)
@@ -898,7 +926,7 @@
      (emit "bool_to_val(is_char(") (emit-val (car args)) (emit "))"))
     ((eq? op 'procedure?)
      (emit "bool_to_val(!") (emit-val (car args)) (emit ".is_fixnum() && ") (emit-val (car args))
-     (emit " != Val::NIL && unsafe { HEAP[") (emit-val (car args)) (emit ".as_rib()].tag == TAG_CLS })"))
+     (emit " != Val::NIL && unsafe { FROM[") (emit-val (car args)) (emit ".as_rib()].tag == TAG_CLS })"))
     ((eq? op 'eof-object?)
      (emit "bool_to_val(") (emit-val (car args)) (emit " == EOF_VAL)"))
     ((eq? op 'eqv?)
@@ -919,6 +947,8 @@
      (emit "string_to_symbol(") (emit-val (car args)) (emit ")"))
     ((eq? op 'number->string)
      (emit "number_to_string(") (emit-val (car args)) (emit ")"))
+    ((eq? op 'string->number)
+     (emit "string_to_number(") (emit-val (car args)) (emit ")"))
     ((eq? op 'char->integer)
      (emit "Val::fixnum(char_codepoint(") (emit-val (car args)) (emit "))"))
     ((eq? op 'integer->char)
@@ -1213,7 +1243,7 @@
   (let loop ((vars free-vars) (depth 0))
     (if (pair? vars)
         (begin
-          (emit "    let ")
+          (emit "    let mut ")
           (rust-ident (car vars))
           (emit " = ")
           (if (= depth 0)
@@ -1240,12 +1270,12 @@
          (self-call (begin
                       (set! *current-lambda-id* id)
                       (set! *current-lambda-params* params)
-                      (has-self-tail-call? body))))
+                      (has-self-tail-call? body)))
+         (mutations (mutated-vars body)))
     (emit "fn __lambda_") (emit id) (emit "(__env: Val")
-    ;; Parameters — use 'mut' if self-calling (need reassignment)
+    ;; Parameters — always mut (set! on params is common; allow_unused_mut suppresses warnings)
     (for-each (lambda (p)
-                (emit ", ")
-                (if self-call (emit "mut "))
+                (emit ", mut ")
                 (rust-ident p)
                 (emit ": Val"))
               (params-all params))
@@ -1293,6 +1323,24 @@
     (emit "}")
     (newline)
     (newline)))
+
+;; ── Emit gc_roots_visit (scans all generated static roots) ──
+;; Called by cheney_gc to update __g_* and __DATUM_* statics.
+
+(define (emit-gc-roots-visit var-names datum-cache)
+  (emit-line "fn gc_roots_visit(visit: &mut impl FnMut(&mut Val)) { unsafe {")
+  (for-each (lambda (name)
+              (emit "    visit(&mut ")
+              (emit-global-ident name)
+              (emit-line ");"))
+            var-names)
+  (for-each (lambda (entry)
+              (emit "    visit(&mut ")
+              (emit (cdr entry))
+              (emit-line ");"))
+            datum-cache)
+  (emit-line "} }")
+  (newline))
 
 ;; ── Emit dispatch_cps (user lambdas only) ──
 
@@ -1380,26 +1428,118 @@ const TAG_CLS: u8 = 14;
 
 #[derive(Clone, Copy)]
 struct Rib { car: Val, cdr: Val, tag: u8 }
-static mut HEAP: Vec<Rib> = Vec::new();
+
+// Two-space Cheney GC semi-spaces.
+// FROM = live allocation space; TO = evacuation target during GC.
+// Fixed ribs 0..FIXED_RIBS never move: nil(0), #f(1), #t(2), eof(3), chars(4..260).
+static mut FROM: Vec<Rib> = Vec::new();
+static mut TO:   Vec<Rib> = Vec::new();
+const SPACE_SIZE: usize = 1 << 22;   // 4M ribs ~32 MB per space
+const TAG_FWD:    u8     = 253;       // forwarding pointer: car = new Val
+const FIXED_RIBS: usize  = 260;       // nil + #f + #t + eof + 256 chars
+static mut GC_DEPTH:  usize = 0;       // nested trampoline depth; GC only at depth 0
+
+static mut CHAR_TABLE: [Val; 256] = [Val(0); 256];
 
 fn heap_init() { unsafe {
-    HEAP = Vec::with_capacity(1 << 20);
-    HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: 0 }); // rib 0: nil
-    HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: 0 }); // rib 1: #f
-    HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: 0 }); // rib 2: #t
-    HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: TAG_EOF }); // rib 3: eof
+    FROM = Vec::with_capacity(SPACE_SIZE);
+    TO   = Vec::with_capacity(SPACE_SIZE);
+    FROM.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: 0 });       // 0: nil
+    FROM.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: 0 });       // 1: #f
+    FROM.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: 0 });       // 2: #t
+    FROM.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: TAG_EOF }); // 3: eof
+    // Pre-intern all 256 ASCII chars so eq? works on chars (ribs 4..260)
+    for i in 0..256i64 {
+        CHAR_TABLE[i as usize] = alloc_rib(Val::fixnum(i), Val::NIL, TAG_CHAR);
+    }
 }}
 
 #[inline(always)]
 fn alloc_rib(car: Val, cdr: Val, tag: u8) -> Val {
-    unsafe { let idx = HEAP.len(); HEAP.push(Rib { car, cdr, tag }); Val((idx as i64) << 1) }
+    unsafe {
+        let idx = FROM.len();
+        FROM.push(Rib { car, cdr, tag });
+        if GC_BUDGET > 0 { GC_BUDGET -= 1; } // saturate at 0 to signal GC needed
+        Val((idx as i64) << 1)
+    }
 }
 
 #[inline(always)] fn cons(car: Val, cdr: Val) -> Val { alloc_rib(car, cdr, TAG_PAIR) }
-#[inline(always)] fn car(v: Val) -> Val { if v.is_fixnum() || v == Val::NIL { Val::NIL } else { unsafe { HEAP[v.as_rib()].car } } }
-#[inline(always)] fn cdr(v: Val) -> Val { if v.is_fixnum() || v == Val::NIL { Val::NIL } else { unsafe { HEAP[v.as_rib()].cdr } } }
-#[inline(always)] fn set_car(v: Val, c: Val) { if !v.is_fixnum() && v != Val::NIL { unsafe { HEAP[v.as_rib()].car = c; } } }
-#[inline(always)] fn set_cdr(v: Val, c: Val) { if !v.is_fixnum() && v != Val::NIL { unsafe { HEAP[v.as_rib()].cdr = c; } } }
+#[inline(always)] fn car(v: Val) -> Val { if v.is_fixnum() || v == Val::NIL { Val::NIL } else { unsafe { FROM[v.as_rib()].car } } }
+#[inline(always)] fn cdr(v: Val) -> Val { if v.is_fixnum() || v == Val::NIL { Val::NIL } else { unsafe { FROM[v.as_rib()].cdr } } }
+#[inline(always)] fn set_car(v: Val, c: Val) { if !v.is_fixnum() && v != Val::NIL { unsafe { FROM[v.as_rib()].car = c; } } }
+#[inline(always)] fn set_cdr(v: Val, c: Val) { if !v.is_fixnum() && v != Val::NIL { unsafe { FROM[v.as_rib()].cdr = c; } } }
+
+// --- Cheney GC -------------------------------------------------------
+
+// Copy one rib from FROM to TO, leaving a forwarding pointer in FROM.
+// Returns the new Val (index in TO).
+fn gc_copy(v: Val) -> Val {
+    if v.is_fixnum() { return v; }
+    let idx = v.as_rib();
+    if idx < FIXED_RIBS { return v; }        // fixed ribs never move
+    unsafe {
+        if FROM[idx].tag == TAG_FWD {
+            return FROM[idx].car;             // already forwarded
+        }
+        let rib = FROM[idx];
+        let new_idx = TO.len();
+        TO.push(rib);
+        FROM[idx] = Rib { car: Val((new_idx as i64) << 1), cdr: Val::NIL, tag: TAG_FWD };
+        Val((new_idx as i64) << 1)
+    }
+}
+
+// Full Cheney collection.  extra_roots is updated in-place to new locations.
+fn cheney_gc(extra_roots: &mut [Val]) {
+    unsafe {
+        // Seed TO with the fixed ribs at their canonical indices.
+        TO.clear();
+        for i in 0..FIXED_RIBS { TO.push(FROM[i]); }
+
+        // Evacuate live roots: extra_roots, statics, char table, symbol table.
+        for r in extra_roots.iter_mut() { *r = gc_copy(*r); }
+        gc_roots_visit(&mut |r: &mut Val| { *r = gc_copy(*r); });
+        for ch in CHAR_TABLE.iter_mut() { *ch = gc_copy(*ch); }
+        for sym in SYM_TABLE.iter_mut() { *sym = gc_copy(*sym); }
+
+        // Scan: copy car/cdr of every object in TO, handling vectors specially.
+        let mut scan = FIXED_RIBS;
+        while scan < TO.len() {
+            let tag = TO[scan].tag;
+            if tag == TAG_VEC {
+                // Vector header: car = fixnum(len), cdr = fixnum(old_elem_base).
+                let len      = TO[scan].car.as_fixnum().unwrap_or(0) as usize;
+                let old_base = TO[scan].cdr.as_fixnum().unwrap_or(0) as usize;
+                if len > 0 {
+                    let new_base = TO.len();
+                    for i in 0..len {
+                        let ei = old_base + i;
+                        let elem_car = if FROM[ei].tag == TAG_FWD { gc_copy(FROM[ei].car) }
+                                       else { gc_copy(FROM[ei].car) };
+                        TO.push(Rib { car: elem_car, cdr: Val::NIL, tag: 0 });
+                        FROM[ei] = Rib { car: Val(((new_base+i) as i64)<<1), cdr: Val::NIL, tag: TAG_FWD };
+                    }
+                    TO[scan].cdr = Val::fixnum(new_base as i64);
+                }
+                // car is fixnum(len), no pointer update needed.
+            } else {
+                let new_car = gc_copy(TO[scan].car);
+                let new_cdr = gc_copy(TO[scan].cdr);
+                TO[scan].car = new_car;
+                TO[scan].cdr = new_cdr;
+            }
+            scan += 1;
+        }
+
+        // Swap spaces: TO becomes new FROM; FROM becomes empty TO-space.
+        std::mem::swap(&mut FROM, &mut TO);
+        TO.clear();
+        // Reset allocation budget based on remaining free space.
+        GC_BUDGET = if FROM.len() < SPACE_SIZE { SPACE_SIZE - FROM.len() } else { 0 };
+    }
+}
+
 
 #[inline(always)]
 fn make_closure(code_id: i64, __cenv: Val) -> Val { alloc_rib(Val::fixnum(code_id), __cenv, TAG_CLS) }
@@ -1408,7 +1548,7 @@ const TAG_CONT: u8 = 6;
 #[inline(always)]
 fn make_cont(variant: i64, env: Val) -> Val { alloc_rib(Val::fixnum(variant), env, TAG_CONT) }
 #[inline(always)]
-fn is_cont(v: Val) -> bool { !v.is_fixnum() && v != Val::NIL && unsafe { HEAP[v.as_rib()].tag == TAG_CONT } }
+fn is_cont(v: Val) -> bool { !v.is_fixnum() && v != Val::NIL && unsafe { FROM[v.as_rib()].tag == TAG_CONT } }
 
 #[inline(always)] fn is_true(v: Val) -> bool { v != FALSE_VAL }
 #[inline(always)] fn bool_to_val(b: bool) -> Val { if b { TRUE_VAL } else { FALSE_VAL } }
@@ -1419,8 +1559,11 @@ const TAG_CHAR: u8 = 15;
 const TAG_EOF: u8 = 16;
 const EOF_VAL: Val = Val(3 << 1); // rib 3
 
-fn make_char(cp: i64) -> Val { alloc_rib(Val::fixnum(cp), Val::NIL, TAG_CHAR) }
-fn is_char(v: Val) -> bool { !v.is_fixnum() && v != Val::NIL && unsafe { HEAP[v.as_rib()].tag == TAG_CHAR } }
+fn make_char(cp: i64) -> Val {
+    if cp >= 0 && cp < 256 { unsafe { CHAR_TABLE[cp as usize] } }
+    else { alloc_rib(Val::fixnum(cp), Val::NIL, TAG_CHAR) }
+}
+fn is_char(v: Val) -> bool { !v.is_fixnum() && v != Val::NIL && unsafe { FROM[v.as_rib()].tag == TAG_CHAR } }
 fn char_codepoint(v: Val) -> i64 { car(v).as_fixnum().unwrap_or(0) }
 
 fn make_string_from_str(s: &str) -> Val {
@@ -1428,7 +1571,7 @@ fn make_string_from_str(s: &str) -> Val {
     for b in s.bytes().rev() { chars = cons(Val::fixnum(b as i64), chars); }
     alloc_rib(chars, Val::fixnum(s.len() as i64), TAG_STR)
 }
-fn is_string(v: Val) -> bool { !v.is_fixnum() && v != Val::NIL && unsafe { HEAP[v.as_rib()].tag == TAG_STR } }
+fn is_string(v: Val) -> bool { !v.is_fixnum() && v != Val::NIL && unsafe { FROM[v.as_rib()].tag == TAG_STR } }
 fn string_length(v: Val) -> Val { cdr(v) }
 fn string_ref(s: Val, idx: Val) -> Val {
     let i = idx.as_fixnum().unwrap_or(0);
@@ -1450,12 +1593,19 @@ fn number_to_string(n: Val) -> Val {
     let s = format!(\"{}\", n.as_fixnum().unwrap_or(0));
     make_string_from_str(&s)
 }
+fn string_to_number(s: Val) -> Val {
+    let mut bytes = Vec::new();
+    let mut c = car(s);
+    while c != Val::NIL && !c.is_fixnum() { bytes.push(car(c).as_fixnum().unwrap_or(0) as u8); c = cdr(c); }
+    let text = String::from_utf8_lossy(&bytes);
+    match text.parse::<i64>() { Ok(n) => Val::fixnum(n), Err(_) => FALSE_VAL }
+}
 
 static mut SYM_TABLE: Vec<Val> = Vec::new();
 fn intern_symbol(name: &str) -> Val {
     unsafe {
         for &sym in &SYM_TABLE {
-            let s = HEAP[sym.as_rib()].car;
+            let s = FROM[sym.as_rib()].car;
             if string_eq_str(s, name) { return sym; }
         }
         let s = make_string_from_str(name);
@@ -1488,7 +1638,7 @@ fn scheme_equal(a: Val, b: Val) -> bool {
     if a.is_fixnum() || b.is_fixnum() { return false; }
     if a == Val::NIL || b == Val::NIL { return false; }
     unsafe {
-        let ra = &HEAP[a.as_rib()]; let rb = &HEAP[b.as_rib()];
+        let ra = &FROM[a.as_rib()]; let rb = &FROM[b.as_rib()];
         if ra.tag != rb.tag { return false; }
         scheme_equal(ra.car, rb.car) && scheme_equal(ra.cdr, rb.cdr)
     }
@@ -1500,22 +1650,22 @@ fn display(v: Val) {
     else if v == TRUE_VAL { print!(\"#t\"); }
     else if v == FALSE_VAL { print!(\"#f\"); }
     else { unsafe {
-        let rib = &HEAP[v.as_rib()];
+        let rib = &FROM[v.as_rib()];
         match rib.tag {
             TAG_STR => {
                 let mut c = rib.car;
                 while c != Val::NIL && !c.is_fixnum() {
-                    print!(\"{}\", HEAP[c.as_rib()].car.as_fixnum().unwrap_or(0) as u8 as char);
-                    c = HEAP[c.as_rib()].cdr;
+                    print!(\"{}\", FROM[c.as_rib()].car.as_fixnum().unwrap_or(0) as u8 as char);
+                    c = FROM[c.as_rib()].cdr;
                 }
             }
             TAG_SYM => { display(rib.car); }
             TAG_PAIR => {
                 print!(\"(\"); display(rib.car);
                 let mut rest = rib.cdr;
-                while rest != Val::NIL && !rest.is_fixnum() && HEAP[rest.as_rib()].tag == TAG_PAIR {
-                    print!(\" \"); display(HEAP[rest.as_rib()].car);
-                    rest = HEAP[rest.as_rib()].cdr;
+                while rest != Val::NIL && !rest.is_fixnum() && FROM[rest.as_rib()].tag == TAG_PAIR {
+                    print!(\" \"); display(FROM[rest.as_rib()].car);
+                    rest = FROM[rest.as_rib()].cdr;
                 }
                 if rest != Val::NIL { print!(\" . \"); display(rest); }
                 print!(\")\");
@@ -1649,23 +1799,23 @@ fn collect_rest(args: &[Val], start: usize) -> Val {
 }
 
 const TAG_VEC: u8 = 5;
-fn is_vector(v: Val) -> bool { !v.is_fixnum() && v != Val::NIL && unsafe { HEAP[v.as_rib()].tag == TAG_VEC } }
+fn is_vector(v: Val) -> bool { !v.is_fixnum() && v != Val::NIL && unsafe { FROM[v.as_rib()].tag == TAG_VEC } }
 fn make_vector(len: i64, fill: Val) -> Val {
     let n = len as usize;
     unsafe {
-        let hdr = HEAP.len();
-        HEAP.push(Rib { car: Val::fixnum(len), cdr: Val::fixnum((hdr + 1) as i64), tag: TAG_VEC });
-        for _ in 0..n { HEAP.push(Rib { car: fill, cdr: Val::NIL, tag: 0 }); }
+        let hdr = FROM.len();
+        FROM.push(Rib { car: Val::fixnum(len), cdr: Val::fixnum((hdr + 1) as i64), tag: TAG_VEC });
+        for _ in 0..n { FROM.push(Rib { car: fill, cdr: Val::NIL, tag: 0 }); }
         Val((hdr as i64) << 1)
     }
 }
 fn vector_ref(v: Val, idx: i64) -> Val {
     let base = cdr(v).as_fixnum().unwrap() as usize;
-    unsafe { HEAP[base + idx as usize].car }
+    unsafe { FROM[base + idx as usize].car }
 }
 fn vector_set(v: Val, idx: i64, val: Val) {
     let base = cdr(v).as_fixnum().unwrap() as usize;
-    unsafe { HEAP[base + idx as usize].car = val; }
+    unsafe { FROM[base + idx as usize].car = val; }
 }
 fn vector_length(v: Val) -> Val { car(v) }
 fn vector_to_list(v: Val) -> Val {
@@ -1691,22 +1841,50 @@ enum Action {
     Halt(Val),
 }
 
+// Countdown to next GC check.  Decremented in alloc_rib; when it hits zero,
+// the trampoline will trigger cheney_gc.  Reset after each collection.
+static mut GC_BUDGET: usize = SPACE_SIZE - FIXED_RIBS;
+
 fn trampoline(func: Val, args: &[Val]) -> Val {
     let mut action = dispatch_cps(func, args);
     loop {
         match action {
             Action::Halt(v) => return v,
-            Action::Call1(f, a) => action = dispatch_cps(f, &[a]),
-            Action::Call2(f, a, b) => action = dispatch_cps(f, &[a, b]),
-            Action::Call3(f, a, b, c) => action = dispatch_cps(f, &[a, b, c]),
-            Action::CallN(f, ref args) => action = dispatch_cps(f, args),
+            Action::Call1(f, a) => {
+                action = if unsafe { GC_BUDGET == 0 } {
+                    let mut r = [f, a]; cheney_gc(&mut r); dispatch_cps(r[0], &[r[1]])
+                } else { dispatch_cps(f, &[a]) };
+            }
+            Action::Call2(f, a, b) => {
+                action = if unsafe { GC_BUDGET == 0 } {
+                    let mut r = [f, a, b]; cheney_gc(&mut r); dispatch_cps(r[0], &[r[1], r[2]])
+                } else { dispatch_cps(f, &[a, b]) };
+            }
+            Action::Call3(f, a, b, c) => {
+                action = if unsafe { GC_BUDGET == 0 } {
+                    let mut r = [f, a, b, c]; cheney_gc(&mut r); dispatch_cps(r[0], &[r[1], r[2], r[3]])
+                } else { dispatch_cps(f, &[a, b, c]) };
+            }
+            Action::CallN(ref f_ref, ref args_ref) => {
+                let f = *f_ref; let args = args_ref.clone();
+                action = if unsafe { GC_BUDGET == 0 } {
+                    let mut live: Vec<Val> = std::iter::once(f).chain(args.iter().copied()).collect();
+                    cheney_gc(&mut live);
+                    let mut new_args = args.clone();
+                    for (i, a) in new_args.iter_mut().enumerate() { *a = live[i+1]; }
+                    dispatch_cps(live[0], &new_args)
+                } else { dispatch_cps(f, &args) };
+            }
         }
     }
 }
 
 fn call_closure_1(f: Val, arg: Val) -> Val {
     let halt = make_cont(-1, Val::NIL);
-    trampoline(f, &[halt, arg])
+    unsafe { GC_DEPTH += 1; }
+    let r = trampoline(f, &[halt, arg]);
+    unsafe { GC_DEPTH -= 1; }
+    r
 }
 
 fn scheme_map(f: Val, lst: Val) -> Val {
@@ -1802,10 +1980,13 @@ fn scheme_for_each(f: Val, lst: Val) {
 (define (var-name def) (cadr def))
 (define (var-init def) (caddr def))
 
+(define (define-syntax? form)
+  (and (pair? form) (eq? (car form) 'define-syntax)))
+
 (define (compile-program forms)
   (let* ((func-defs (filter func-define? forms))
          (var-defs (filter var-define? forms))
-         (exprs (filter (lambda (x) (and (not (define? x)) (not (import? x)))) forms))
+         (exprs (filter (lambda (x) (and (not (define? x)) (not (import? x)) (not (define-syntax? x)))) forms))
          (func-names (map func-name func-defs))
          (var-names (map var-name var-defs)))
 
@@ -1882,6 +2063,9 @@ fn scheme_for_each(f: Val, lst: Val) {
 
         ;; Emit continuation lambda functions
         (for-each emit-cont-lambda (reverse *cont-lambdas*))
+
+        ;; Emit gc_roots_visit — called by cheney_gc to scan all static roots
+        (emit-gc-roots-visit var-names *datum-cache*)
 
         ;; Emit dispatch + continuation dispatch
         (emit-dispatch)
