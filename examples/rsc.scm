@@ -197,7 +197,8 @@
     string->symbol symbol->string number->string
     char->integer integer->char
     apply error
-    char=? memq assq assoc map for-each))
+    char=? memq assq assoc map for-each
+    make-vector vector-ref vector-set! vector-length vector? vector->list list->vector))
 
 (define (primitive? name)
   (memq name *primitives*))
@@ -209,13 +210,17 @@
                   procedure? number? not zero? positive? negative?
                   eof-object? display newline write-char read
                   string-length symbol->string number->string
-                  char->integer integer->char error reverse length))
+                  char->integer integer->char error reverse length
+                  vector-length vector? vector->list list->vector))
      1)
     ((memq name '(+ - * quotient remainder modulo < > = <= >=
                   eq? eqv? equal? cons set-car! set-cdr!
                   string-ref string-append string->symbol
-                  char=? memq assq assoc map for-each append apply))
+                  char=? memq assq assoc map for-each append apply
+                  make-vector vector-ref))
      2)
+    ((memq name '(vector-set!))
+     3)
     (else 2))) ;; default to 2
 
 ;; Eta-expand a primitive: car → (lambda (__a) (car __a))
@@ -300,6 +305,37 @@
 
          ((eq? head 'or)
           (parse-or (cdr expr)))
+
+         ((eq? head 'case)
+          ;; (case expr ((datum ...) body ...) ... (else body ...))
+          ;; → (let ((__case-key expr)) (cond ((memv __case-key '(datum ...)) body ...) ...))
+          (let ((key (gensym 'case)))
+            (parse `(let ((,key ,(cadr expr)))
+                      (cond ,@(map (lambda (clause)
+                                     (if (eq? (car clause) 'else)
+                                         clause
+                                         `((memq ,key (quote ,(car clause)))
+                                           ,@(cdr clause))))
+                                   (cddr expr)))))))
+
+         ((eq? head 'do)
+          ;; (do ((var init step) ...) (test result ...) body ...)
+          ;; → (let loop ((var init) ...) (if test (begin result ...) (begin body ... (loop step ...))))
+          (let ((bindings (cadr expr))
+                (test-clause (caddr expr))
+                (body (cdr (cddr expr)))
+                (loop (gensym 'do)))
+            (parse `(let ,loop ,(map (lambda (b) (list (car b) (cadr b))) bindings)
+                      (if ,(car test-clause)
+                          (begin ,@(if (null? (cdr test-clause))
+                                       '(#f)
+                                       (cdr test-clause)))
+                          (begin ,@body
+                                 (,loop ,@(map (lambda (b)
+                                                 (if (null? (cddr b))
+                                                     (car b)   ;; no step → reuse var
+                                                     (caddr b)))
+                                               bindings))))))))
 
          ((eq? head 'quasiquote)
           (parse (expand-qq (cadr expr))))
@@ -856,6 +892,24 @@
      (emit "scheme_map(") (emit-val (car args)) (emit ", ") (emit-val (cadr args)) (emit ")"))
     ((eq? op 'for-each)
      (emit "{ scheme_for_each(") (emit-val (car args)) (emit ", ") (emit-val (cadr args)) (emit "); Val::NIL }"))
+
+    ;; Vectors
+    ((eq? op 'make-vector)
+     (if (null? (cdr args))
+         (begin (emit "make_vector(") (emit-i64 (car args)) (emit ", Val::NIL)"))
+         (begin (emit "make_vector(") (emit-i64 (car args)) (emit ", ") (emit-val (cadr args)) (emit ")"))))
+    ((eq? op 'vector-ref)
+     (emit "vector_ref(") (emit-val (car args)) (emit ", ") (emit-i64 (cadr args)) (emit ")"))
+    ((eq? op 'vector-set!)
+     (emit "{ vector_set(") (emit-val (car args)) (emit ", ") (emit-i64 (cadr args)) (emit ", ") (emit-val (caddr args)) (emit "); Val::NIL }"))
+    ((eq? op 'vector-length)
+     (emit "vector_length(") (emit-val (car args)) (emit ")"))
+    ((eq? op 'vector?)
+     (emit "bool_to_val(is_vector(") (emit-val (car args)) (emit "))"))
+    ((eq? op 'vector->list)
+     (emit "vector_to_list(") (emit-val (car args)) (emit ")"))
+    ((eq? op 'list->vector)
+     (emit "list_to_vector(") (emit-val (car args)) (emit ")"))
 
     ;; %halt — used by CPS as program terminator
     ((eq? op '%halt)
@@ -1456,6 +1510,42 @@
   (emit-line "    let mut i = args.len();")
   (emit-line "    while i > start { i -= 1; r = cons(args[i], r); }")
   (emit-line "    r")
+  (emit-line "}")
+  (newline)
+  ;; Vectors: flat rib layout — header + N contiguous element ribs
+  (emit-line "const TAG_VEC: u8 = 5;")
+  (emit-line "fn is_vector(v: Val) -> bool { !v.is_fixnum() && v != Val::NIL && unsafe { HEAP[v.as_rib()].tag == TAG_VEC } }")
+  (emit-line "fn make_vector(len: i64, fill: Val) -> Val {")
+  (emit-line "    let n = len as usize;")
+  (emit-line "    unsafe {")
+  (emit-line "        let hdr = HEAP.len();")
+  (emit-line "        HEAP.push(Rib { car: Val::fixnum(len), cdr: Val::fixnum((hdr + 1) as i64), tag: TAG_VEC });")
+  (emit-line "        for _ in 0..n { HEAP.push(Rib { car: fill, cdr: Val::NIL, tag: 0 }); }")
+  (emit-line "        Val((hdr as i64) << 1)")
+  (emit-line "    }")
+  (emit-line "}")
+  (emit-line "fn vector_ref(v: Val, idx: i64) -> Val {")
+  (emit-line "    let base = cdr(v).as_fixnum().unwrap() as usize;")
+  (emit-line "    unsafe { HEAP[base + idx as usize].car }")
+  (emit-line "}")
+  (emit-line "fn vector_set(v: Val, idx: i64, val: Val) {")
+  (emit-line "    let base = cdr(v).as_fixnum().unwrap() as usize;")
+  (emit-line "    unsafe { HEAP[base + idx as usize].car = val; }")
+  (emit-line "}")
+  (emit-line "fn vector_length(v: Val) -> Val { car(v) }")
+  (emit-line "fn vector_to_list(v: Val) -> Val {")
+  (emit-line "    let len = car(v).as_fixnum().unwrap();")
+  (emit-line "    let mut r = Val::NIL;")
+  (emit-line "    let mut i = len - 1;")
+  (emit-line "    while i >= 0 { r = cons(vector_ref(v, i), r); i -= 1; }")
+  (emit-line "    r")
+  (emit-line "}")
+  (emit-line "fn list_to_vector(lst: Val) -> Val {")
+  (emit-line "    let len = { let mut n = 0i64; let mut l = lst; while l != Val::NIL && !l.is_fixnum() { n += 1; l = cdr(l); } n };")
+  (emit-line "    let v = make_vector(len, Val::NIL);")
+  (emit-line "    let mut l = lst; let mut i = 0i64;")
+  (emit-line "    while l != Val::NIL && !l.is_fixnum() { vector_set(v, i, car(l)); l = cdr(l); i += 1; }")
+  (emit-line "    v")
   (emit-line "}")
   (newline)
   ;; Action enum + trampoline
