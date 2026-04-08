@@ -85,6 +85,15 @@
 (define (seq? x) (and (pair? x) (eq? (car x) 'seq)))
 (define (closure? x) (and (pair? x) (eq? (car x) 'closure)))
 
+;; Continuation (CPS-internal lambda, defunctionalized separately from user closures)
+(define (make-cont params body) (list 'cont params body))
+(define (cont? x) (and (pair? x) (eq? (car x) 'cont)))
+(define (cont-params x) (cadr x))
+(define (cont-body x) (caddr x))
+(define (cont-closure? x) (and (pair? x) (eq? (car x) 'cont-closure)))
+(define (cont-closure-id x) (cadr x))
+(define (cont-closure-free x) (cddr x))
+
 ;; Accessors
 (define (lit-val x) (cadr x))
 (define (ref-var x) (cadr x))
@@ -164,8 +173,10 @@
     ((prim? ast) (union-multi (map fv (prim-args ast))))
     ((app? ast)  (union-multi (map fv (cdr ast)))) ;; cdr skips 'app tag
     ((lam? ast)  (diff (fv (lam-body ast)) (params-all (lam-params ast))))
+    ((cont? ast) (diff (fv (cont-body ast)) (params-all (cont-params ast))))
     ((seq? ast)  (union-multi (map fv (seq-exprs ast))))
     ((closure? ast) (closure-free ast)) ;; free vars are listed in the node
+    ((cont-closure? ast) (cont-closure-free ast))
     (else '())))
 
 ;;; ════════════════════════════════════════════════════════════════════
@@ -447,7 +458,7 @@
     ((set? ast)
      (cps (set-val ast)
           (let ((r (gensym 'r)))
-            (make-lam (list r)
+            (make-cont (list r)
               (make-app (list k (make-set (set-var ast) (make-ref r))))))))
 
     ;; Conditional: CPS the test, then branch
@@ -530,7 +541,7 @@
             ;; Complex: CPS it, bind result to fresh var
             (let ((r (gensym 'r)))
               (cps first
-                (make-lam (list r)
+                (make-cont (list r)
                   (cps-list rest
                     (lambda (rest-vals)
                       (inner (cons (make-ref r) rest-vals)))))))))))
@@ -543,14 +554,14 @@
     (else
      (let ((r (gensym 'r)))
        (cps (car asts)
-         (make-lam (list r)
+         (make-cont (list r)
            (cps-seq (cdr asts) k)))))))
 
 ;; Top-level CPS entry: wrap with %halt continuation
 (define (cps-convert ast)
   (let ((r (gensym 'r)))
     (cps ast
-      (make-lam (list r)
+      (make-cont (list r)
         (make-prim '%halt (list (make-ref r)))))))
 
 ;;; ════════════════════════════════════════════════════════════════════
@@ -575,8 +586,9 @@
 ;;; Lambda collection: walk CPS'd AST, collect all lambdas
 ;;; ════════════════════════════════════════════════════════════════════
 
-;; Each collected lambda: (id params free-vars body)
+;; Each collected lambda/cont: (id params free-vars body)
 (define *lambdas* '())
+(define *cont-lambdas* '())  ;; continuation lambdas (defunctionalized separately)
 (define *next-id* 0)
 (define *globals* '())    ;; known top-level function names
 (define *global-ids* '()) ;; ((name . id) ...) for global functions
@@ -586,6 +598,13 @@
         (free (diff (diff (fv body) (params-all params)) *globals*)))
     (set! *next-id* (+ *next-id* 1))
     (set! *lambdas* (cons (list id params free body) *lambdas*))
+    id))
+
+(define (add-cont! params body)
+  (let ((id *next-id*)
+        (free (diff (diff (fv body) (params-all params)) *globals*)))
+    (set! *next-id* (+ *next-id* 1))
+    (set! *cont-lambdas* (cons (list id params free body) *cont-lambdas*))
     id))
 
 (define (lambda-id l) (car l))
@@ -606,18 +625,30 @@
     ((prim? ast) (make-prim (prim-op ast) (map lift (prim-args ast))))
     ((app? ast)
      (let ((fn (app-fn ast)))
-       (if (lam? fn)
-           ;; Administrative redex (let binding): lift body, keep structure
-           (make-app (cons (make-lam (lam-params fn) (lift (lam-body fn)))
-                           (map lift (app-args ast))))
-           ;; Regular call: lift all parts
-           (make-app (map lift (cdr ast))))))
+       (cond
+         ((lam? fn)
+          ;; User-lambda administrative redex (let binding): lift body, keep structure
+          (make-app (cons (make-lam (lam-params fn) (lift (lam-body fn)))
+                          (map lift (app-args ast)))))
+         ((cont? fn)
+          ;; Cont administrative redex (let binding for CPS temps): lift body, keep structure
+          (make-app (cons (make-cont (cont-params fn) (lift (cont-body fn)))
+                          (map lift (app-args ast)))))
+         (else
+          ;; Regular call: lift all parts
+          (make-app (map lift (cdr ast)))))))
     ((lam? ast)
      ;; Lambda in value position: lift body, collect, return closure node
      (let* ((body (lift (lam-body ast)))
             (id (add-lambda! (lam-params ast) body))
             (free (diff (diff (fv body) (params-all (lam-params ast))) *globals*)))
        (cons 'closure (cons id free))))
+    ((cont? ast)
+     ;; Cont in value position: lift body, collect into cont-lambdas, return cont-closure node
+     (let* ((body (lift (cont-body ast)))
+            (id (add-cont! (cont-params ast) body))
+            (free (diff (diff (fv body) (params-all (cont-params ast))) *globals*)))
+       (cons 'cont-closure (cons id free))))
     ((seq? ast)
      (make-seq (map lift (seq-exprs ast))))
     (else ast)))
@@ -655,9 +686,9 @@
   (cond
     ((app? ast)
      (let ((fn (app-fn ast)))
-       (if (lam? fn)
+       (if (or (lam? fn) (cont? fn))
            ;; Administrative redex: check body
-           (has-self-tail-call? (lam-body fn))
+           (has-self-tail-call? (if (lam? fn) (lam-body fn) (cont-body fn)))
            ;; Real call: check if self-call
            (self-call? fn))))
     ((if? ast)
@@ -754,13 +785,24 @@
                   (emit-env-build free)
                   (emit ")")))))
 
+    ((cont-closure? ast)
+     (let ((id (cont-closure-id ast))
+           (free (cont-closure-free ast)))
+       (if (null? free)
+           (begin (emit "make_cont(") (emit id) (emit ", Val::NIL)"))
+           (begin (emit "make_cont(") (emit id) (emit ", ")
+                  (emit-env-build free)
+                  (emit ")")))))
+
     ((app? ast)
      ;; (app (lam ...) args) = let binding in value position
-     (if (lam? (app-fn ast))
-         (begin
+     (if (or (lam? (app-fn ast)) (cont? (app-fn ast)))
+         (let* ((fn (app-fn ast))
+                (params (if (lam? fn) (lam-params fn) (cont-params fn)))
+                (body   (if (lam? fn) (lam-body fn)  (cont-body fn))))
            (emit "{ ")
-           (emit-let-bindings (lam-params (app-fn ast)) (app-args ast))
-           (emit-val (lam-body (app-fn ast)))
+           (emit-let-bindings params (app-args ast))
+           (emit-val body)
            (emit " }"))
          ;; Shouldn't happen in CPS (all non-let apps are in tail position)
          (begin (emit "Val::NIL /* unexpected app in value position */"))))
@@ -1097,12 +1139,13 @@
     ;; Application in tail position
     ((app? ast)
      (let ((fn (app-fn ast)))
-       (if (lam? fn)
+       (if (or (lam? fn) (cont? fn))
            ;; Administrative redex (let binding): emit bindings, body in tail
-           (begin
+           (let ((params (if (lam? fn) (lam-params fn) (cont-params fn)))
+                 (body   (if (lam? fn) (lam-body fn)  (cont-body fn))))
              (emit "{ ")
-             (emit-let-bindings (lam-params fn) (app-args ast))
-             (emit-tail (lam-body fn))
+             (emit-let-bindings params (app-args ast))
+             (emit-tail body)
              (emit " }"))
            ;; Real tail call → Action
            (emit-tail-call (cdr ast)))))
@@ -1226,14 +1269,42 @@
     (newline)
     (newline)))
 
-;; ── Emit dispatch_cps ──
+;; ── Emit a single cont lambda function ──
+;; Cont lambdas always have exactly 1 parameter (the return value).
+;; Signature: fn __cont_N(__env: Val, val: Val) -> Action
+
+(define (emit-cont-lambda lam)
+  (set! *closure-bindings* '())
+  (let* ((id (lambda-id lam))
+         (params (lambda-params lam))
+         (free (lambda-free lam))
+         (body (lambda-body lam)))
+    (emit "fn __cont_") (emit id) (emit "(__env: Val, val: Val) -> Action {")
+    (newline)
+    (emit-env-extract free)
+    ;; Bind the single parameter to 'val'
+    (emit "    let ")
+    (rust-ident (car (params-all params)))
+    (emit " = val;")
+    (newline)
+    (emit "    ")
+    (emit-tail body)
+    (newline)
+    (emit "}")
+    (newline)
+    (newline)))
+
+;; ── Emit dispatch_cps (user lambdas only) ──
 
 (define (emit-dispatch)
   (emit-line "fn dispatch_cps(closure: Val, args: &[Val]) -> Action {")
+  (emit-line "    if is_cont(closure) {")
+  (emit-line "        return apply_cont(car(closure).as_fixnum().unwrap(), cdr(closure), args[0]);")
+  (emit-line "    }")
   (emit-line "    let code_id = car(closure).as_fixnum().unwrap();")
   (emit-line "    let __env = cdr(closure);")
   (emit-line "    match code_id {")
-  ;; Emit each lambda's dispatch case
+  ;; Emit each user lambda's dispatch case
   (for-each
     (lambda (lam)
       (let ((id (lambda-id lam))
@@ -1256,7 +1327,23 @@
         (emit "),")
         (newline)))
     (reverse *lambdas*))
-  (emit-line "        -1 => Action::Halt(args[0]),  // %halt continuation")
+  (emit-line "        _ => Action::Halt(Val::NIL),")
+  (emit-line "    }")
+  (emit-line "}")
+  (newline))
+
+;; ── Emit apply_cont (continuation dispatch) ──
+
+(define (emit-apply-cont)
+  (emit-line "fn apply_cont(variant: i64, env: Val, val: Val) -> Action {")
+  (emit-line "    match variant {")
+  (emit-line "        -1 => Action::Halt(val),")
+  (for-each
+    (lambda (lam)
+      (let ((id (lambda-id lam)))
+        (emit "        ") (emit id) (emit " => __cont_") (emit id) (emit "(env, val),")
+        (newline)))
+    (reverse *cont-lambdas*))
   (emit-line "        _ => Action::Halt(Val::NIL),")
   (emit-line "    }")
   (emit-line "}")
@@ -1316,6 +1403,12 @@ fn alloc_rib(car: Val, cdr: Val, tag: u8) -> Val {
 
 #[inline(always)]
 fn make_closure(code_id: i64, __cenv: Val) -> Val { alloc_rib(Val::fixnum(code_id), __cenv, TAG_CLS) }
+
+const TAG_CONT: u8 = 6;
+#[inline(always)]
+fn make_cont(variant: i64, env: Val) -> Val { alloc_rib(Val::fixnum(variant), env, TAG_CONT) }
+#[inline(always)]
+fn is_cont(v: Val) -> bool { !v.is_fixnum() && v != Val::NIL && unsafe { HEAP[v.as_rib()].tag == TAG_CONT } }
 
 #[inline(always)] fn is_true(v: Val) -> bool { v != FALSE_VAL }
 #[inline(always)] fn bool_to_val(b: bool) -> Val { if b { TRUE_VAL } else { FALSE_VAL } }
@@ -1612,7 +1705,7 @@ fn trampoline(func: Val, args: &[Val]) -> Val {
 }
 
 fn call_closure_1(f: Val, arg: Val) -> Val {
-    let halt = make_closure(-1, Val::NIL);
+    let halt = make_cont(-1, Val::NIL);
     trampoline(f, &[halt, arg])
 }
 
@@ -1648,8 +1741,10 @@ fn scheme_for_each(f: Val, lst: Val) {
     ((prim? ast) (for-each collect-datums (prim-args ast)))
     ((app? ast) (for-each collect-datums (cdr ast)))
     ((lam? ast) (collect-datums (lam-body ast)))
+    ((cont? ast) (collect-datums (cont-body ast)))
     ((seq? ast) (for-each collect-datums (seq-exprs ast)))
     ((closure? ast) #f)
+    ((cont-closure? ast) #f)
     (else #f)))
 
 ;; Emit Rust code to construct a datum value (for static initialization)
@@ -1716,6 +1811,7 @@ fn scheme_for_each(f: Val, lst: Val) {
 
     ;; Reset state
     (set! *lambdas* '())
+    (set! *cont-lambdas* '())
     (set! *next-id* 0)
     (set! *gensym-counter* 0)
     (set! *datum-cache* '())
@@ -1759,6 +1855,8 @@ fn scheme_for_each(f: Val, lst: Val) {
         ;; Pre-scan all lambda bodies to register datums
         (for-each (lambda (lam) (collect-datums (lambda-body lam)))
                   *lambdas*)
+        (for-each (lambda (lam) (collect-datums (lambda-body lam)))
+                  *cont-lambdas*)
 
         ;; Emit everything
         (emit-runtime)
@@ -1779,11 +1877,15 @@ fn scheme_for_each(f: Val, lst: Val) {
                   var-names)
         (if (pair? var-names) (newline))
 
-        ;; Emit all lambda functions
+        ;; Emit user lambda functions
         (for-each emit-lambda (reverse *lambdas*))
 
-        ;; Emit dispatch
+        ;; Emit continuation lambda functions
+        (for-each emit-cont-lambda (reverse *cont-lambdas*))
+
+        ;; Emit dispatch + continuation dispatch
         (emit-dispatch)
+        (emit-apply-cont)
 
         ;; Emit main
         (emit-line "fn main() {")
