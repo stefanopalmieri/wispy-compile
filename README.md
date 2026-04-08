@@ -49,18 +49,18 @@ For interpreted execution, REPL, and running the self-hosted tools (reflective t
 
 | Benchmark | Wispy (no GC) | Wispy (Cheney) | Chez | Winner |
 |-----------|:------------:|:--------------:|:----:|--------|
-| fib | 2.16s | 2.14s | 3.28s | **Wispy** 1.5x |
+| fib | 2.15s | 2.14s | 3.28s | **Wispy** 1.5x |
 | tak | 1.02s | 1.03s | 1.38s | **Wispy** 1.4x |
-| sum | 0.45s | 0.47s | 2.36s | **Wispy** 5.2x |
-| ack | 4.88s | 4.62s | 2.24s | **Chez** 2.2x |
-| deriv | 3.67s | 2.77s | 0.91s | **Chez** 4.0x |
-| diviter | 4.65s | 4.08s | 1.26s | **Chez** 3.7x |
-| divrec | 7.61s | 7.72s | 1.40s | **Chez** 5.4x |
-| nqueens | 8.71s | 11.81s | 3.79s | **Chez** 2.3x |
-| destruc | 2.85s | 3.76s | 1.27s | **Chez** 2.2x |
-| triangl | 1.34s | 3.24s | 1.85s | **Wispy** 1.4x |
-| takl | 4.06s | 4.08s | 3.39s | **Chez** 1.2x |
-| primes | 2.32s | 3.10s | 0.65s | **Chez** 3.6x |
+| sum | 0.48s | 0.47s | 2.36s | **Wispy** 4.9x |
+| ack | 4.58s | 4.62s | 2.24s | **Chez** 2.0x |
+| deriv | 3.49s | 2.77s | 0.91s | **Chez** 3.8x |
+| diviter | 4.19s | 4.08s | 1.26s | **Chez** 3.3x |
+| divrec | 7.35s | 7.72s | 1.40s | **Chez** 5.3x |
+| nqueens | 8.36s | 11.81s | 3.79s | **Chez** 2.2x |
+| destruc | 2.82s | 3.76s | 1.27s | **Chez** 2.2x |
+| triangl | 1.33s | 3.24s | 1.85s | **Wispy** 1.4x |
+| takl | 4.00s | 4.08s | 3.39s | **Chez** 1.2x |
+| primes | 2.29s | 3.10s | 0.65s | **Chez** 3.5x |
 
 Benchmarks from [r7rs-benchmarks](https://github.com/ecraven/r7rs-benchmarks) with standard parameters. All 12 benchmarks pass in both modes. Wispy wins 4/12 (fixnum-heavy + vector), Chez wins 8/12 (allocation/list-heavy).
 

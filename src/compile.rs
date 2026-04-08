@@ -108,6 +108,9 @@ pub struct Compiler {
     /// During analysis: names that are self-tail-calls (loop names from named let / TCO).
     /// These are non-allocating (they compile to `continue`).
     analysis_loop_names: RefCell<HashSet<String>>,
+    /// Cache of interned symbol names → static variable names for quoted symbols.
+    sym_cache: RefCell<HashMap<String, String>>,
+    sym_cache_counter: Cell<usize>,
 }
 
 impl Compiler {
@@ -129,6 +132,8 @@ impl Compiler {
             gc_slot_counter: Cell::new(0),
             fn_alloc_flags: RefCell::new(None),
             analysis_loop_names: RefCell::new(HashSet::new()),
+            sym_cache: RefCell::new(HashMap::new()),
+            sym_cache_counter: Cell::new(0),
         }
     }
 
@@ -1536,7 +1541,7 @@ impl Compiler {
                     "car" => "    car(args[0])\n",
                     "cdr" => "    cdr(args[0])\n",
                     "null?" => "    bool_to_val(args[0] == Val::NIL)\n",
-                    "pair?" => "    bool_to_val(args[0] != Val::NIL && !args[0].is_fixnum())\n",
+                    "pair?" => "    bool_to_val(args[0] != Val::NIL && !args[0].is_fixnum() && unsafe { HEAP[args[0].as_rib()].tag == TAG_PAIR })\n",
                     "number?" | "integer?" => "    bool_to_val(args[0].is_fixnum())\n",
                     "zero?" => "    bool_to_val(args[0].as_fixnum() == Some(0))\n",
                     "positive?" => "    bool_to_val(args[0].as_fixnum().map_or(false, |n| n > 0))\n",
@@ -1966,9 +1971,27 @@ impl Compiler {
         // dispatch_closure (must come after all functions are defined)
         out.push_str(&self.emit_dispatch(heap, syms));
 
+        // Symbol cache statics
+        {
+            let cache = self.sym_cache.borrow();
+            if !cache.is_empty() {
+                for var in cache.values() {
+                    out.push_str(&format!("static mut {var}: Val = Val::NIL;\n"));
+                }
+                out.push('\n');
+            }
+        }
+
         // Main
         out.push_str("fn main() {\n");
         out.push_str("    heap_init();\n");
+        // Initialize symbol cache
+        {
+            let cache = self.sym_cache.borrow();
+            for (name, var) in cache.iter() {
+                out.push_str(&format!("    unsafe {{ {var} = intern_symbol(\"{name}\"); }}\n"));
+            }
+        }
         out.push_str(&globals_init_code);
         out.push_str("\n");
         out.push_str(&main_code);
@@ -2542,7 +2565,7 @@ impl Compiler {
                 }
                 "pair?" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("bool_to_val({a} != Val::NIL && !{a}.is_fixnum())");
+                    return format!("bool_to_val({a} != Val::NIL && !{a}.is_fixnum() && unsafe {{ HEAP[{a}.as_rib()].tag == TAG_PAIR }})");
                 }
                 "number?" | "integer?" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
@@ -3751,9 +3774,17 @@ impl Compiler {
             return "Val::NIL".to_string();
         }
         if heap.is_symbol(datum) {
-            // Quoted symbol — emit as interned symbol rib
-            let name = syms.symbol_name(datum).unwrap_or("_");
-            return format!("intern_symbol(\"{name}\")");
+            // Quoted symbol — emit cached intern to avoid per-call overhead
+            let name = syms.symbol_name(datum).unwrap_or("_").to_string();
+            let mut cache = self.sym_cache.borrow_mut();
+            if let Some(var) = cache.get(&name) {
+                return format!("unsafe {{ {var} }}");
+            }
+            let n = self.sym_cache_counter.get();
+            self.sym_cache_counter.set(n + 1);
+            let var = format!("__SYM_{n}");
+            cache.insert(name.clone(), var.clone());
+            return format!("unsafe {{ {var} }}");
         }
         if heap.tag(datum) == table::T_STR {
             return self.emit_string_rib(datum, heap);
