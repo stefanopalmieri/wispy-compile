@@ -128,7 +128,6 @@ cargo check --no-default-features --lib
 
 - **Mutual tail recursion** — only self-tail-calls are optimized to loops. Mutually recursive functions in tail position use regular calls and can overflow the stack.
 - **call/cc** — escape-only (non-reentrant). Full continuations would require a CPS transform.
-- **Symbols at runtime** — `symbol->string` / `string->symbol` are not yet supported (symbols exist only at compile time).
 
 ## Future Work
 
