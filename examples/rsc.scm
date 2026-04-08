@@ -288,10 +288,31 @@
           (make-app (map parse expr))))))))
 
 (define (parse-body exprs)
-  (cond
-    ((null? exprs) (make-lit #f))
-    ((null? (cdr exprs)) (parse (car exprs)))
-    (else (make-seq (map parse exprs)))))
+  ;; Handle internal defines: collect leading (define ...) forms,
+  ;; convert to letrec, then parse the rest as the body.
+  (let collect ((es exprs) (defs '()))
+    (if (and (pair? es)
+             (pair? (car es))
+             (eq? (car (car es)) 'define))
+        (collect (cdr es) (cons (car es) defs))
+        ;; defs collected (reversed); es is the remaining body
+        (if (null? defs)
+            ;; No internal defines — original behavior
+            (cond
+              ((null? es) (make-lit #f))
+              ((null? (cdr es)) (parse (car es)))
+              (else (make-seq (map parse es))))
+            ;; Convert internal defines to letrec
+            (let ((bindings
+                    (map (lambda (d)
+                           (if (pair? (cadr d))
+                               ;; (define (f args...) body...) → (f (lambda (args...) body...))
+                               (list (car (cadr d))
+                                     (cons 'lambda (cons (cdr (cadr d)) (cddr d))))
+                               ;; (define x expr) → (x expr)
+                               (list (cadr d) (caddr d))))
+                         (reverse defs))))
+              (parse (cons 'letrec (cons bindings es))))))))
 
 (define (parse-cond clauses)
   (cond
@@ -592,8 +613,7 @@
              (emit-val (set-val ast))
              (emit "; } Val::NIL }"))
            (let* ((val (set-val ast))
-                  ;; Find the closure node — either val is a closure directly,
-                  ;; or val is a ref to a variable bound to a closure.
+                  ;; Resolve the closure node for this value
                   (closure-node
                     (cond
                       ((closure? val) val)
@@ -606,18 +626,26 @@
              (emit " = ")
              (emit-val val)
              (emit "; ")
-             ;; Patch letrec self-reference: if the assigned value is a closure
-             ;; that captures 'name', update the closure's environment cons cell.
-             (if (and closure-node (memq name (closure-free closure-node)))
-                 (let ((pos (list-index name (closure-free closure-node))))
-                   ;; set_car! on closure's env at position pos
-                   (emit "set_car(")
-                   (let loop ((d pos))
-                     (if (= d 0)
-                         (begin (emit "cdr(") (rust-ident name) (emit ")"))
-                         (begin (emit "cdr(") (loop (- d 1)) (emit ")"))))
-                   (emit ", ") (rust-ident name) (emit "); "))
-                 #f)
+             ;; Register this binding if it's a closure (for future cross-patches)
+             (if closure-node
+                 (set! *closure-bindings*
+                       (cons (cons name closure-node) *closure-bindings*)))
+             ;; Letrec patching: after setting 'name', scan ALL known
+             ;; closure bindings. Any closure that captured 'name' in its
+             ;; free vars has a stale copy — patch it via set_car!.
+             (for-each
+               (lambda (cb)
+                 (let ((closure-var (car cb))
+                       (closure-node (cdr cb)))
+                   (if (memq name (closure-free closure-node))
+                       (let ((pos (list-index name (closure-free closure-node))))
+                         (emit "set_car(")
+                         (let loop ((d pos))
+                           (if (= d 0)
+                               (begin (emit "cdr(") (rust-ident closure-var) (emit ")"))
+                               (begin (emit "cdr(") (loop (- d 1)) (emit ")"))))
+                         (emit ", ") (rust-ident name) (emit "); ")))))
+               *closure-bindings*)
              (emit "Val::NIL }")))))
 
     ((prim? ast)
