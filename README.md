@@ -24,10 +24,24 @@ Type dispatch in the compiled output is branchless: every dispatch decision is a
 | Repo | What | Install |
 |------|------|---------|
 | [**wispy-table**](https://github.com/stefanopalmieri/wispy-table) | 1KB Cayley table + Lean proofs + Z3 search | `cargo add wispy-table` |
-| [**wispy-vm**](https://github.com/stefanopalmieri/wispy-vm) | Stak VM fork + REPL + examples + benchmarks | `cargo install --path wispy` |
+| [**wispy-vm**](https://github.com/stefanopalmieri/wispy-vm) | Stak VM fork · REPL · self-hosted tools (specializer, Futamura tower, reflective tower, metacircular evaluator) | `cargo install --path wispy` |
 | **wispy-compile** (this repo) | Scheme → Rust AOT compiler | `cargo install --path .` |
 
-For interpreted execution, REPL, running the self-hosted tools (reflective tower, partial evaluator, Futamura projections), and bootstrapping the self-hosted compiler (`examples/rsc.scm`), use [wispy-vm](https://github.com/stefanopalmieri/wispy-vm).
+The self-hosted tool chain lives in wispy-vm under `examples/wispy/`:
+
+| File | Role |
+|------|------|
+| `ir-lib.scm` | Shared 7-node algebraic IR (synced to `examples/ir-lib.scm` here) |
+| `specialize.scm` | Partial evaluator for Cayley table IR — constant folding, dead branch elimination, beta reduction |
+| `transpile.scm` | IR → Rust code generator (synced to `examples/transpile.scm` here) |
+| `pe.scm` | General online partial evaluator for Scheme |
+| `futamura.scm` | Futamura projections P1 and P2 on the algebra, with three-path verification |
+| `futamura-real.scm` | P1 on a direct-style Scheme evaluator |
+| `futamura-cps.scm` | P2 on the CPS metacircular evaluator |
+| `reflective-tower.scm` | Reflective meta-interpreter tower |
+| `metacircular.scm` | Metacircular Scheme interpreter |
+
+`examples/ir-lib.scm` and `examples/transpile.scm` in this repo are synced copies of the wispy-vm originals, kept here so `rsc.scm` and the transpiler back-end can be developed and tested independently. The full Futamura pipeline (`specialize.scm` → `transpile.scm` → Rust) runs in wispy-vm. When `rsc.scm` matures to replace `compile.rs`, the self-hosted compiler will migrate there too, consolidating the complete self-hosting story in one place.
 
 ## Language Support
 
@@ -161,11 +175,64 @@ rustc -O -o /tmp/rsc /tmp/rsc.rs
 
 **Pipeline:** S-expression → AST (tagged lists) → CPS conversion → lambda lifting / closure conversion → Rust emission (trampoline + `dispatch_cps` + `__lambda_N` functions).
 
-Remaining work: Cheney GC via CPS roots, optimization passes (type inference, inlining), and Futamura P3.
+Remaining work: Cheney GC via CPS roots, optimization passes (type inference, inlining), and wiring the specializer output into the P3 transpiler.
+
+## Algebraic IR and Transpiler
+
+Two companion files support Futamura-projection-based specialization over the Cayley table algebra. They operate on a different level than `rsc.scm`: where `rsc.scm` compiles general Scheme, these tools work exclusively with algebraic expressions — programs that compute by composing Cayley table lookups.
+
+### `examples/ir-lib.scm` — Shared expression IR
+
+Defines a 7-node tagged-pair representation for algebraic expressions:
+
+| Node | Encoding | Meaning |
+|------|----------|---------|
+| `Atom(n)` | `(0 . n)` | constant algebra element (0–31) |
+| `Var(x)` | `(1 . x)` | variable |
+| `Dot(a, b)` | `(2 . (a . b))` | Cayley table lookup `a·b` |
+| `If(t, c, a)` | `(3 . ...)` | conditional on `t != BOT` |
+| `Let(x, v, b)` | `(4 . ...)` | local binding |
+| `Lam(x, b)` | `(5 . ...)` | abstraction |
+| `App(f, a)` | `(6 . ...)` | application |
+
+Provides constructors (`mk-atom`, `mk-dot`, …), predicates, accessors, capture-avoiding substitution (`subst-expr`), and a pretty-printer (`ir-display`). Load this first — it is a dependency of `transpile.scm` and the specializer.
+
+### `examples/transpile.scm` — IR → Rust code generator
+
+Walks an IR expression tree and emits valid Rust source targeting the 32×32 Cayley table. This is the back-end for Futamura projections P2 and P3: the specializer reduces a program to a residual IR tree (no `Lam` or `App` nodes), and `transpile.scm` renders it as flat `u8` arithmetic over `CAYLEY[][]`.
+
+Emission rules:
+- `Atom(Q)` → named constant (`Q`, `CAR`, …) or `n_u8`
+- `Dot(a, b)` → `CAYLEY[a as usize][b as usize]`
+- `If(t, c, a)` → `if t != BOT { c } else { a }`
+- `Let(x, v, b)` → `{ let v_x: u8 = v; b }`
+
+`transpile-main` emits a complete standalone Rust program: element constants, the full 32×32 Cayley table literal, and a `fn main()` that evaluates the residual expression.
+
+```bash
+# Load both files and run the built-in tests
+cargo run -- -e '(load "examples/ir-lib.scm") (load "examples/transpile.scm")'
+
+# Or via wispy-vm
+wispy -e '(load "examples/ir-lib.scm") (load "examples/transpile.scm")'
+```
+
+### Relationship to `rsc.scm`
+
+| | `rsc.scm` | `transpile.scm` |
+|-|-----------|-----------------|
+| Input | Scheme source (s-expressions) | Algebraic IR (from `ir-lib.scm`) |
+| Domain | General Scheme | Cayley table expressions only |
+| Pipeline | CPS + closure conversion + trampoline | Direct tree walk |
+| Output | Rust with a Scheme runtime | Rust doing pure `u8` table lookups |
+| Role | The compiler proper | Back-end for the specializer's residual output |
+
+`Lam` and `App` nodes are expected to be fully eliminated by the specializer before reaching `transpile.scm`. Bare lambdas in the input emit `0_u8` as a placeholder.
 
 ## Future Work
 
 - **Cheney GC in the self-hosted compiler.** CPS makes GC root tracking systematic — every continuation's free variables are the precise live set. No shadow stack needed.
+- **Futamura P3.** `specialize.scm` (wispy-vm) already produces Lam/App-free residual IR from a known program; `transpile.scm` already renders that IR as Rust. The remaining step is wiring the two: run `transpile-main` on the output of `specialize`, yielding a residual Rust program with zero interpreter overhead.
 - **Type inference / specialization.** Propagating type information through the call graph would eliminate runtime type checks on provably-fixnum paths.
 - **Cross-function inlining.** Inlining small closures at call sites would eliminate the `dispatch_cps` indirect dispatch.
 - **Full continuations.** The CPS architecture already represents continuations as closures — `call/cc` just captures the current one.
