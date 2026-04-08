@@ -99,6 +99,29 @@
 (define (app-args x) (cddr x))
 (define (lam-params x) (cadr x))
 (define (lam-body x) (caddr x))
+
+;; Rest-arg helpers: params can be improper list (x y . rest)
+;; or a bare symbol (lambda args body)
+(define (params-proper params)
+  ;; Return the proper (fixed) part of a param list
+  (cond ((null? params) '())
+        ((symbol? params) '())  ;; bare symbol = all rest
+        ((pair? params) (cons (car params) (params-proper (cdr params))))
+        (else '())))
+
+(define (params-rest params)
+  ;; Return the rest param name, or #f if none
+  (cond ((null? params) #f)
+        ((symbol? params) params)  ;; bare symbol = rest param
+        ((pair? params) (params-rest (cdr params)))
+        (else #f)))
+
+(define (params-all params)
+  ;; Return a flat list of ALL param names (proper + rest)
+  (let ((rest (params-rest params)))
+    (if rest
+        (append (params-proper params) (list rest))
+        (params-proper params))))
 (define (seq-exprs x) (cdr x))
 (define (closure-id x) (cadr x))
 (define (closure-free x) (cddr x))
@@ -140,7 +163,7 @@
                        (union (fv (if-then ast)) (fv (if-else ast)))))
     ((prim? ast) (union-multi (map fv (prim-args ast))))
     ((app? ast)  (union-multi (map fv (cdr ast)))) ;; cdr skips 'app tag
-    ((lam? ast)  (diff (fv (lam-body ast)) (lam-params ast)))
+    ((lam? ast)  (diff (fv (lam-body ast)) (params-all (lam-params ast))))
     ((seq? ast)  (union-multi (map fv (seq-exprs ast))))
     ((closure? ast) (closure-free ast)) ;; free vars are listed in the node
     (else '())))
@@ -524,7 +547,7 @@
 
 (define (add-lambda! params body)
   (let ((id *next-id*)
-        (free (diff (diff (fv body) params) *globals*)))
+        (free (diff (diff (fv body) (params-all params)) *globals*)))
     (set! *next-id* (+ *next-id* 1))
     (set! *lambdas* (cons (list id params free body) *lambdas*))
     id))
@@ -557,7 +580,7 @@
      ;; Lambda in value position: lift body, collect, return closure node
      (let* ((body (lift (lam-body ast)))
             (id (add-lambda! (lam-params ast) body))
-            (free (diff (diff (fv body) (lam-params ast)) *globals*)))
+            (free (diff (diff (fv body) (params-all (lam-params ast))) *globals*)))
        (cons 'closure (cons id free))))
     ((seq? ast)
      (make-seq (map lift (seq-exprs ast))))
@@ -1073,12 +1096,12 @@
         (free (lambda-free lam))
         (body (lambda-body lam)))
     (emit "fn __lambda_") (emit id) (emit "(__env: Val")
-    ;; Parameters
+    ;; Parameters (use params-all to flatten rest args)
     (for-each (lambda (p)
                 (emit ", ")
                 (rust-ident p)
                 (emit ": Val"))
-              params)
+              (params-all params))
     (emit ") -> Action {")
     (newline)
     ;; Extract free variables from environment
@@ -1102,13 +1125,22 @@
   (for-each
     (lambda (lam)
       (let ((id (lambda-id lam))
-            (params (lambda-params lam)))
+            (params (lambda-params lam))
+            (proper (params-proper (lambda-params lam)))
+            (rest (params-rest (lambda-params lam))))
         (emit "        ") (emit id) (emit " => __lambda_") (emit id) (emit "(__env")
-        (let loop ((i 0) (ps params))
+        ;; Fixed params
+        (let loop ((i 0) (ps proper))
           (if (pair? ps)
               (begin
                 (emit ", args[") (emit i) (emit "]")
                 (loop (+ i 1) (cdr ps)))))
+        ;; Rest param: collect remaining args into a cons-list
+        (if rest
+            (begin
+              (emit ", collect_rest(args, ")
+              (emit (length proper))
+              (emit ")")))
         (emit "),")
         (newline)))
     (reverse *lambdas*))
@@ -1417,6 +1449,14 @@
   (emit-line "fn scheme_memq(key: Val, lst: Val) -> Val { let mut l = lst; while l != Val::NIL && !l.is_fixnum() { if car(l) == key { return l; } l = cdr(l); } FALSE_VAL }")
   (emit-line "fn scheme_assq(key: Val, lst: Val) -> Val { let mut l = lst; while l != Val::NIL && !l.is_fixnum() { let p = car(l); if car(p) == key { return p; } l = cdr(l); } FALSE_VAL }")
   (emit-line "fn scheme_assoc(key: Val, lst: Val) -> Val { let mut l = lst; while l != Val::NIL && !l.is_fixnum() { let p = car(l); if scheme_equal(car(p), key) { return p; } l = cdr(l); } FALSE_VAL }")
+  (newline)
+  ;; Collect rest args into a cons-list (for variadic lambda dispatch)
+  (emit-line "fn collect_rest(args: &[Val], start: usize) -> Val {")
+  (emit-line "    let mut r = Val::NIL;")
+  (emit-line "    let mut i = args.len();")
+  (emit-line "    while i > start { i -= 1; r = cons(args[i], r); }")
+  (emit-line "    r")
+  (emit-line "}")
   (newline)
   ;; Action enum + trampoline
   (emit-line "enum Action {")
