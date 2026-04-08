@@ -1,6 +1,6 @@
 # WispyScheme
 
-Scheme → Rust AOT compiler with branchless Cayley table type dispatch and optional semi-space Cheney GC. Compiles R7RS Scheme to standalone native binaries — beats Chez Scheme on triangl, fib, tak, and sum.
+Scheme → Rust AOT compiler built on a 1KB finite algebra. All type dispatch is a single table lookup — no tag-bit branches, no polymorphic inline caches — just a 32×32 [Cayley table](https://github.com/stefanopalmieri/wispy-table) with 14 Lean-proved theorems. Compiles R7RS Scheme to standalone native binaries with competitive performance.
 
 Named after Wispy the guinea pig.
 
@@ -17,7 +17,7 @@ rustc -O -o nqueens nqueens.rs
 cargo run -- --gc cheney --compile bench/nqueens.scm > nqueens.rs
 ```
 
-Type dispatch in the compiled output is branchless: instead of tag-bit branch chains, every dispatch decision is a single index into the 32×32 [Cayley table](https://github.com/stefanopalmieri/wispy-table) (`wispy-table` crate).
+Type dispatch in the compiled output is branchless: every dispatch decision is a single index into the Cayley table. The algebra replaces the tag-bit branch chains found in traditional Scheme implementations.
 
 ## Part of the Wispy ecosystem
 
@@ -45,28 +45,32 @@ For interpreted execution, REPL, and running the self-hosted tools (reflective t
 
 ## Performance
 
+The point of these benchmarks is not "we beat Chez" — Chez Scheme has 35 years of engineering. The point is that a table-driven algebra produces competitive native code without the usual type-dispatch machinery. No polymorphic inline caches, no type-feedback JIT, no tag-bit branch chains — just a 1KB lookup table.
+
 ### R7RS benchmarks (Apple M-series, single-threaded)
 
-| Benchmark | Wispy (no GC) | Wispy (Cheney) | Chez | Winner |
-|-----------|:------------:|:--------------:|:----:|--------|
-| fib | 2.15s | 2.14s | 3.28s | **Wispy** 1.5x |
-| tak | 1.02s | 1.03s | 1.38s | **Wispy** 1.4x |
-| sum | 0.48s | 0.47s | 2.36s | **Wispy** 4.9x |
-| ack | 4.58s | 4.62s | 2.24s | **Chez** 2.0x |
-| deriv | 3.49s | 2.77s | 0.91s | **Chez** 3.8x |
-| diviter | 4.19s | 4.08s | 1.26s | **Chez** 3.3x |
-| divrec | 7.35s | 7.72s | 1.40s | **Chez** 5.3x |
-| nqueens | 8.36s | 11.81s | 3.79s | **Chez** 2.2x |
-| destruc | 2.82s | 3.76s | 1.27s | **Chez** 2.2x |
-| triangl | 1.33s | 3.24s | 1.85s | **Wispy** 1.4x |
-| takl | 4.00s | 4.08s | 3.39s | **Chez** 1.2x |
-| primes | 2.29s | 3.10s | 0.65s | **Chez** 3.5x |
+| Benchmark | Wispy (no GC) | Wispy (Cheney) | Chez |
+|-----------|:------------:|:--------------:|:----:|
+| fib | 2.15s | 2.14s | 3.28s |
+| tak | 1.02s | 1.03s | 1.38s |
+| sum | 0.48s | 0.47s | 2.36s |
+| ack | 4.58s | 4.62s | 2.24s |
+| deriv | 3.49s | 2.77s | 0.91s |
+| diviter | 4.19s | 4.08s | 1.26s |
+| divrec | 7.35s | 7.72s | 1.40s |
+| nqueens | 8.36s | 11.81s | 3.79s |
+| destruc | 2.82s | 3.76s | 1.27s |
+| triangl | 1.33s | 3.24s | 1.85s |
+| takl | 4.00s | 4.08s | 3.39s |
+| primes | 2.29s | 3.10s | 0.65s |
 
-Benchmarks from [r7rs-benchmarks](https://github.com/ecraven/r7rs-benchmarks) with standard parameters. All 12 benchmarks pass in both modes. Wispy wins 4/12 (fixnum-heavy + vector), Chez wins 8/12 (allocation/list-heavy).
+Benchmarks from [r7rs-benchmarks](https://github.com/ecraven/r7rs-benchmarks) with standard parameters. All 12 benchmarks pass in both modes.
 
-**No-GC mode** (grow-only heap) wins on pure fixnum recursion: 5.2× faster than Chez on sum, 1.5× on fib, 1.4× on tak, 1.4× on triangl. The gap on allocation-heavy benchmarks (divrec 5.4×, deriv 4.0×) is due to unbounded heap growth, no compaction, and unoptimized codegen (no type inference, no inlining).
+**Where Wispy is faster** (fib, tak, sum, triangl): fixnum-heavy recursion where the Cayley table's branchless dispatch pays off — no type checks on the hot path, just arithmetic and table lookups.
 
-**Cheney GC mode** uses liveness-based root elision: functions whose bodies (transitively) never allocate emit zero GC overhead. On fib/tak/sum/ack/takl/divrec, Cheney matches no-GC exactly. On deriv/diviter, Cheney *beats* no-GC (compaction improves cache locality). The remaining overhead on nqueens is from the benchmark harness calling closures via `call_val`, which the analysis conservatively treats as allocating.
+**Where Chez is faster** (deriv, nqueens, primes, etc.): allocation-heavy workloads where Chez's type inference, inlining, and mature GC dominate. Wispy doesn't yet have type inference or cross-function inlining — these are planned for the self-hosted compiler.
+
+**Cheney GC mode** uses liveness-based root elision: functions whose bodies (transitively) never allocate emit zero GC overhead. On fib/tak/sum/ack/takl/divrec, Cheney matches no-GC exactly. On deriv/diviter, Cheney *beats* no-GC (compaction improves cache locality).
 
 ## Garbage Collection
 
