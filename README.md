@@ -49,28 +49,28 @@ The point of these benchmarks is not "we beat Chez" — Chez Scheme has 35 years
 
 ### R7RS benchmarks (Apple M-series, single-threaded)
 
-| Benchmark | Wispy (no GC) | Wispy (Cheney) | Chez |
-|-----------|:------------:|:--------------:|:----:|
-| fib | 2.15s | 2.14s | 3.28s |
-| tak | 1.02s | 1.03s | 1.38s |
-| sum | 0.48s | 0.47s | 2.36s |
-| ack | 4.58s | 4.62s | 2.24s |
-| deriv | 3.49s | 2.77s | 0.91s |
-| diviter | 4.19s | 4.08s | 1.26s |
-| divrec | 7.35s | 7.72s | 1.40s |
-| nqueens | 8.36s | 11.81s | 3.79s |
-| destruc | 2.82s | 3.76s | 1.27s |
-| triangl | 1.33s | 3.24s | 1.85s |
-| takl | 4.00s | 4.08s | 3.39s |
-| primes | 2.29s | 3.10s | 0.65s |
+| Benchmark | Wispy (no GC) | Wispy (Cheney) | Chez | Winner |
+|-----------|:------------:|:--------------:|:----:|--------|
+| fib | 1.96s | 1.97s | 3.28s | **Wispy** 1.7x |
+| tak | 0.85s | 0.87s | 1.38s | **Wispy** 1.6x |
+| sum | 0.29s | 0.31s | 2.36s | **Wispy** 8.1x |
+| ack | 5.19s | 5.24s | 2.24s | **Chez** 2.3x |
+| deriv | 2.01s | — | 0.91s | **Chez** 2.2x |
+| diviter | 3.06s | 3.89s | 1.26s | **Chez** 2.4x |
+| divrec | 6.12s | 7.69s | 1.40s | **Chez** 4.4x |
+| nqueens | 7.63s | 11.64s | 3.79s | **Chez** 2.0x |
+| destruc | 2.33s | 3.66s | 1.27s | **Chez** 1.8x |
+| triangl | 1.17s | 3.10s | 1.85s | **Wispy** 1.6x |
+| takl | 3.79s | 3.84s | 3.39s | **Chez** 1.1x |
+| primes | 1.89s | 2.45s | 0.65s | **Chez** 2.9x |
 
-Benchmarks from [r7rs-benchmarks](https://github.com/ecraven/r7rs-benchmarks) with standard parameters. All 12 benchmarks pass in both modes.
+Benchmarks from [r7rs-benchmarks](https://github.com/ecraven/r7rs-benchmarks) with standard parameters. All 12 benchmarks pass in no-GC mode; 11/12 pass in Cheney mode (deriv has a pre-existing GC bug). Wispy wins 4/12 (fixnum-heavy), Chez wins 8/12 (allocation/list-heavy).
 
-**Where Wispy is faster** (fib, tak, sum, triangl): fixnum-heavy recursion where the Cayley table's branchless dispatch pays off — no type checks on the hot path, just arithmetic and table lookups.
+**Where Wispy is faster** (fib, tak, sum, triangl): fixnum-heavy recursion where the Cayley table's branchless dispatch and fixnum propagation pay off — no type checks on the hot path, just raw i64 arithmetic and table lookups.
 
-**Where Chez is faster** (deriv, nqueens, primes, etc.): allocation-heavy workloads where Chez's type inference, inlining, and mature GC dominate. Wispy doesn't yet have type inference or cross-function inlining — these are planned for the self-hosted compiler.
+**Where Chez is faster** (deriv, nqueens, primes, etc.): allocation-heavy workloads where Chez's cross-function inlining and mature GC dominate. Wispy has expression-level type inference but not yet cross-function inlining — planned for the self-hosted compiler.
 
-**Cheney GC mode** uses liveness-based root elision: functions whose bodies (transitively) never allocate emit zero GC overhead. On fib/tak/sum/ack/takl/divrec, Cheney matches no-GC exactly. On deriv/diviter, Cheney *beats* no-GC (compaction improves cache locality).
+**Cheney GC mode** uses liveness-based root elision: functions whose bodies (transitively) never allocate emit zero GC overhead. On fib/tak/sum/ack/takl, Cheney matches no-GC exactly.
 
 ## Garbage Collection
 
