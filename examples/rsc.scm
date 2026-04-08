@@ -634,6 +634,39 @@
 ;; Track which local variables are bound to closure nodes (for letrec patching)
 (define *closure-bindings* '())
 
+;; Track current lambda for self-tail-call optimization
+(define *current-lambda-id* -1)
+(define *current-lambda-params* '())
+(define *in-self-loop* #f)
+
+;; Check if a tail-call target resolves to the current lambda
+(define (self-call? fn-ast)
+  (cond
+    ((ref? fn-ast)
+     (let ((gid (assq (ref-var fn-ast) *global-ids*)))
+       (and gid (= (cdr gid) *current-lambda-id*))))
+    ((closure? fn-ast)
+     (and (= (closure-id fn-ast) *current-lambda-id*)
+          (null? (closure-free fn-ast))))
+    (else #f)))
+
+;; Scan an AST for any self-tail-call (used to decide whether to emit loop)
+(define (has-self-tail-call? ast)
+  (cond
+    ((app? ast)
+     (let ((fn (app-fn ast)))
+       (if (lam? fn)
+           ;; Administrative redex: check body
+           (has-self-tail-call? (lam-body fn))
+           ;; Real call: check if self-call
+           (self-call? fn))))
+    ((if? ast)
+     (or (has-self-tail-call? (if-then ast))
+         (has-self-tail-call? (if-else ast))))
+    ((seq? ast)
+     (has-self-tail-call? (car (reverse (seq-exprs ast)))))
+    (else #f)))
+
 ;; ── Emit a value expression (not in tail position) ──
 
 (define (emit-val ast)
@@ -1018,38 +1051,46 @@
 
 ;; Emit a tail call: all-parts = (fn arg1 arg2 ...)
 (define (emit-tail-call all-parts)
-  (let ((nargs (- (length all-parts) 1)))
-    (cond
-      ((= nargs 1)
-       (emit "Action::Call1(")
-       (emit-val (car all-parts))
-       (emit ", ")
-       (emit-val (cadr all-parts))
-       (emit ")"))
-      ((= nargs 2)
-       (emit "Action::Call2(")
-       (emit-val (car all-parts))
-       (emit ", ")
-       (emit-val (cadr all-parts))
-       (emit ", ")
-       (emit-val (caddr all-parts))
-       (emit ")"))
-      ((= nargs 3)
-       (emit "Action::Call3(")
-       (emit-val (car all-parts))
-       (emit ", ")
-       (emit-val (cadr all-parts))
-       (emit ", ")
-       (emit-val (caddr all-parts))
-       (emit ", ")
-       (emit-val (cadddr all-parts))
-       (emit ")"))
-      (else
-       (emit "Action::CallN(")
-       (emit-val (car all-parts))
-       (emit ", vec![")
-       (emit-val-list (cdr all-parts))
-       (emit "])")))))
+  (let ((fn (car all-parts))
+        (args (cdr all-parts))
+        (nargs (- (length all-parts) 1)))
+    ;; Self-tail-call optimization: reassign params and continue
+    (if (and *in-self-loop* (self-call? fn))
+        (begin
+          ;; Evaluate all new arg values into temporaries first
+          ;; (to avoid order-of-evaluation issues with shared params)
+          (emit "{ ")
+          (let loop ((as args) (i 0))
+            (if (pair? as)
+                (begin
+                  (emit "let __t") (emit i) (emit " = ") (emit-val (car as)) (emit "; ")
+                  (loop (cdr as) (+ i 1)))))
+          ;; Reassign params from temporaries
+          (let loop ((ps (params-all *current-lambda-params*)) (i 0))
+            (if (pair? ps)
+                (begin
+                  (rust-ident (car ps)) (emit " = __t") (emit i) (emit "; ")
+                  (loop (cdr ps) (+ i 1)))))
+          (emit "continue; }"))
+        ;; Normal tail call → Action (with return if inside a loop)
+        (begin
+          (if *in-self-loop* (emit "return "))
+          (cond
+            ((= nargs 1)
+             (emit "Action::Call1(")
+             (emit-val fn) (emit ", ") (emit-val (car args)) (emit ")"))
+            ((= nargs 2)
+             (emit "Action::Call2(")
+             (emit-val fn) (emit ", ") (emit-val (car args))
+             (emit ", ") (emit-val (cadr args)) (emit ")"))
+            ((= nargs 3)
+             (emit "Action::Call3(")
+             (emit-val fn) (emit ", ") (emit-val (car args))
+             (emit ", ") (emit-val (cadr args))
+             (emit ", ") (emit-val (caddr args)) (emit ")"))
+            (else
+             (emit "Action::CallN(")
+             (emit-val fn) (emit ", vec![") (emit-val-list args) (emit "])")))))))
 
 (define (emit-tail ast)
   (cond
@@ -1087,17 +1128,21 @@
     ((prim? ast)
      (cond
        ((eq? (prim-op ast) '%halt)
+        (if *in-self-loop* (emit "return "))
         (emit "Action::Halt(") (emit-val (car (prim-args ast))) (emit ")"))
        ((eq? (prim-op ast) 'apply)
         ;; (apply f args-list) in tail position → scheme_apply
+        (if *in-self-loop* (emit "return "))
         (emit "scheme_apply(") (emit-val (car (prim-args ast)))
         (emit ", ") (emit-val (cadr (prim-args ast))) (emit ")"))
        (else
         ;; Other prims in tail: wrap result as Halt
+        (if *in-self-loop* (emit "return "))
         (emit "Action::Halt(") (emit-prim (prim-op ast) (prim-args ast)) (emit ")"))))
 
     ;; Lit/ref in tail position: shouldn't happen after CPS
     (else
+     (if *in-self-loop* (emit "return "))
      (emit "Action::Halt(")
      (emit-val ast)
      (emit ")"))))
@@ -1145,14 +1190,19 @@
 
 (define (emit-lambda lam)
   (set! *closure-bindings* '())  ;; reset per-lambda
-  (let ((id (lambda-id lam))
-        (params (lambda-params lam))
-        (free (lambda-free lam))
-        (body (lambda-body lam)))
+  (let* ((id (lambda-id lam))
+         (params (lambda-params lam))
+         (free (lambda-free lam))
+         (body (lambda-body lam))
+         (self-call (begin
+                      (set! *current-lambda-id* id)
+                      (set! *current-lambda-params* params)
+                      (has-self-tail-call? body))))
     (emit "fn __lambda_") (emit id) (emit "(__env: Val")
-    ;; Parameters (use params-all to flatten rest args)
+    ;; Parameters — use 'mut' if self-calling (need reassignment)
     (for-each (lambda (p)
                 (emit ", ")
+                (if self-call (emit "mut "))
                 (rust-ident p)
                 (emit ": Val"))
               (params-all params))
@@ -1160,9 +1210,17 @@
     (newline)
     ;; Extract free variables from environment
     (emit-env-extract free)
-    ;; Body (in tail position)
-    (emit "    ")
-    (emit-tail body)
+    ;; Body (in tail position), wrapped in loop if self-calling
+    (if self-call
+        (begin
+          (set! *in-self-loop* #t)
+          (emit "    loop { ")
+          (emit-tail body)
+          (emit " }")
+          (set! *in-self-loop* #f))
+        (begin
+          (emit "    ")
+          (emit-tail body)))
     (newline)
     (emit "}")
     (newline)
