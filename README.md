@@ -27,7 +27,7 @@ Type dispatch in the compiled output is branchless: every dispatch decision is a
 | [**wispy-vm**](https://github.com/stefanopalmieri/wispy-vm) | Stak VM fork + REPL + examples + benchmarks | `cargo install --path wispy` |
 | **wispy-compile** (this repo) | Scheme → Rust AOT compiler | `cargo install --path .` |
 
-For interpreted execution, REPL, and running the self-hosted tools (reflective tower, partial evaluator, Futamura projections), use [wispy-vm](https://github.com/stefanopalmieri/wispy-vm).
+For interpreted execution, REPL, running the self-hosted tools (reflective tower, partial evaluator, Futamura projections), and bootstrapping the self-hosted compiler (`examples/rsc.scm`), use [wispy-vm](https://github.com/stefanopalmieri/wispy-vm).
 
 ## Language Support
 
@@ -140,27 +140,28 @@ cargo check --no-default-features --lib
 
 `examples/rsc.scm` is a self-hosted Scheme→Rust compiler written in Scheme (~1600 lines). It uses a CPS + closure conversion pipeline based on Feeley's 90-minute Scheme-to-C compiler: all function calls become tail calls through a trampoline, closures are lambda-lifted with cons-list environments, and every continuation's free variables are the precise live set.
 
-The compiler can compile itself: Chez runs rsc.scm, which reads rsc.scm from stdin and emits a standalone Rust binary. That binary correctly compiles Scheme programs.
+The compiler reaches a **fixed point** at generation 2: the self-compiled binary produces identical output when compiling itself again. Bootstraps through [wispy-vm](https://github.com/stefanopalmieri/wispy-vm).
 
 ```bash
-# Development: use Chez as the host Scheme
+# Compile a program (wispy-vm as host)
 echo '(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (display (fib 30)) (newline)' \
-  | chez --script examples/rsc.scm > fib.rs && rustc -O -o fib fib.rs && ./fib  # 832040
+  | wispy examples/rsc.scm > fib.rs && rustc -O -o fib fib.rs && ./fib  # 832040
 
-# Self-compilation: rsc.scm compiles itself
-chez --script examples/rsc.scm < examples/rsc.scm > /tmp/rsc.rs
+# Self-compilation: rsc.scm compiles itself → gen1
+wispy examples/rsc.scm < examples/rsc.scm > /tmp/rsc.rs
 rustc -O -o /tmp/rsc /tmp/rsc.rs
 
-# Use the self-compiled compiler
-echo '(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (display (fib 30)) (newline)' \
-  | /tmp/rsc > fib.rs && rustc -O -o fib fib.rs && ./fib  # 832040
+# gen1 compiles rsc.scm → gen2 (fixed point: gen2 == gen3)
+/tmp/rsc < examples/rsc.scm > /tmp/rsc2.rs
+# diff /tmp/rsc.rs /tmp/rsc2.rs shows only gen1≠gen2 (host expansion diffs)
+# but gen2 compiling rsc.scm produces identical output to gen2 itself
 ```
 
-**What it compiles:** `define`, `lambda`, `if`, `cond`, `let`/`let*`/`letrec`, named `let`, `begin`, `and`/`or`, `set!`, `quote`, `quasiquote`, closures, higher-order functions (`map`, `for-each`, `apply`), strings, symbols, characters, `equal?`, `read`/`eof-object?`, `display`/`newline`/`write-char`, `error`.
+**What it compiles:** `define` (top-level and internal), `lambda`, `if`, `cond`, `let`/`let*`/`letrec`, named `let`, `begin`, `and`/`or`, `set!`, `quote`, `quasiquote`, closures, higher-order functions (`map`, `for-each`, `apply`), first-class primitives, strings, symbols, characters, `equal?`, `read`/`eof-object?`, `display`/`newline`/`write-char`, `error`.
 
 **Pipeline:** S-expression → AST (tagged lists) → CPS conversion → lambda lifting / closure conversion → Rust emission (trampoline + `dispatch_cps` + `__lambda_N` functions).
 
-Remaining work: full generation-2 self-compilation (self-compiled binary compiling rsc.scm), Cheney GC via CPS roots, optimization passes (type inference, inlining), and Futamura P3.
+Remaining work: Cheney GC via CPS roots, optimization passes (type inference, inlining), and Futamura P3.
 
 ## Future Work
 
