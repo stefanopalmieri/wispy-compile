@@ -177,11 +177,41 @@
 (define (primitive? name)
   (memq name *primitives*))
 
+;; Arity table for primitives (used for eta-expansion)
+(define (prim-arity name)
+  (cond
+    ((memq name '(car cdr null? pair? symbol? string? boolean? char?
+                  procedure? number? not zero? positive? negative?
+                  eof-object? display newline write-char read
+                  string-length symbol->string number->string
+                  char->integer integer->char error reverse length))
+     1)
+    ((memq name '(+ - * quotient remainder modulo < > = <= >=
+                  eq? eqv? equal? cons set-car! set-cdr!
+                  string-ref string-append string->symbol
+                  char=? memq assq assoc map for-each append apply))
+     2)
+    (else 2))) ;; default to 2
+
+;; Eta-expand a primitive: car → (lambda (__a) (car __a))
+(define (prim-eta name)
+  (let ((arity (prim-arity name)))
+    (cond
+      ((= arity 0) `(lambda () (,name)))
+      ((= arity 1) `(lambda (__a) (,name __a)))
+      ((= arity 2) `(lambda (__a __b) (,name __a __b)))
+      (else `(lambda (__a __b __c) (,name __a __b __c))))))
+
 (define (parse expr)
   (cond
     ((number? expr) (make-lit expr))
     ((boolean? expr) (make-lit expr))
-    ((symbol? expr) (make-ref expr))
+    ((symbol? expr)
+     ;; If a primitive name is used as a value (not in call position),
+     ;; wrap it in a lambda so it becomes a first-class closure.
+     (if (primitive? expr)
+         (parse (prim-eta expr))
+         (make-ref expr)))
     ((not (pair? expr)) (make-lit expr))
     (else
      (let ((head (car expr)))
