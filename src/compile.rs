@@ -2039,7 +2039,7 @@ impl Compiler {
                     let rest2 = heap.cdr(rest);
                     let conseq = heap.car(rest2);
                     let alt_list = heap.cdr(rest2);
-                    let test_code = self.emit_expr_inline(test, heap, syms);
+                    let test_code = self.emit_test(test, heap, syms);
                     let saved_slots = self.gc_slots.borrow().clone();
                     let t_code = self.emit_expr(conseq, heap, syms, indent + 1);
                     *self.gc_slots.borrow_mut() = saved_slots.clone();
@@ -2047,13 +2047,13 @@ impl Compiler {
                         let f_code = self.emit_expr(heap.car(alt_list), heap, syms, indent + 1);
                         *self.gc_slots.borrow_mut() = saved_slots;
                         return format!(
-                            "{pad}if is_true({test_code}) {{\n{t_code}{pad}}} else {{\n{f_code}{pad}}}\n"
+                            "{pad}if {test_code} {{\n{t_code}{pad}}} else {{\n{f_code}{pad}}}\n"
                         );
                     } else {
                         *self.gc_slots.borrow_mut() = saved_slots;
                         let else_code = self.tco_return(&format!("{pad}    "), "Val::NIL");
                         return format!(
-                            "{pad}if is_true({test_code}) {{\n{t_code}{pad}}} else {{\n{else_code}{pad}}}\n"
+                            "{pad}if {test_code} {{\n{t_code}{pad}}} else {{\n{else_code}{pad}}}\n"
                         );
                     }
                 }
@@ -2428,6 +2428,260 @@ impl Compiler {
         self.tco_return(&pad, &code)
     }
 
+    // ── Type inference helpers ──────────────────────────────────────────
+
+    /// Returns true if this expression is guaranteed to produce a fixnum Val.
+    fn is_fixnum_expr(&self, expr: Val, heap: &Heap, syms: &SymbolTable) -> bool {
+        if expr.is_fixnum() { return true; }
+        if !expr.is_rib() || heap.tag(expr) != table::T_PAIR { return false; }
+        let head = heap.car(expr);
+        if !heap.is_symbol(head) { return false; }
+        let name = syms.symbol_name(head).unwrap_or("");
+        match name {
+            "+" | "-" | "*" | "/" | "quotient" | "remainder" | "modulo"
+            | "abs" | "max" | "min" | "expt" | "gcd" | "lcm"
+            | "char->integer" | "string-length" | "vector-length" => true,
+            "if" => {
+                let rest = heap.cdr(expr);
+                let conseq = heap.car(heap.cdr(rest));
+                let alt_list = heap.cdr(heap.cdr(rest));
+                self.is_fixnum_expr(conseq, heap, syms)
+                    && heap.is_pair(alt_list)
+                    && self.is_fixnum_expr(heap.car(alt_list), heap, syms)
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns true if this expression is guaranteed to produce TRUE_VAL or FALSE_VAL.
+    fn is_bool_expr(&self, expr: Val, heap: &Heap, syms: &SymbolTable) -> bool {
+        if !expr.is_rib() || heap.tag(expr) != table::T_PAIR { return false; }
+        let head = heap.car(expr);
+        if !heap.is_symbol(head) { return false; }
+        let name = syms.symbol_name(head).unwrap_or("");
+        match name {
+            "=" | "<" | ">" | "<=" | ">="
+            | "zero?" | "positive?" | "negative?" | "even?" | "odd?"
+            | "null?" | "pair?" | "number?" | "integer?" | "boolean?"
+            | "eq?" | "eqv?" | "equal?" | "not"
+            | "char?" | "string?" | "vector?" | "symbol?" | "procedure?"
+            | "exact?" | "inexact?"
+            | "eof-object?" | "port?" | "input-port?" | "output-port?"
+            | "char-alphabetic?" | "char-numeric?" | "char-whitespace?"
+            | "char-upper-case?" | "char-lower-case?"
+            | "string=?" | "string<?" | "string>?" | "string<=?" | "string>=?"
+            | "char=?" | "char<?" | "char>?" | "char<=?" | "char>=?"
+            | "type-valid?" => true,
+            // and/or return the actual value, NOT necessarily a bool
+            _ => false,
+        }
+    }
+
+    /// Emit an expression as raw i64 (no Val wrapping).
+    /// Recurses through arithmetic — only wraps to Val at the outermost boundary.
+    fn emit_as_i64(&self, expr: Val, heap: &Heap, syms: &SymbolTable) -> String {
+        // Integer literal
+        if expr.is_fixnum() {
+            let n = expr.as_fixnum().unwrap();
+            if n < 0 {
+                return format!("({n}i64)");
+            }
+            return format!("{n}i64");
+        }
+        // Compound expression
+        if expr.is_rib() && heap.tag(expr) == table::T_PAIR {
+            let head = heap.car(expr);
+            if heap.is_symbol(head) {
+                let name = syms.symbol_name(head).unwrap_or("");
+                let rest = heap.cdr(expr);
+                match name {
+                    "+" | "*" => {
+                        let mut parts = Vec::new();
+                        let mut r = rest;
+                        while heap.is_pair(r) {
+                            parts.push(self.emit_as_i64(heap.car(r), heap, syms));
+                            r = heap.cdr(r);
+                        }
+                        let op = if name == "+" { " + " } else { " * " };
+                        return format!("({})", parts.join(op));
+                    }
+                    "-" => {
+                        let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                        if heap.cdr(rest) == Val::NIL {
+                            return format!("(-{a})");
+                        }
+                        let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
+                        return format!("({a} - {b})");
+                    }
+                    "/" | "quotient" => {
+                        let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                        let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
+                        return format!("({a} / {b})");
+                    }
+                    "remainder" | "modulo" => {
+                        let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                        let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
+                        return format!("({a} % {b})");
+                    }
+                    "abs" => {
+                        let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                        return format!("({a}).abs()");
+                    }
+                    "max" => {
+                        let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                        let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
+                        return format!("({a}).max({b})");
+                    }
+                    "min" => {
+                        let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                        let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
+                        return format!("({a}).min({b})");
+                    }
+                    "if" => {
+                        let test = heap.car(rest);
+                        let r2 = heap.cdr(rest);
+                        let conseq = heap.car(r2);
+                        let alt_list = heap.cdr(r2);
+                        if self.is_fixnum_expr(conseq, heap, syms)
+                            && heap.is_pair(alt_list)
+                            && self.is_fixnum_expr(heap.car(alt_list), heap, syms)
+                        {
+                            let tc = self.emit_test(test, heap, syms);
+                            let c = self.emit_as_i64(conseq, heap, syms);
+                            let a = self.emit_as_i64(heap.car(alt_list), heap, syms);
+                            return format!("if {tc} {{ {c} }} else {{ {a} }}");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Fallback: emit as Val and unwrap
+        let val_code = self.emit_expr_inline(expr, heap, syms);
+        format!("{val_code}.as_fixnum().unwrap()")
+    }
+
+    /// Emit an expression as raw Rust bool (no bool_to_val wrapping).
+    fn emit_as_bool(&self, expr: Val, heap: &Heap, syms: &SymbolTable) -> String {
+        if !expr.is_rib() || heap.tag(expr) != table::T_PAIR {
+            // Fallback
+            let val_code = self.emit_expr_inline(expr, heap, syms);
+            return format!("is_true({val_code})");
+        }
+        let head = heap.car(expr);
+        if !heap.is_symbol(head) {
+            let val_code = self.emit_expr_inline(expr, heap, syms);
+            return format!("is_true({val_code})");
+        }
+        let name = syms.symbol_name(head).unwrap_or("");
+        let rest = heap.cdr(expr);
+        match name {
+            "=" | "<" | ">" | "<=" | ">=" => {
+                let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
+                let op = match name { "=" => "==", _ => name };
+                format!("({a} {op} {b})")
+            }
+            "zero?" => {
+                let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                format!("({a} == 0)")
+            }
+            "positive?" => {
+                let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                format!("({a} > 0)")
+            }
+            "negative?" => {
+                let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                format!("({a} < 0)")
+            }
+            "even?" => {
+                let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                format!("({a} % 2 == 0)")
+            }
+            "odd?" => {
+                let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                format!("({a} % 2 != 0)")
+            }
+            "null?" => {
+                let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                format!("({a} == Val::NIL)")
+            }
+            "pair?" => {
+                let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                format!("({a} != Val::NIL && !{a}.is_fixnum() && unsafe {{ HEAP[{a}.as_rib()].tag == TAG_PAIR }})")
+            }
+            "number?" | "integer?" => {
+                let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                format!("({a}.is_fixnum())")
+            }
+            "boolean?" => {
+                let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                format!("({a} == TRUE_VAL || {a} == FALSE_VAL)")
+            }
+            "eq?" | "eqv?" => {
+                let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                format!("({a} == {b})")
+            }
+            "not" => {
+                let inner = heap.car(rest);
+                if self.is_bool_expr(inner, heap, syms) {
+                    format!("(!{})", self.emit_as_bool(inner, heap, syms))
+                } else {
+                    let a = self.emit_expr_inline(inner, heap, syms);
+                    format!("(!is_true({a}))")
+                }
+            }
+            "symbol?" => {
+                let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                format!("(!{a}.is_fixnum() && {a} != Val::NIL && unsafe {{ HEAP[{a}.as_rib()].tag == 13 }})")
+            }
+            "procedure?" => {
+                let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                format!("(!{a}.is_fixnum() && {a} != Val::NIL && unsafe {{ HEAP[{a}.as_rib()].tag == TAG_CLS }})")
+            }
+            "exact?" => {
+                let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                format!("({a}.is_fixnum())")
+            }
+            "inexact?" => {
+                let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                format!("(!{a}.is_fixnum())")
+            }
+            "char?" => {
+                let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                format!("is_char({a})")
+            }
+            "string?" => {
+                let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                format!("is_string({a})")
+            }
+            "vector?" => {
+                let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                format!("is_vector({a})")
+            }
+            "eof-object?" => {
+                let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                format!("({a} == EOF_VAL)")
+            }
+            _ => {
+                // Fallback: emit as Val and test
+                let val_code = self.emit_expr_inline(expr, heap, syms);
+                format!("is_true({val_code})")
+            }
+        }
+    }
+
+    /// Emit a conditional test: raw bool if possible, otherwise is_true(val).
+    fn emit_test(&self, expr: Val, heap: &Heap, syms: &SymbolTable) -> String {
+        if self.is_bool_expr(expr, heap, syms) {
+            self.emit_as_bool(expr, heap, syms)
+        } else {
+            let val_code = self.emit_expr_inline(expr, heap, syms);
+            format!("is_true({val_code})")
+        }
+    }
+
     /// Emit an expression as an inline Rust expression (no trailing newline).
     fn emit_expr_inline(&self, expr: Val, heap: &Heap, syms: &SymbolTable) -> String {
         if expr.is_fixnum() {
@@ -2486,35 +2740,31 @@ impl Compiler {
             let name = syms.symbol_name(head).unwrap_or("");
             match name {
                 "+" | "*" => {
-                    let mut args = Vec::new();
+                    let mut parts = Vec::new();
                     let mut r = rest;
                     while heap.is_pair(r) {
-                        args.push(self.emit_expr_inline(heap.car(r), heap, syms));
+                        parts.push(self.emit_as_i64(heap.car(r), heap, syms));
                         r = heap.cdr(r);
                     }
-                    let op = if name == "+" { "+" } else { "*" };
-                    let chain = args.iter()
-                        .map(|a| format!("{a}.as_fixnum().unwrap()"))
-                        .collect::<Vec<_>>()
-                        .join(&format!(" {op} "));
-                    return format!("Val::fixnum({chain})");
+                    let op = if name == "+" { " + " } else { " * " };
+                    return format!("Val::fixnum({})", parts.join(op));
                 }
                 "-" | "/" | "quotient" | "remainder" | "modulo" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let a = self.emit_as_i64(heap.car(rest), heap, syms);
                     if name == "-" && heap.cdr(rest) == Val::NIL {
-                        return format!("Val::fixnum(-{a}.as_fixnum().unwrap())");
+                        return format!("Val::fixnum(-{a})");
                     }
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
                     let op = match name { "-" => "-", "/" | "quotient" => "/",
                                           "remainder" | "modulo" => "%", _ => "-" };
-                    return format!("Val::fixnum({a}.as_fixnum().unwrap() {op} {b}.as_fixnum().unwrap())");
+                    return format!("Val::fixnum({a} {op} {b})");
                 }
                 "=" | "<" | ">" | "<=" | ">=" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                    let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
                     let op = match name { "=" => "==", "<" => "<", ">" => ">",
                                           "<=" => "<=", ">=" => ">=", _ => "==" };
-                    return format!("bool_to_val({a}.as_fixnum().unwrap() {op} {b}.as_fixnum().unwrap())");
+                    return format!("bool_to_val({a} {op} {b})");
                 }
                 "cons" => {
                     let car_expr = heap.car(rest);
@@ -2546,7 +2796,7 @@ impl Compiler {
                     return format!("cdr({a})");
                 }
                 "if" => {
-                    let test = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let test = self.emit_test(heap.car(rest), heap, syms);
                     let r2 = heap.cdr(rest);
                     let saved_slots = self.gc_slots.borrow().clone();
                     let c = self.emit_expr_inline(heap.car(r2), heap, syms);
@@ -2558,7 +2808,7 @@ impl Compiler {
                         "Val::NIL".to_string()
                     };
                     *self.gc_slots.borrow_mut() = saved_slots;
-                    return format!("if is_true({test}) {{ {c} }} else {{ {a} }}");
+                    return format!("if {test} {{ {c} }} else {{ {a} }}");
                 }
                 "null?" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
@@ -2573,27 +2823,31 @@ impl Compiler {
                     return format!("bool_to_val({a}.is_fixnum())");
                 }
                 "zero?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("bool_to_val({a}.as_fixnum() == Some(0))");
+                    let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                    return format!("bool_to_val({a} == 0)");
                 }
                 "positive?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("bool_to_val({a}.as_fixnum().map_or(false, |n| n > 0))");
+                    let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                    return format!("bool_to_val({a} > 0)");
                 }
                 "negative?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("bool_to_val({a}.as_fixnum().map_or(false, |n| n < 0))");
+                    let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                    return format!("bool_to_val({a} < 0)");
                 }
                 "even?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("bool_to_val({a}.as_fixnum().unwrap() % 2 == 0)");
+                    let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                    return format!("bool_to_val({a} % 2 == 0)");
                 }
                 "odd?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("bool_to_val({a}.as_fixnum().unwrap() % 2 != 0)");
+                    let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                    return format!("bool_to_val({a} % 2 != 0)");
                 }
                 "not" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let inner = heap.car(rest);
+                    if self.is_bool_expr(inner, heap, syms) {
+                        return format!("bool_to_val(!{})", self.emit_as_bool(inner, heap, syms));
+                    }
+                    let a = self.emit_expr_inline(inner, heap, syms);
                     return format!("bool_to_val(!is_true({a}))");
                 }
                 "eq?" | "eqv?" => {
@@ -2602,18 +2856,18 @@ impl Compiler {
                     return format!("bool_to_val({a} == {b})");
                 }
                 "abs" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("Val::fixnum({a}.as_fixnum().unwrap().abs())");
+                    let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                    return format!("Val::fixnum(({a}).abs())");
                 }
                 "max" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("Val::fixnum({a}.as_fixnum().unwrap().max({b}.as_fixnum().unwrap()))");
+                    let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                    let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("Val::fixnum(({a}).max({b}))");
                 }
                 "min" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("Val::fixnum({a}.as_fixnum().unwrap().min({b}.as_fixnum().unwrap()))");
+                    let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                    let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("Val::fixnum(({a}).min({b}))");
                 }
                 "length" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
@@ -2669,9 +2923,9 @@ impl Compiler {
                     return self.emit_or_chain(&parts);
                 }
                 "gcd" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{{ let (mut a, mut b) = ({a}.as_fixnum().unwrap().abs(), {b}.as_fixnum().unwrap().abs()); while b != 0 {{ let t = b; b = a % b; a = t; }} Val::fixnum(a) }}");
+                    let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                    let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{{ let (mut a, mut b) = (({a}).abs(), ({b}).abs()); while b != 0 {{ let t = b; b = a % b; a = t; }} Val::fixnum(a) }}");
                 }
                 "set!" => {
                     let var = heap.car(rest);
@@ -2776,8 +3030,8 @@ impl Compiler {
                     return format!("char_to_integer({a})");
                 }
                 "integer->char" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    return format!("make_char({a}.as_fixnum().unwrap())");
+                    let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                    return format!("make_char({a})");
                 }
                 "char?" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
@@ -2928,24 +3182,24 @@ impl Compiler {
                     return format!("bool_to_val(!{a}.is_fixnum())");
                 }
                 "expt" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("Val::fixnum({a}.as_fixnum().unwrap().pow({b}.as_fixnum().unwrap() as u32))");
+                    let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                    let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("Val::fixnum(({a}).pow(({b}) as u32))");
                 }
                 "lcm" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("{{ let (a, b) = ({a}.as_fixnum().unwrap().abs(), {b}.as_fixnum().unwrap().abs()); if a == 0 || b == 0 {{ Val::fixnum(0) }} else {{ let (mut x, mut y) = (a, b); while y != 0 {{ let t = y; y = x % y; x = t; }} Val::fixnum(a / x * b) }} }}");
+                    let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                    let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("{{ let (a, b) = (({a}).abs(), ({b}).abs()); if a == 0 || b == 0 {{ Val::fixnum(0) }} else {{ let (mut x, mut y) = (a, b); while y != 0 {{ let t = y; y = x % y; x = t; }} Val::fixnum(a / x * b) }} }}");
                 }
                 "list-ref" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("list_ref({a}, {b}.as_fixnum().unwrap())");
+                    let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("list_ref({a}, {b})");
                 }
                 "list-tail" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("list_tail({a}, {b}.as_fixnum().unwrap())");
+                    let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("list_tail({a}, {b})");
                 }
                 "apply" => {
                     let f = self.emit_expr_inline(heap.car(rest), heap, syms);
@@ -2984,11 +3238,11 @@ impl Compiler {
                 }
                 // ── Vector operations ────────────
                 "make-vector" => {
-                    let n = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    let n = self.emit_as_i64(heap.car(rest), heap, syms);
                     let fill = if heap.is_pair(heap.cdr(rest)) {
                         self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms)
                     } else { "Val::fixnum(0)".to_string() };
-                    return format!("make_vector_fill({n}.as_fixnum().unwrap(), {fill})");
+                    return format!("make_vector_fill({n}, {fill})");
                 }
                 "vector-length" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
@@ -2996,21 +3250,21 @@ impl Compiler {
                 }
                 "vector-ref" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("vector_ref({a}, {b}.as_fixnum().unwrap())");
+                    let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("vector_ref({a}, {b})");
                 }
                 "vector-set!" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
+                    let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
                     let c = self.emit_expr_inline(heap.car(heap.cdr(heap.cdr(rest))), heap, syms);
                     // In Cheney mode, always protect vector — the value expr
                     // may allocate even when analysis says otherwise (e.g.
                     // first-class builtins compile to make_closure).
                     if self.is_cheney() {
                         let slot = self.next_gc_slot();
-                        return format!("{{ let {slot} = gc_push({a}); let __val = {c}; vector_set(gc_load({slot}), {b}.as_fixnum().unwrap(), __val); Val::NIL }}");
+                        return format!("{{ let {slot} = gc_push({a}); let __val = {c}; vector_set(gc_load({slot}), {b}, __val); Val::NIL }}");
                     }
-                    return format!("{{ vector_set({a}, {b}.as_fixnum().unwrap(), {c}); Val::NIL }}");
+                    return format!("{{ vector_set({a}, {b}, {c}); Val::NIL }}");
                 }
                 "vector?" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
@@ -3026,18 +3280,18 @@ impl Compiler {
                 }
                 // ── Algebra extension ────────────
                 "dot" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("Val::fixnum(CAYLEY[{a}.as_fixnum().unwrap() as usize][{b}.as_fixnum().unwrap() as usize] as i64)");
+                    let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                    let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("Val::fixnum(CAYLEY[{a} as usize][{b} as usize] as i64)");
                 }
                 "tau" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
                     return format!("tau({a})");
                 }
                 "type-valid?" => {
-                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
-                    let b = self.emit_expr_inline(heap.car(heap.cdr(rest)), heap, syms);
-                    return format!("bool_to_val(CAYLEY[{a}.as_fixnum().unwrap() as usize][{b}.as_fixnum().unwrap() as usize] != TAG_BOT)");
+                    let a = self.emit_as_i64(heap.car(rest), heap, syms);
+                    let b = self.emit_as_i64(heap.car(heap.cdr(rest)), heap, syms);
+                    return format!("bool_to_val(CAYLEY[{a} as usize][{b} as usize] != TAG_BOT)");
                 }
                 // ── R7RS: values / call-with-values ────
                 "values" => {
@@ -3169,11 +3423,11 @@ impl Compiler {
                             }
                             if !first { out.push_str(" }"); }
                         } else {
-                            let test_code = self.emit_expr_inline(test, heap, syms);
+                            let test_code = self.emit_test(test, heap, syms);
                             if first {
-                                out.push_str(&format!("if is_true({test_code}) {{ "));
+                                out.push_str(&format!("if {test_code} {{ "));
                             } else {
-                                out.push_str(&format!(" else if is_true({test_code}) {{ "));
+                                out.push_str(&format!(" else if {test_code} {{ "));
                             }
                             let mut parts = Vec::new();
                             let mut r = clause_body;
@@ -3461,8 +3715,8 @@ impl Compiler {
                     out.push_str("loop { ");
 
                     // Test
-                    let test_code = self.emit_expr_inline(test_expr, heap, syms);
-                    out.push_str(&format!("if is_true({test_code}) {{ break "));
+                    let test_code = self.emit_test(test_expr, heap, syms);
+                    out.push_str(&format!("if {test_code} {{ break "));
                     // Result expressions
                     let mut rparts = Vec::new();
                     let mut r = result_exprs;
@@ -3589,12 +3843,12 @@ impl Compiler {
             }
 
             *self.gc_slots.borrow_mut() = saved_slots.clone();
-            let test_code = self.emit_expr_inline(test, heap, syms);
+            let test_code = self.emit_test(test, heap, syms);
             if first {
-                out.push_str(&format!("{pad}if is_true({test_code}) {{\n"));
+                out.push_str(&format!("{pad}if {test_code} {{\n"));
                 first = false;
             } else {
-                out.push_str(&format!("{pad}}} else if is_true({test_code}) {{\n"));
+                out.push_str(&format!("{pad}}} else if {test_code} {{\n"));
             }
             out.push_str(&self.emit_begin(body, heap, syms, indent + 1));
             clauses = heap.cdr(clauses);
@@ -3724,8 +3978,8 @@ impl Compiler {
         }
 
         // Test
-        let test_code = self.emit_expr_inline(test_expr, heap, syms);
-        out.push_str(&format!("{pad}        if is_true({test_code}) {{ break\n"));
+        let test_code = self.emit_test(test_expr, heap, syms);
+        out.push_str(&format!("{pad}        if {test_code} {{ break\n"));
         out.push_str(&self.emit_begin(result_exprs, heap, syms, indent + 3));
         out.push_str(&format!("{pad}        }}\n"));
 
@@ -5389,8 +5643,8 @@ mod tests {
     #[test]
     fn compile_arithmetic() {
         let code = compile("(display (+ 3 4))");
-        assert!(code.contains("Val::fixnum(3)"));
-        assert!(code.contains("Val::fixnum(4)"));
+        // With type inference, (+ 3 4) emits Val::fixnum(3i64 + 4i64)
+        assert!(code.contains("Val::fixnum(3i64 + 4i64)"));
     }
 
     #[test]
