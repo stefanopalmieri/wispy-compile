@@ -92,3 +92,86 @@ on a known Scheme program eliminates the interpreter and produces output competi
 with `compile.rs`. That depends on whether the specializer handles closures and
 higher-order functions without diverging — a general partial evaluation problem that
 the algebra does not predetermine.
+
+## Research Program: Formally Proving P3
+
+The right order of attack is Psi Lisp first, then WispyScheme. The reasons are structural,
+not just difficulty.
+
+### Why Psi Lisp First
+
+In Psi Lisp, values *are* algebra elements. There is no separate heap, no closures in the
+traditional sense, no GC. A formal operational semantics has type `eval : Program → Env → Value`
+where `Value = AlgebraElement` — already in Lean. The gap between the algebra proofs and
+the language semantics is as small as it can be.
+
+The Q/E retraction theorems are not just background facts for Psi Lisp: they are the
+semantics of quote and eval in the language. The absorber theorems describe what happens
+when you apply `nil` or `#f`. The existing 130+ Lean theorems in DistinctionStructures/Kamea
+are closer to being a formal semantics of the language than they are for any other target.
+
+For WispyScheme, values are ribs on a heap. The algebra types them but does not compute
+them. A formal semantics must model the heap separately — a significant additional layer
+that the algebra theorems do not reach.
+
+### The Proof Structure
+
+**Step 1: Operational semantics of Psi Lisp in Lean**
+
+Formalize `eval` over the 16-element algebra. Values are algebra elements; environments
+are association lists of element bindings; programs are quoted S-expressions encoded in
+the algebra. This is tractable because the value domain is finite and already in Lean.
+
+**Step 2: Formalize the metacircular evaluator**
+
+`psi_metacircular.lisp` (DistinctionStructures) is already defunctionalized CPS —
+continuations are explicit tagged data structures with 14 named types, not closures.
+There is a body of literature on formally reasoning about defunctionalized interpreters
+(Danvy, Reynolds). Prove the metacircular evaluator equivalent to the direct semantics
+from Step 1.
+
+Defunctionalized CPS is the right shape for a Lean formalization: you are reasoning
+about a concrete inductive data type, not fighting with closure semantics.
+
+**Step 3: Specializer correctness**
+
+State and prove the specializer correct with respect to the Step 1 semantics:
+
+```
+∀ prog partialEnv completeEnv,
+  extends completeEnv partialEnv →
+  eval (specialize prog partialEnv) completeEnv = eval prog completeEnv
+```
+
+This is where the algebra theorems become load-bearing for the *proof*, not just the
+*implementation*: the constant-folding reductions in `specialize.scm` are justified by
+the Cayley table's algebraic properties, which are already proved in Lean.
+
+**Step 4: P3 as a corollary**
+
+Given Step 3, P3 — `specialize(specialize, interpreter)` computes the same results as
+`interpreter` for all inputs — follows as a corollary by instantiating the correctness
+theorem with the interpreter as the program and the specializer as the environment.
+
+### What This Would Tell Us
+
+If Step 3 goes through, the proof will have identified exactly which properties of the
+algebra the specializer correctness argument depends on. That is a precise characterization
+of what WispyScheme needs to inherit from its algebra for the proof to scale.
+
+Formally proved P3 for any language would be a new result. The combination —
+formally proved P3, grounded in a Lean-verified finite algebra, for a language whose
+operational semantics is the algebra itself — would be a publishable contribution
+independent of the WispyScheme engineering work.
+
+### Scaling to WispyScheme
+
+After Psi Lisp, the additional steps for WispyScheme are:
+
+1. Formalize rib heap semantics in Lean (the algebra types ribs; the heap computes them)
+2. Show the algebra's type dispatch theorems are the typing rules for rib operations
+3. Re-run the specializer correctness argument at the rib level
+
+Steps 2 and 3 would reuse the proof structure from Psi Lisp. Step 1 is the new work —
+and knowing exactly what properties the Psi Lisp proof required tells you what the rib
+heap formalization needs to provide.
