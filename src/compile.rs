@@ -2680,6 +2680,14 @@ impl Compiler {
                     return self.emit_datum(datum, heap, syms);
                 }
                 // ── String / char builtins ────────────
+                "symbol->string" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("symbol_to_string({a})");
+                }
+                "symbol?" => {
+                    let a = self.emit_expr_inline(heap.car(rest), heap, syms);
+                    return format!("bool_to_val(!{a}.is_fixnum() && {a} != Val::NIL && unsafe {{ HEAP[{a}.as_rib()].tag == 13 }})");
+                }
                 "string-length" => {
                     let a = self.emit_expr_inline(heap.car(rest), heap, syms);
                     return format!("string_length({a})");
@@ -3743,10 +3751,9 @@ impl Compiler {
             return "Val::NIL".to_string();
         }
         if heap.is_symbol(datum) {
-            // Quoted symbol — for now, emit as a fixnum hash
+            // Quoted symbol — emit as interned symbol rib
             let name = syms.symbol_name(datum).unwrap_or("_");
-            let hash = name.bytes().fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
-            return format!("Val::fixnum({hash}) /* '{name} */");
+            return format!("intern_symbol(\"{name}\")");
         }
         if heap.tag(datum) == table::T_STR {
             return self.emit_string_rib(datum, heap);
@@ -3872,6 +3879,7 @@ impl Val {
 struct Rib { car: Val, cdr: Val, tag: u8 }
 
 static mut HEAP: Vec<Rib> = Vec::new();
+static mut SYM_TABLE: Vec<Val> = Vec::new();
 
 // Rib 0 = nil/'(), rib 1 = #f (BOT), rib 2 = #t
 const FALSE_VAL: Val = Val(1 << 1); // rib index 1
@@ -3881,6 +3889,7 @@ const EOF_VAL: Val = Val(3 << 1);  // rib index 3
 
 fn heap_init() {
     unsafe { HEAP = Vec::with_capacity(65536);
+             SYM_TABLE = Vec::with_capacity(256);
              HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: TAG_TOP });  // rib 0: nil
              HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: TAG_BOT });  // rib 1: #f
              HEAP.push(Rib { car: Val::NIL, cdr: Val::NIL, tag: 20 });       // rib 2: #t
@@ -4073,6 +4082,56 @@ fn make_string_fill(n: Val, fill: Val) -> Val {
     make_string(chars, Val::fixnum(len))
 }
 
+// ── Symbol interning ───────────────────────────────────────────
+
+fn make_string_from_str(s: &str) -> Val {
+    let mut chars = Val::NIL;
+    for c in s.bytes().rev() {
+        chars = cons(Val::fixnum(c as i64), chars);
+    }
+    make_string(chars, Val::fixnum(s.len() as i64))
+}
+
+fn intern_symbol(name: &str) -> Val {
+    unsafe {
+        for &sym in &SYM_TABLE {
+            let sym_str = HEAP[sym.as_rib()].car;
+            if string_eq_str(sym_str, name) {
+                return sym;
+            }
+        }
+        let s = make_string_from_str(name);
+        let sym = alloc_rib(s, Val::NIL, 13); // 13 = TAG_SYM
+        SYM_TABLE.push(sym);
+        sym
+    }
+}
+
+fn string_eq_str(str_val: Val, s: &str) -> bool {
+    unsafe {
+        if str_val.is_fixnum() || str_val == Val::NIL { return s.is_empty(); }
+        let rib = &HEAP[str_val.as_rib()];
+        if rib.tag != TAG_STR { return false; }
+        let len = rib.cdr.as_fixnum().unwrap_or(-1);
+        if len != s.len() as i64 { return false; }
+        let mut chars = rib.car;
+        for b in s.bytes() {
+            if chars == Val::NIL || chars.is_fixnum() { return false; }
+            let cp = HEAP[chars.as_rib()].car.as_fixnum().unwrap_or(-1);
+            if cp != b as i64 { return false; }
+            chars = HEAP[chars.as_rib()].cdr;
+        }
+        chars == Val::NIL || chars.is_fixnum()
+    }
+}
+
+fn symbol_to_string(sym: Val) -> Val {
+    unsafe {
+        if sym.is_fixnum() || sym == Val::NIL { return make_string_from_str(""); }
+        HEAP[sym.as_rib()].car
+    }
+}
+
 fn char_to_integer(c: Val) -> Val {
     if is_char(c) { car(c) } else { Val::fixnum(0) }
 }
@@ -4196,6 +4255,19 @@ fn display(v: Val) {
                     display(HEAP[base + 1 + i].car);
                 }
                 print!(")");
+            } else if rib.tag == 13 {
+                // TAG_SYM — display the symbol name
+                let name_str = rib.car;
+                if !name_str.is_fixnum() && name_str != Val::NIL && HEAP[name_str.as_rib()].tag == TAG_STR {
+                    let mut chars = HEAP[name_str.as_rib()].car;
+                    while chars != Val::NIL && !chars.is_fixnum() {
+                        let cp = HEAP[chars.as_rib()].car.as_fixnum().unwrap_or(0);
+                        print!("{}", cp as u8 as char);
+                        chars = HEAP[chars.as_rib()].cdr;
+                    }
+                } else {
+                    print!("<sym>");
+                }
             } else if rib.tag == TAG_BOT {
                 print!("{}{}", '\x23', 'f');
             } else if rib.tag == 20 {
@@ -4376,6 +4448,9 @@ fn display_to(v: Val, w: &mut dyn std::io::Write) {
                     let _ = write!(w, "{}", cp as u8 as char);
                     chars = HEAP[chars.as_rib()].cdr;
                 }
+            } else if rib.tag == 13 {
+                // symbol — display the name
+                display_to(rib.car, w);
             } else {
                 let _ = write!(w, "<object>");
             }
@@ -4771,12 +4846,7 @@ fn scheme_read_port(r: &mut dyn std::io::BufRead) -> Val {
         b'\'' => {
             r.consume(1);
             let datum = scheme_read_port(r);
-            // Build (quote datum)
-            let q_chars = Val::NIL;
-            let q_str = rust_string_to_val("quote");
-            // Use a fixnum hash for the symbol (same as compiler's quoted symbols)
-            let hash = "quote".bytes().fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
-            let qsym = Val::fixnum(hash);
+            let qsym = intern_symbol("quote");
             cons(qsym, cons(datum, Val::NIL))
         }
         // Hash: #t, #f, #\char
@@ -4852,9 +4922,7 @@ fn scheme_read_port(r: &mut dyn std::io::BufRead) -> Val {
         _ => {
             let mut s = String::new();
             read_symbol_into(r, &mut s);
-            // Return as a fixnum hash (same encoding as compiler's quoted symbols)
-            let hash = s.bytes().fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
-            Val::fixnum(hash)
+            intern_symbol(&s)
         }
     }
 }
@@ -4951,8 +5019,7 @@ fn read_symbol_into(r: &mut dyn std::io::BufRead, s: &mut String) {
 fn read_symbol_rest(r: &mut dyn std::io::BufRead, prefix: &str) -> Val {
     let mut s = prefix.to_string();
     read_symbol_into(r, &mut s);
-    let hash = s.bytes().fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
-    Val::fixnum(hash)
+    intern_symbol(&s)
 }
 
 fn skip_atom_tail(r: &mut dyn std::io::BufRead) {
@@ -5011,6 +5078,7 @@ const FORWARDED: u8 = 255;         // sentinel tag for forwarding pointers
 static mut HEAP: Vec<Rib> = Vec::new();      // active space
 static mut HEAP_ALT: Vec<Rib> = Vec::new();  // inactive space
 static mut ALLOC_PTR: usize = RESERVED;      // next free index in active space
+static mut SYM_TABLE: Vec<Val> = Vec::new();
 
 // ── GC root tracking ────────────────────────────────────────────
 
@@ -5060,6 +5128,7 @@ fn heap_init() {
         HEAP[3] = Rib { car: Val::NIL, cdr: Val::NIL, tag: TAG_EOF };  // eof
         GC_GLOBALS = Vec::with_capacity(64);
         GC_STACK = Vec::with_capacity(4096);
+        SYM_TABLE = Vec::with_capacity(256);
         PORTS = Vec::with_capacity(16);
         PORTS.push(PortInner::Stdin(std::io::BufReader::new(std::io::stdin())));
         PORTS.push(PortInner::Stdout);
@@ -5141,6 +5210,11 @@ fn gc_collect() {
         // Copy roots: shadow stack
         for i in 0..GC_STACK.len() {
             GC_STACK[i] = gc_copy_val(GC_STACK[i]);
+        }
+
+        // Copy roots: symbol table
+        for i in 0..SYM_TABLE.len() {
+            SYM_TABLE[i] = gc_copy_val(SYM_TABLE[i]);
         }
 
         // Cheney scan: breadth-first copy of reachable objects
