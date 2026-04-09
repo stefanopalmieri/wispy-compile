@@ -1851,23 +1851,23 @@ fn trampoline(func: Val, args: &[Val]) -> Val {
         match action {
             Action::Halt(v) => return v,
             Action::Call1(f, a) => {
-                action = if unsafe { GC_BUDGET == 0 } {
+                action = if unsafe { GC_BUDGET == 0 && GC_DEPTH == 0 } {
                     let mut r = [f, a]; cheney_gc(&mut r); dispatch_cps(r[0], &[r[1]])
                 } else { dispatch_cps(f, &[a]) };
             }
             Action::Call2(f, a, b) => {
-                action = if unsafe { GC_BUDGET == 0 } {
+                action = if unsafe { GC_BUDGET == 0 && GC_DEPTH == 0 } {
                     let mut r = [f, a, b]; cheney_gc(&mut r); dispatch_cps(r[0], &[r[1], r[2]])
                 } else { dispatch_cps(f, &[a, b]) };
             }
             Action::Call3(f, a, b, c) => {
-                action = if unsafe { GC_BUDGET == 0 } {
+                action = if unsafe { GC_BUDGET == 0 && GC_DEPTH == 0 } {
                     let mut r = [f, a, b, c]; cheney_gc(&mut r); dispatch_cps(r[0], &[r[1], r[2], r[3]])
                 } else { dispatch_cps(f, &[a, b, c]) };
             }
             Action::CallN(ref f_ref, ref args_ref) => {
                 let f = *f_ref; let args = args_ref.clone();
-                action = if unsafe { GC_BUDGET == 0 } {
+                action = if unsafe { GC_BUDGET == 0 && GC_DEPTH == 0 } {
                     let mut live: Vec<Val> = std::iter::once(f).chain(args.iter().copied()).collect();
                     cheney_gc(&mut live);
                     let mut new_args = args.clone();
