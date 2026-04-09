@@ -152,9 +152,13 @@ cargo check --no-default-features --lib
 
 ## Self-Hosted Compiler
 
-`examples/rsc.scm` is a self-hosted Scheme→Rust compiler written in Scheme (~1600 lines). It uses a CPS + closure conversion pipeline based on Feeley's 90-minute Scheme-to-C compiler: all function calls become tail calls through a trampoline, closures are lambda-lifted with cons-list environments, and every continuation's free variables are the precise live set.
+`examples/rsc.scm` is a self-hosted Scheme→Rust compiler written in Scheme (~2200 lines). It uses a CPS + closure conversion pipeline based on Feeley's 90-minute Scheme-to-C compiler: all function calls become tail calls through a trampoline, closures are lambda-lifted with cons-list environments, and every continuation's free variables are the precise live set.
 
 The compiler reaches a **fixed point** at generation 2: the self-compiled binary produces identical output when compiling itself again. Bootstraps through [wispy-vm](https://github.com/stefanopalmieri/wispy-vm).
+
+**GC:** rsc.scm emits a semi-space Cheney GC driven by a `GC_BUDGET` countdown — no shadow stack needed. Between trampoline steps only `f` + args are live; CPS makes the root set explicit. A generated `gc_roots_visit` visits all global vars and interned datums. A `GC_DEPTH` guard prevents GC from firing inside `scheme_map`/`scheme_for_each` where outer stack frames hold stale pointers.
+
+**Known-call optimization:** When a tail call targets a compile-time-known global function, rsc.scm emits `__lambda_N(Val::NIL, args...)` directly, eliminating one `alloc_rib` (closure rib), one `Action` construction, and one `dispatch_cps` call per site. This gives 3.4× speedup on tak and 11% on fib.
 
 ```bash
 # Compile a program (wispy-vm as host)
@@ -175,7 +179,7 @@ rustc -O -o /tmp/rsc /tmp/rsc.rs
 
 **Pipeline:** S-expression → AST (tagged lists) → CPS conversion → lambda lifting / closure conversion → Rust emission (trampoline + `dispatch_cps` + `__lambda_N` functions).
 
-Remaining work: Cheney GC via CPS roots, optimization passes (type inference, inlining), and wiring the specializer output into the P3 transpiler.
+Passes 9 of 12 r7rs-benchmarks (fib, sum, ack, tak, takl, nqueens, diviter, deriv, primes). Remaining work: type inference / fixnum propagation, continuation inlining, `call/cc`, multiple return values, macros, and wiring the specializer output into the P3 transpiler.
 
 ## Algebraic IR and Transpiler
 
@@ -231,7 +235,6 @@ wispy -e '(load "examples/ir-lib.scm") (load "examples/transpile.scm")'
 
 ## Future Work
 
-- **Cheney GC in the self-hosted compiler.** CPS makes GC root tracking systematic — every continuation's free variables are the precise live set. No shadow stack needed.
 - **Futamura P3.** `specialize.scm` (wispy-vm) already produces Lam/App-free residual IR from a known program; `transpile.scm` already renders that IR as Rust. The remaining step is wiring the two: run `transpile-main` on the output of `specialize`, yielding a residual Rust program with zero interpreter overhead.
 - **Type inference / specialization.** Propagating type information through the call graph would eliminate runtime type checks on provably-fixnum paths.
 - **Cross-function inlining.** Inlining small closures at call sites would eliminate the `dispatch_cps` indirect dispatch.
