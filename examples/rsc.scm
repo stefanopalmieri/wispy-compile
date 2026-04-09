@@ -1122,47 +1122,73 @@
 ;; ── Emit a tail-position expression (returns Action) ──
 
 ;; Emit a tail call: all-parts = (fn arg1 arg2 ...)
+;; Emit direct call to a known lambda or continuation, bypassing Action + dispatch.
+;; __lambda_N(env, arg0, arg1, ...) or __cont_N(env, val)
+(define (emit-direct-call prefix id free-vars args)
+  (emit prefix) (emit id) (emit "(")
+  (emit-env-build free-vars)
+  (for-each (lambda (a) (emit ", ") (emit-val a)) args)
+  (emit ")"))
+
 (define (emit-tail-call all-parts)
   (let ((fn (car all-parts))
         (args (cdr all-parts))
         (nargs (- (length all-parts) 1)))
-    ;; Self-tail-call optimization: reassign params and continue
-    (if (and *in-self-loop* (self-call? fn))
-        (begin
-          ;; Evaluate all new arg values into temporaries first
-          ;; (to avoid order-of-evaluation issues with shared params)
-          (emit "{ ")
-          (let loop ((as args) (i 0))
-            (if (pair? as)
-                (begin
-                  (emit "let __t") (emit i) (emit " = ") (emit-val (car as)) (emit "; ")
-                  (loop (cdr as) (+ i 1)))))
-          ;; Reassign params from temporaries
-          (let loop ((ps (params-all *current-lambda-params*)) (i 0))
-            (if (pair? ps)
-                (begin
-                  (rust-ident (car ps)) (emit " = __t") (emit i) (emit "; ")
-                  (loop (cdr ps) (+ i 1)))))
-          (emit "continue; }"))
-        ;; Normal tail call → Action (with return if inside a loop)
-        (begin
-          (if *in-self-loop* (emit "return "))
-          (cond
-            ((= nargs 1)
-             (emit "Action::Call1(")
-             (emit-val fn) (emit ", ") (emit-val (car args)) (emit ")"))
-            ((= nargs 2)
-             (emit "Action::Call2(")
-             (emit-val fn) (emit ", ") (emit-val (car args))
-             (emit ", ") (emit-val (cadr args)) (emit ")"))
-            ((= nargs 3)
-             (emit "Action::Call3(")
-             (emit-val fn) (emit ", ") (emit-val (car args))
-             (emit ", ") (emit-val (cadr args))
-             (emit ", ") (emit-val (caddr args)) (emit ")"))
-            (else
-             (emit "Action::CallN(")
-             (emit-val fn) (emit ", vec![") (emit-val-list args) (emit "])")))))))
+    (cond
+      ;; Self-tail-call optimization: reassign params and continue
+      ((and *in-self-loop* (self-call? fn))
+       (emit "{ ")
+       (let loop ((as args) (i 0))
+         (if (pair? as)
+             (begin
+               (emit "let __t") (emit i) (emit " = ") (emit-val (car as)) (emit "; ")
+               (loop (cdr as) (+ i 1)))))
+       (let loop ((ps (params-all *current-lambda-params*)) (i 0))
+         (if (pair? ps)
+             (begin
+               (rust-ident (car ps)) (emit " = __t") (emit i) (emit "; ")
+               (loop (cdr ps) (+ i 1)))))
+       (emit "continue; }"))
+
+      ;; Known global function (compile-time lambda ID, no free vars):
+      ;; skip make_closure + Action::Call + dispatch_cps overhead
+      ((and (ref? fn) (assq (ref-var fn) *global-ids*))
+       (let ((id (cdr (assq (ref-var fn) *global-ids*))))
+         (if *in-self-loop* (emit "return "))
+         (emit "__lambda_") (emit id) (emit "(Val::NIL")
+         (for-each (lambda (a) (emit ", ") (emit-val a)) args)
+         (emit ")")))
+
+      ;; Known closure literal in function position (rare after CPS, but handle it):
+      ;; skip make_closure + Action + dispatch_cps
+      ((closure? fn)
+       (if *in-self-loop* (emit "return "))
+       (emit-direct-call "__lambda_" (closure-id fn) (closure-free fn) args))
+
+      ;; Known continuation literal in function position: skip make_cont + Action + apply_cont
+      ((cont-closure? fn)
+       (if *in-self-loop* (emit "return "))
+       (emit-direct-call "__cont_" (cont-closure-id fn) (cont-closure-free fn) args))
+
+      ;; Normal tail call → Action (with return if inside a loop)
+      (else
+       (if *in-self-loop* (emit "return "))
+       (cond
+         ((= nargs 1)
+          (emit "Action::Call1(")
+          (emit-val fn) (emit ", ") (emit-val (car args)) (emit ")"))
+         ((= nargs 2)
+          (emit "Action::Call2(")
+          (emit-val fn) (emit ", ") (emit-val (car args))
+          (emit ", ") (emit-val (cadr args)) (emit ")"))
+         ((= nargs 3)
+          (emit "Action::Call3(")
+          (emit-val fn) (emit ", ") (emit-val (car args))
+          (emit ", ") (emit-val (cadr args))
+          (emit ", ") (emit-val (caddr args)) (emit ")"))
+         (else
+          (emit "Action::CallN(")
+          (emit-val fn) (emit ", vec![") (emit-val-list args) (emit "])")))))))
 
 (define (emit-tail ast)
   (cond
