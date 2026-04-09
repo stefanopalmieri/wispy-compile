@@ -55,6 +55,12 @@
     (emit "__v_")
     (emit-ident-chars s 0)))
 
+(define (rust-i64-ident sym)
+  ;; Emit i64 loop parameter variable name (prefix __i_ instead of __v_)
+  (let ((s (if (symbol? sym) (symbol->string sym) sym)))
+    (emit "__i_")
+    (emit-ident-chars s 0)))
+
 (define (cadr x) (car (cdr x)))
 (define (caddr x) (car (cdr (cdr x))))
 (define (cadddr x) (car (cdr (cdr (cdr x)))))
@@ -675,6 +681,11 @@
 ;; Track which local variables are bound to closure nodes (for letrec patching)
 (define *closure-bindings* '())
 
+;; Type environment for fixnum propagation
+(define *fixnum-vars* '())     ;; vars known to hold i64 (from typed let bindings)
+(define *bool-vars* '())       ;; vars known to hold bool (from typed let bindings)
+(define *loop-i64-params* '()) ;; params unboxed as i64 at self-tail-call loop entry
+
 ;; Track current lambda for self-tail-call optimization
 (define *current-lambda-id* -1)
 (define *current-lambda-params* '())
@@ -726,6 +737,118 @@
      (has-self-tail-call? (car (reverse (seq-exprs ast)))))
     (else #f)))
 
+;; ── Type inference for fixnum propagation ──
+
+(define (infer-type ast)
+  ;; Returns 'fixnum, 'bool, or 'val for the type of a value expression
+  (cond
+    ((lit? ast)
+     (if (number? (lit-val ast)) 'fixnum 'val))
+    ((prim? ast)
+     (let ((op (prim-op ast)))
+       (cond
+         ((memq op '(+ - * quotient remainder modulo char->integer
+                     string-length vector-length length))
+          'fixnum)
+         ((memq op '(< > = <= >= zero? positive? negative?
+                     not null? number? pair? symbol? string? char?
+                     boolean? procedure? eof-object? eq? eqv? equal?))
+          'bool)
+         (else 'val))))
+    ((ref? ast)
+     (let ((name (ref-var ast)))
+       (cond
+         ((memq name *fixnum-vars*) 'fixnum)
+         ((memq name *bool-vars*) 'bool)
+         ((memq name *loop-i64-params*) 'fixnum)
+         (else 'val))))
+    (else 'val)))
+
+(define (arith-used-params body param-names)
+  ;; Find which params in param-names appear as direct operands to arithmetic prims.
+  ;; Uses union for dedup (avoids apply which is not in value position in rsc.scm).
+  (define (collect-list asts acc)
+    (if (null? asts) acc
+        (collect-list (cdr asts) (union (collect (car asts)) acc))))
+  (define (collect ast)
+    (cond
+      ((prim? ast)
+       (let ((op (prim-op ast)) (args (prim-args ast)))
+         (if (memq op '(+ - * quotient remainder modulo
+                        < > = <= >= zero? positive? negative?))
+             ;; Collect refs to params that are direct arithmetic args
+             (let loop ((as args) (acc '()))
+               (if (null? as) acc
+                   (let ((a (car as)))
+                     (loop (cdr as)
+                           (union
+                             (if (and (ref? a) (memq (ref-var a) param-names))
+                                 (list (ref-var a))
+                                 (collect a))
+                             acc)))))
+             ;; Other prims: recurse into all args
+             (collect-list args '()))))
+      ((if? ast)
+       (union (collect (if-test ast))
+              (union (collect (if-then ast))
+                     (collect (if-else ast)))))
+      ((app? ast)
+       (collect-list (app-args ast) '()))
+      ((seq? ast)
+       (collect-list (seq-exprs ast) '()))
+      (else '())))
+  (collect body))
+
+;; ── Emit expression as raw Rust bool (no is_true/bool_to_val wrapping) ──
+
+(define (emit-bool ast)
+  (cond
+    ((prim? ast)
+     (let ((op (prim-op ast)) (args (prim-args ast)))
+       (cond
+         ((memq op '(< > = <= >=))
+          (let ((rust-op (cond ((eq? op '<) " < ") ((eq? op '>) " > ")
+                               ((eq? op '=) " == ") ((eq? op '<=) " <= ")
+                               ((eq? op '>=) " >= "))))
+            (emit "(")
+            (emit-i64 (car args))
+            (emit rust-op)
+            (emit-i64 (cadr args))
+            (emit ")")))
+         ((eq? op 'zero?)
+          (emit "(") (emit-i64 (car args)) (emit " == 0)"))
+         ((eq? op 'positive?)
+          (emit "(") (emit-i64 (car args)) (emit " > 0)"))
+         ((eq? op 'negative?)
+          (emit "(") (emit-i64 (car args)) (emit " < 0)"))
+         ((eq? op 'not)
+          (emit "!(")
+          (emit-bool (car args))
+          (emit ")"))
+         ((eq? op 'null?)
+          (emit "(") (emit-val (car args)) (emit " == Val::NIL)"))
+         ((eq? op 'number?)
+          (emit "(") (emit-val (car args)) (emit ".is_fixnum())"))
+         ((memq op '(eq? eqv?))
+          (emit "(")
+          (emit-val (car args))
+          (emit " == ")
+          (emit-val (cadr args))
+          (emit ")"))
+         (else
+          (emit "is_true(") (emit-val ast) (emit ")")))))
+    ((ref? ast)
+     (cond
+       ((memq (ref-var ast) *bool-vars*)
+        (rust-ident (ref-var ast)))
+       (else
+        (emit "is_true(") (emit-val ast) (emit ")"))))
+    ((lit? ast)
+     (let ((v (lit-val ast)))
+       (if (eq? v #f) (emit "false") (emit "true"))))
+    (else
+     (emit "is_true(") (emit-val ast) (emit ")"))))
+
 ;; ── Emit a value expression (not in tail position) ──
 
 (define (emit-val ast)
@@ -753,6 +876,15 @@
             (emit "make_closure(") (emit (cdr gid)) (emit ", Val::NIL)"))
            ((memq name *globals*)
             (emit "unsafe { ") (emit-global-ident name) (emit " }"))
+           ;; Fixnum-typed let binding → box to Val
+           ((memq name *fixnum-vars*)
+            (emit "Val::fixnum(") (rust-ident name) (emit ")"))
+           ;; Loop i64 parameter → box to Val
+           ((memq name *loop-i64-params*)
+            (emit "Val::fixnum(") (rust-i64-ident name) (emit ")"))
+           ;; Bool-typed let binding → convert to Val
+           ((memq name *bool-vars*)
+            (emit "bool_to_val(") (rust-ident name) (emit ")"))
            (else
             (rust-ident name))))))
 
@@ -836,9 +968,9 @@
          (begin (emit "Val::NIL /* unexpected app in value position */"))))
 
     ((if? ast)
-     (emit "if is_true(")
-     (emit-val (if-test ast))
-     (emit ") { ")
+     (emit "if ")
+     (emit-bool (if-test ast))
+     (emit " { ")
      (emit-val (if-then ast))
      (emit " } else { ")
      (emit-val (if-else ast))
@@ -1076,6 +1208,12 @@
          (else
           ;; Not arithmetic prim — fall back to Val unwrap
           (emit-val ast) (emit ".as_fixnum().unwrap()")))))
+    ;; Typed fixnum let binding → emit directly as i64 (no unbox)
+    ((and (ref? ast) (memq (ref-var ast) *fixnum-vars*))
+     (rust-ident (ref-var ast)))
+    ;; Loop i64 parameter → emit i64 name directly
+    ((and (ref? ast) (memq (ref-var ast) *loop-i64-params*))
+     (rust-i64-ident (ref-var ast)))
     (else
      ;; Variable or other → emit as Val and unwrap
      (emit-val ast) (emit ".as_fixnum().unwrap()"))))
@@ -1086,7 +1224,8 @@
       (emit "Val::NIL")
       (begin
         (emit "cons(")
-        (rust-ident (car free-vars))
+        ;; Use emit-val so typed vars (fixnum/i64) get properly boxed
+        (emit-val (make-ref (car free-vars)))
         (emit ", ")
         (emit-env-build (cdr free-vars))
         (emit ")"))))
@@ -1103,20 +1242,41 @@
         (begin (emit "cdr(") (loop (- d 1)) (emit ")"))))
   (emit ", ") (emit closure-var) (emit ");"))
 
-;; Emit let bindings for administrative redex
+;; Emit let bindings for administrative redex (with fixnum/bool type propagation)
 (define (emit-let-bindings params args)
   (if (pair? params)
       (begin
-        (emit "let mut ")
-        (rust-ident (car params))
-        (emit " = ")
-        (emit-val (car args))
-        (emit "; ")
-        ;; Track if this binding is a closure (for letrec patching)
-        (if (closure? (car args))
-            (set! *closure-bindings*
-                  (cons (cons (car params) (car args))
-                        *closure-bindings*)))
+        (let* ((param (car params))
+               (arg   (car args))
+               (typ   (infer-type arg)))
+          (cond
+            ;; Bool-typed: declare as bool, track in *bool-vars*
+            ((eq? typ 'bool)
+             (emit "let mut ")
+             (rust-ident param)
+             (emit ": bool = ")
+             (emit-bool arg)
+             (emit "; ")
+             (set! *bool-vars* (cons param *bool-vars*)))
+            ;; Fixnum-typed: declare as i64, track in *fixnum-vars*
+            ((eq? typ 'fixnum)
+             (emit "let mut ")
+             (rust-ident param)
+             (emit ": i64 = ")
+             (emit-i64 arg)
+             (emit "; ")
+             (set! *fixnum-vars* (cons param *fixnum-vars*)))
+            ;; Val-typed: existing behavior
+            (else
+             (emit "let mut ")
+             (rust-ident param)
+             (emit " = ")
+             (emit-val arg)
+             (emit "; ")
+             (if (closure? arg)
+                 (set! *closure-bindings*
+                       (cons (cons param arg)
+                             *closure-bindings*))))))
         (emit-let-bindings (cdr params) (cdr args)))))
 
 ;; ── Emit a tail-position expression (returns Action) ──
@@ -1138,15 +1298,27 @@
       ;; Self-tail-call optimization: reassign params and continue
       ((and *in-self-loop* (self-call? fn))
        (emit "{ ")
-       (let loop ((as args) (i 0))
+       ;; Emit temp assignments (i64 for loop-i64 params, Val otherwise)
+       (let loop ((as args) (ps (params-all *current-lambda-params*)) (i 0))
          (if (pair? as)
              (begin
-               (emit "let __t") (emit i) (emit " = ") (emit-val (car as)) (emit "; ")
-               (loop (cdr as) (+ i 1)))))
+               (if (memq (car ps) *loop-i64-params*)
+                   (begin
+                     (emit "let __ti") (emit i) (emit ": i64 = ")
+                     (emit-i64 (car as))
+                     (emit "; "))
+                   (begin
+                     (emit "let __t") (emit i) (emit " = ")
+                     (emit-val (car as))
+                     (emit "; ")))
+               (loop (cdr as) (cdr ps) (+ i 1)))))
+       ;; Emit reassignments
        (let loop ((ps (params-all *current-lambda-params*)) (i 0))
          (if (pair? ps)
              (begin
-               (rust-ident (car ps)) (emit " = __t") (emit i) (emit "; ")
+               (if (memq (car ps) *loop-i64-params*)
+                   (begin (rust-i64-ident (car ps)) (emit " = __ti") (emit i) (emit "; "))
+                   (begin (rust-ident (car ps)) (emit " = __t") (emit i) (emit "; ")))
                (loop (cdr ps) (+ i 1)))))
        (emit "continue; }"))
 
@@ -1208,9 +1380,9 @@
 
     ;; If in tail position: both branches are tail
     ((if? ast)
-     (emit "if is_true(")
-     (emit-val (if-test ast))
-     (emit ") { ")
+     (emit "if ")
+     (emit-bool (if-test ast))
+     (emit " { ")
      (emit-tail (if-then ast))
      (emit " } else { ")
      (emit-tail (if-else ast))
@@ -1288,7 +1460,10 @@
 ;; ── Emit a single lambda function ──
 
 (define (emit-lambda lam)
-  (set! *closure-bindings* '())  ;; reset per-lambda
+  (set! *closure-bindings* '())
+  (set! *fixnum-vars* '())
+  (set! *bool-vars* '())
+  (set! *loop-i64-params* '())
   (let* ((id (lambda-id lam))
          (params (lambda-params lam))
          (free (lambda-free lam))
@@ -1298,8 +1473,11 @@
                       (set! *current-lambda-params* params)
                       (has-self-tail-call? body)))
          (mutations (mutated-vars body)))
+    ;; For self-tail-call loops, find params used in arithmetic → unbox as i64
+    (if self-call
+        (set! *loop-i64-params*
+              (arith-used-params body (params-all params))))
     (emit "fn __lambda_") (emit id) (emit "(__env: Val")
-    ;; Parameters — always mut (set! on params is common; allow_unused_mut suppresses warnings)
     (for-each (lambda (p)
                 (emit ", mut ")
                 (rust-ident p)
@@ -1309,6 +1487,17 @@
     (newline)
     ;; Extract free variables from environment
     (emit-env-extract free)
+    ;; Unbox arithmetic-used loop params as i64 before the loop
+    (if self-call
+        (for-each
+          (lambda (p)
+            (emit "    let mut ")
+            (rust-i64-ident p)
+            (emit " = ")
+            (rust-ident p)
+            (emit ".as_fixnum().unwrap();")
+            (newline))
+          *loop-i64-params*))
     ;; Body (in tail position), wrapped in loop if self-calling
     (if self-call
         (begin
@@ -1331,6 +1520,9 @@
 
 (define (emit-cont-lambda lam)
   (set! *closure-bindings* '())
+  (set! *fixnum-vars* '())
+  (set! *bool-vars* '())
+  (set! *loop-i64-params* '())
   (let* ((id (lambda-id lam))
          (params (lambda-params lam))
          (free (lambda-free lam))
