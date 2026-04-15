@@ -160,6 +160,8 @@ The compiler reaches a **fixed point** at generation 2: the self-compiled binary
 
 **Known-call optimization:** When a tail call targets a compile-time-known global function, rsc.scm emits `__lambda_N(Val::NIL, args...)` directly, eliminating one `alloc_rib` (closure rib), one `Action` construction, and one `dispatch_cps` call per site. This gives 3.4× speedup on tak and 11% on fib.
 
+**Fixnum/bool propagation:** Expression-level type inference within each function. Arithmetic let-bindings declare as `i64` Rust locals; boolean let-bindings as `bool`; `if`-test conditions bypass `bool_to_val`/`is_true`. Self-tail-call loop parameters used only in arithmetic context are unboxed to `i64` at loop entry and reassigned without `Val` wrapping. Measured: ~5% on fib, ~11% on diviter.
+
 ```bash
 # Compile a program (wispy-vm as host)
 echo '(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (display (fib 30)) (newline)' \
@@ -179,7 +181,7 @@ rustc -O -o /tmp/rsc /tmp/rsc.rs
 
 **Pipeline:** S-expression → AST (tagged lists) → CPS conversion → lambda lifting / closure conversion → Rust emission (trampoline + `dispatch_cps` + `__lambda_N` functions).
 
-Passes 9 of 12 r7rs-benchmarks (fib, sum, ack, tak, takl, nqueens, diviter, deriv, primes). Remaining work: type inference / fixnum propagation, continuation inlining, `call/cc`, multiple return values, macros, and wiring the specializer output into the P3 transpiler.
+Passes 9 of 12 r7rs-benchmarks (fib, sum, ack, tak, takl, nqueens, diviter, deriv, primes). Remaining work: contification (Kennedy's optimization — converts mutual tail recursion to direct jumps, eliminates `make_cont` per call), cross-function fixnum propagation, `call/cc`, multiple return values, macros, and wiring the specializer output into the P3 transpiler.
 
 ## Algebraic IR and Transpiler
 
